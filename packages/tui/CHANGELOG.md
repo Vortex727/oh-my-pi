@@ -4,9 +4,9 @@
 
 ### Added
 
-- Added a composed settings surface that hosts embedded tabs such as Profiles, native section-sidebar row helpers, and a focused single-role model-hub editor for assigning one role without the full role-management view.
-- Model metric formatters (context, cost, intelligence, measured performance) are exported for reuse outside the model browser.
-- Added `SettingsSelectorComponent.clearSearch()` so embedded editors can reveal action errors hidden by a search filter.
+- Added a composed settings surface that hosts embedded tabs such as Profiles, native section-sidebar row helpers, and a focused single-role model-hub editor for assigning one role without the full role-management view ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727)).
+- Model metric formatters (context, cost, intelligence, measured performance) are exported for reuse outside the model browser ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727)).
+- Added `SettingsSelectorComponent.clearSearch()` so embedded editors can reveal action errors hidden by a search filter ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727)).
 
 ## [18.2.10] - 2026-09-22
 

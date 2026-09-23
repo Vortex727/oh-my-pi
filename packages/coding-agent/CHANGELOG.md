@@ -4,35 +4,35 @@
 
 ### Added
 
-- Added saved-profile management directly to the **Profiles** tab in Settings; `/profiles` opens the same embedded surface with a read-only setup preview and a complete isolated customization editor that defaults new profiles to models only.
-- Added full-profile and model-roles-only export/import through create-only files or the clipboard, with initial and final read-only reviews, pinned Continue and Cancel actions, guided compatibility resolution, and create-only setup saving.
+- Added saved-profile management directly to the **Profiles** tab in Settings; `/profiles` opens the same embedded surface with a read-only setup preview and a complete isolated customization editor that defaults new profiles to models only ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727)).
+- Added full-profile and model-roles-only export/import through create-only files or the clipboard, with initial and final read-only reviews, pinned Continue and Cancel actions, guided compatibility resolution, and create-only setup saving ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727)).
 
 ### Changed
 
 - Extensions load faster on warm starts: their dependencies are no longer re-parsed on every launch ([#12908](https://github.com/can1357/oh-my-pi/pull/12908) by [@H4vC](https://github.com/H4vC)).
 - The first highlighted code block, bash preview, or diff no longer stalls the screen while syntax highlighting initializes ([#12908](https://github.com/can1357/oh-my-pi/pull/12908) by [@H4vC](https://github.com/H4vC)).
-- Profile previews show a compact read-only overview with the selected profile name pinned above one continuous scrollable pane and provider usage in up to three columns; Enter opens the full editor.
-- Loading a saved setup now offers applying model roles and thinking to the current conversation or starting a fresh session with the full preset.
-- Saved setups preserve metadata-less legacy values and unchanged local-only settings, while full-profile export identifies local-only paths instead of silently dropping them.
-- Fresh-session setup switches replace the previous setup overlay while retaining original CLI configuration, so groups left out of a profile inherit local settings.
-- Existing saved-profile emoji choices are clearly marked as immediate commits; **None** removes the emoji, while picker navigation and choices for new or export drafts remain staged.
-- Profile roles, agents, optional groups, and settings share one flat native editor: OFF groups expose inherited values while disabled, inclusion captures them into the draft, exclusion confirms removal, and Ctrl+S saves through the existing confirmation and naming flow.
-- Expanded the curated profile emoji picker to 29 choices, leading with labels and keeping the original icons in a trailing column with a two-space gap.
-- Renamed the optional profile group from **Providers** to **Provider settings** to distinguish its portable behavior from provider accounts and global Settings.
+- Profile previews show a compact read-only overview with the selected profile name pinned above one continuous scrollable pane and provider usage in up to three columns; Enter opens the full editor ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727)).
+- Loading a saved setup now offers applying model roles and thinking to the current conversation or starting a fresh session with the full preset ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727)).
+- Saved setups preserve metadata-less legacy values and unchanged local-only settings, while full-profile export identifies local-only paths instead of silently dropping them ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727)).
+- Fresh-session setup switches replace the previous setup overlay while retaining original CLI configuration, so groups left out of a profile inherit local settings ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727)).
+- Existing saved-profile emoji choices are clearly marked as immediate commits; **None** removes the emoji, while picker navigation and choices for new or export drafts remain staged ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727)).
+- Profile roles, agents, optional groups, and settings share one flat native editor: OFF groups expose inherited values while disabled, inclusion captures them into the draft, exclusion confirms removal, and Ctrl+S saves through the existing confirmation and naming flow ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727)).
+- Expanded the curated profile emoji picker to 29 choices, leading with labels and keeping the original icons in a trailing column with a two-space gap ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727)).
+- Renamed the optional profile group from **Providers** to **Provider settings** to distinguish its portable behavior from provider accounts and global Settings ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727)).
 
 ### Fixed
 
-- Fixed Windows module loading failures when opening model-role selectors.
-- Fixed read-only settings initialization skipping global YAML and silently accepting malformed configuration during profile inspection.
-- Fixed saving and discovering setup names containing uppercase letters, spaces, or Unicode without changing credential-profile naming rules.
-- Saved setups now retain the current model's configured thinking level, including automatic thinking.
-- Settings and model-role edits now take effect after loading a config overlay without rewriting the saved preset.
-- Profile drafts now survive failed saves, and model selection includes the thinking-level confirmation.
-- Profile previews, imports, and live application now respect each role's model kind, including keyless local runners.
-- Profile imports preserve Automatic role aliases and reject excessive alias expansion without freezing the interface.
-- Profile inspection now respects disabled discovery providers and immediate cancellation, and handles prototype-named agents safely.
-- Saved profiles support case-only renames on case-insensitive filesystems without replacing another setup.
-- Profile quota summaries keep independent meters and account headroom separate, and retain last-good data when broker refresh fails.
+- Fixed Windows module loading failures when opening model-role selectors ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727)).
+- Fixed read-only settings initialization skipping global YAML and silently accepting malformed configuration during profile inspection ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727)).
+- Fixed saving and discovering setup names containing uppercase letters, spaces, or Unicode without changing credential-profile naming rules ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727)).
+- Saved setups now retain the current model's configured thinking level, including automatic thinking ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727)).
+- Settings and model-role edits now take effect after loading a config overlay without rewriting the saved preset ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727)).
+- Profile drafts now survive failed saves, and model selection includes the thinking-level confirmation ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727)).
+- Profile previews, imports, and live application now respect each role's model kind, including keyless local runners ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727)).
+- Profile imports preserve Automatic role aliases and reject excessive alias expansion without freezing the interface ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727)).
+- Profile inspection now respects disabled discovery providers and immediate cancellation, and handles prototype-named agents safely ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727)).
+- Saved profiles support case-only renames on case-insensitive filesystems without replacing another setup ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727)).
+- Profile quota summaries keep independent meters and account headroom separate, and retain last-good data when broker refresh fails ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727)).
 
 ## [18.2.10] - 2026-09-22
 

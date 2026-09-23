@@ -38,7 +38,7 @@ export interface ProfileDashboardProfileState {
 	error?: string;
 	/** A failed refresh keeps snapshot as the last-good value and annotates it. */
 	refreshError?: string;
-	/** Current profile only: this session's account usage reports. */
+	/** This session's account usage reports; the overview shows the profile's providers. */
 	usage?: readonly UsageReport[];
 }
 

@@ -389,46 +389,84 @@ function renderAgents(snapshot: ProfileSnapshot, width: number): string[] {
 
 // ─── Usage ───────────────────────────────────────────────────────────────────
 
-/** This session's quota per provider bucket, aggregated as the `/usage` dashboard does. */
+/**
+ * Quota left on the providers this profile's models use, aggregated as the
+ * `/usage` dashboard does. Every profile draws on this machine's accounts, so
+ * profiles differ in which providers' quota they use; the rows compare that.
+ */
 function renderUsage(reports: readonly UsageReport[], snapshot: ProfileSnapshot, width: number): string[] {
 	const now = Date.now();
-	const cards = buildProviderCards([...reports], now);
-	const latest = Math.max(0, ...reports.map(report => report.fetchedAt ?? 0));
-	const lines = [
-		sectionHeading("Usage & limits", latest > 0 ? `updated ${formatDuration(now - latest)} ago` : undefined),
+	const roleUsers = new Map<string, string[]>();
+	for (const role of snapshot.roles) {
+		if (!role.provider) continue;
+		const names = roleUsers.get(role.provider) ?? [];
+		names.push(cleanLine(role.role));
+		roleUsers.set(role.provider, names);
+	}
+	const agentUsers = new Map<string, number>();
+	for (const agent of snapshot.agents) {
+		if (agent.provider) agentUsers.set(agent.provider, (agentUsers.get(agent.provider) ?? 0) + 1);
+	}
+	const inUse = new Set([...roleUsers.keys(), ...agentUsers.keys()]);
+	const profileReports = reports.filter(report => inUse.has(report.provider));
+	const cards = buildProviderCards(profileReports, now);
+	const latest = Math.max(0, ...profileReports.map(report => report.fetchedAt ?? 0));
+	const fractions = cards.flatMap(card => card.windows.map(window => window.fraction)).filter(f => f !== undefined);
+	const details = [
+		...(fractions.length > 0 ? [`lowest ${Math.max(0, Math.round((1 - Math.max(...fractions)) * 100))}% free`] : []),
+		...(latest > 0 ? [`updated ${formatDuration(now - latest)} ago`] : []),
 	];
+	const lines = [sectionHeading("Usage & limits", details.join(" · ") || undefined)];
 	const providers: string[] = [];
 	const limits: string[] = [];
 	const bars: string[] = [];
 	const free: string[] = [];
 	const resets: string[] = [];
-	const push = (provider: string, limit: string, bar = "", left = "", reset = ""): void => {
+	const users: string[] = [];
+	const push = (provider: string, limit: string, bar = "", left = "", reset = "", usedBy = ""): void => {
 		providers.push(provider);
 		limits.push(limit);
 		bars.push(bar);
 		free.push(left);
 		resets.push(reset);
+		users.push(usedBy);
 	};
-	for (const card of cards.filter(card => !card.idle)) {
+	for (const card of cards) {
 		const name =
 			card.accounts > 1 ? `${cleanLine(card.name)} ${dim(`${card.accounts} accts`)}` : cleanLine(card.name);
+		const agents = agentUsers.get(card.provider) ?? 0;
+		const usedBy = dim(
+			[
+				...(roleUsers.get(card.provider) ?? []),
+				...(agents > 0 ? [`${agents} agent${agents === 1 ? "" : "s"}`] : []),
+			].join(", "),
+		);
 		if (card.unlimited) {
-			push(name, dim("no limits"));
+			push(name, dim("no limits"), "", "", "", usedBy);
 			continue;
 		}
 		for (const [index, window] of card.windows.slice(0, CARD_MAX_WINDOWS).entries()) {
 			const label = `${muted(cleanLine(window.label))}${window.windowTag ? dim(` ${cleanLine(window.windowTag)}`) : ""}`;
 			const reset = window.resetMs !== undefined ? dim(formatDuration(window.resetMs)) : "";
+			const first = index === 0;
 			if (window.fraction === undefined) {
-				push(index === 0 ? name : "", label, "", dim(cleanLine(window.usedText ?? "no data")), reset);
+				push(
+					first ? name : "",
+					label,
+					"",
+					dim(cleanLine(window.usedText ?? "no data")),
+					reset,
+					first ? usedBy : "",
+				);
 				continue;
 			}
 			push(
-				index === 0 ? name : "",
+				first ? name : "",
 				label,
 				renderUsageBar(window.fraction, window.status, USAGE_BAR_WIDTH),
 				theme.fg(usageStatusColor(window.status), `${Math.max(0, Math.round((1 - window.fraction) * 100))}%`),
 				reset,
+				first ? usedBy : "",
 			);
 		}
 		const hidden = card.windows.length - CARD_MAX_WINDOWS;
@@ -440,45 +478,34 @@ function renderUsage(reports: readonly UsageReport[], snapshot: ProfileSnapshot,
 				[
 					{ header: "Provider", cells: providers, max: 24 },
 					{ header: "Limit", cells: limits, flexMin: 12 },
-					{ header: "Used", cells: bars, drop: 2 },
+					{ header: "Used", cells: bars, drop: 3 },
 					{ header: "Free", cells: free, align: "right", max: 16 },
-					{ header: "Resets in", cells: resets, align: "right", drop: 1 },
+					{ header: "Resets in", cells: resets, align: "right", drop: 2 },
+					{ header: "Used by", cells: users, max: 28, drop: 1 },
 				],
 				width,
 			),
 		);
 	}
-	const idle = cards.filter(card => card.idle).map(card => cleanLine(card.name));
-	if (idle.length > 0) {
-		pushIndented(
-			lines,
-			`${theme.fg("success", theme.status.success)} ${dim(`untouched: ${idle.join(" · ")}`)}`,
-			2,
-			width,
-		);
-	}
 	const reported = new Set(reports.map(report => report.provider));
-	const unreported = [
-		...new Set(
-			[...snapshot.roles, ...snapshot.agents]
-				.map(row => row.provider)
-				.filter((provider): provider is string => !!provider && !reported.has(provider)),
-		),
-	].map(provider => cleanLine(formatProviderName(provider)));
+	const unreported = [...inUse]
+		.filter(provider => !reported.has(provider))
+		.map(provider => cleanLine(formatProviderName(provider)));
 	if (unreported.length > 0) pushIndented(lines, dim(`Not reported: ${unreported.join(" · ")}`), 2, width);
+	if (inUse.size === 0) lines.push(`${TABLE_INDENT}${dim("No models assigned, so no provider quota applies")}`);
 	return lines;
 }
 
 /**
  * The read-only profile overview: one summary line, then Models, Agents, and
- * (for the current profile) Usage, each as a one-line-per-row table so the
- * whole profile reads at a glance. The draft editor holds the full detail.
+ * Usage for the providers the profile uses, each as a one-line-per-row table
+ * so profiles compare at a glance. The draft editor holds the full detail.
  */
 export function buildProfilePreviewOverview(options: {
 	setup: ProfileDashboardSetupRef;
 	snapshot: ProfileSnapshot;
 	width: number;
-	/** This session's account usage reports; shown last, for the current profile only. */
+	/** This session's account usage reports; shown last, filtered to the profile's providers. */
 	usage?: readonly UsageReport[];
 }): string[] {
 	const { setup, snapshot } = options;

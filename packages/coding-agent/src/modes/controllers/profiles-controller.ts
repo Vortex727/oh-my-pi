@@ -240,11 +240,7 @@ export class ProfilesController {
 			snapshot => {
 				if (generation !== this.#generation || this.#dashboard !== dashboard) return;
 				this.#snapshots.set(key, snapshot);
-				dashboard.setSetupState(setup, {
-					snapshot,
-					loading: false,
-					usage: setup.kind === "current" ? this.#usage : undefined,
-				});
+				dashboard.setSetupState(setup, { snapshot, loading: false, usage: this.#usage });
 			},
 			(error: unknown) => {
 				if (generation !== this.#generation || this.#dashboard !== dashboard) return;
@@ -263,8 +259,9 @@ export class ProfilesController {
 
 	/**
 	 * Fetch this session's account usage once per mount, the same reports `/usage`
-	 * shows, and attach them to the current profile's preview. A failure or an
-	 * empty result leaves the section out, as `/usage` does.
+	 * shows, and attach them to every preview; each overview shows the providers
+	 * its profile uses. A failure or an empty result leaves the section out, as
+	 * `/usage` does.
 	 */
 	async #loadUsage(dashboard: ProfileDashboard): Promise<void> {
 		const { session } = this.ctx;
@@ -277,8 +274,10 @@ export class ProfilesController {
 		}
 		if (this.#dashboard !== dashboard || !reports || reports.length === 0) return;
 		this.#usage = reports;
-		const snapshot = this.#snapshots.get(setupKey(CURRENT_SETUP));
-		if (snapshot) dashboard.setSetupState(CURRENT_SETUP, { snapshot, loading: false, usage: reports });
+		for (const setup of this.#setupRefs()) {
+			const snapshot = this.#snapshots.get(setupKey(setup));
+			if (snapshot) dashboard.setSetupState(setup, { snapshot, loading: false, usage: reports });
+		}
 	}
 
 	async #buildSnapshot(setup: ProfileDashboardSetupRef): Promise<ProfileSnapshot> {

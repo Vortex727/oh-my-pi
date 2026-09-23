@@ -407,7 +407,7 @@ describe("profile dashboard interaction boundaries", () => {
 		expect(narrowLines.join("\n")).toContain("Model catalog warning");
 	});
 
-	test("summarizes this session's usage per quota bucket, collapsing idle and naming unreported providers", () => {
+	test("shows quota only for the profile's providers, idle ones at 100%, and names who uses each", () => {
 		const hour = 3_600_000;
 		const report = (provider: string, used: number): UsageReport => ({
 			provider,
@@ -423,18 +423,15 @@ describe("profile dashboard interaction boundaries", () => {
 			],
 		});
 		const profile = snapshot();
-		profile.roles.push({
-			role: "web",
-			selector: "web/perplexity",
-			provider: "web",
-			modelId: "perplexity",
-			automatic: false,
-		});
+		profile.roles.push(
+			{ role: "web", selector: "web/perplexity", provider: "web", modelId: "perplexity", automatic: false },
+			{ role: "smol", selector: "kimi-code/k3", provider: "kimi-code", modelId: "k3", automatic: false },
+		);
 		const { dashboard } = setup(48, []);
 		dashboard.setSetupState(CURRENT_SETUP, {
 			snapshot: profile,
 			loading: false,
-			usage: [report("anthropic", 0.25), report("kimi-code", 0)],
+			usage: [report("anthropic", 0.25), report("kimi-code", 0), report("zai", 0.5)],
 		});
 		const lines = dashboard.render(160, 48).map(stripVTControlCharacters);
 
@@ -442,9 +439,13 @@ describe("profile dashboard interaction boundaries", () => {
 		expect(anthropic).toHaveLength(1);
 		expect(anthropic[0]).toContain("Weekly");
 		expect(anthropic[0]).toContain("75%");
+		expect(anthropic[0]).toContain("default");
 		const kimi = lines.filter(line => line.includes("Kimi Code"));
 		expect(kimi).toHaveLength(1);
-		expect(kimi[0]).toContain("untouched");
+		expect(kimi[0]).toContain("100%");
+		expect(kimi[0]).toContain("smol");
+		expect(lines.join("\n")).not.toContain("Zai");
+		expect(lines.find(line => line.includes("Usage & limits"))).toContain("lowest 75% free");
 		expect(lines.find(line => line.includes("Not reported"))).toContain("Web");
 		expect(lines.find(line => line.includes("Not reported"))).not.toContain("Anthropic");
 	});

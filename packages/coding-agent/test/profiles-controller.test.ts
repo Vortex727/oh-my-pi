@@ -24,15 +24,15 @@ import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } f
 const NEW_SESSION = "Start a new session";
 const HOUR = 3_600_000;
 
-function quotaReport(now: number): UsageReport {
+function quotaReport(now: number, provider = "anthropic"): UsageReport {
 	return {
-		provider: "anthropic",
+		provider,
 		fetchedAt: now,
 		limits: [
 			{
 				id: "5h",
 				label: "5h",
-				scope: { provider: "anthropic", windowId: "5h", shared: true },
+				scope: { provider, windowId: "5h", shared: true },
 				window: { id: "5h", label: "5h", durationMs: 5 * HOUR, resetsAt: now + 5 * HOUR },
 				amount: { unit: "percent", usedFraction: 0.18 },
 			},
@@ -403,18 +403,24 @@ describe("ProfilesController", () => {
 		expect(h.screen()).toContain("Imported profile shared");
 	});
 
-	it("shows this session's account usage under the current profile only", async () => {
+	it("shows usage on saved profiles too, limited to the providers each one uses", async () => {
+		authStorage.keys.setRuntime("anthropic", "fixture-key");
 		const usage = Promise.withResolvers<UsageReport[] | null>();
 		const h = await harness({ fetchUsageReports: () => usage.promise });
 		expect(h.screen()).not.toContain("Anthropic");
-		usage.resolve([quotaReport(Date.now())]);
-		// The controller awaited this promise first, so the report is attached already.
+		usage.resolve([quotaReport(Date.now()), quotaReport(Date.now(), "zai")]);
+		// The controller awaited this promise first, so the reports are attached already.
 		await usage.promise;
 		expect(h.screen()).toContain("Anthropic");
 
+		// The saved `focus` profile routes smol to Anthropic and nothing to Zai.
 		h.dashboard().handleInput("\x1b[B");
 		await h.renderedUntil(() => h.screen().includes("Saved profile") && !h.screen().includes("Loading preview"));
-		expect(h.screen()).not.toContain("Anthropic");
+		const saved = h.screen().split("\n");
+		const anthropic = saved.find(line => line.includes("Anthropic"));
+		expect(anthropic).toContain("82%");
+		expect(anthropic).toContain("smol");
+		expect(saved.join("\n")).not.toContain("Zai");
 	});
 
 	it("returning to Profiles rediscovers added setups and drops missing ones", async () => {

@@ -6,10 +6,15 @@ import {
 	createSetupDraft,
 	listSavedSetups,
 	loadSavedSetup,
+	modelsOnlyDraft,
+	parseProfileText,
+	readProfileFile,
 	renameSavedSetup,
 	SetupError,
 	saveSetup,
+	serializeSetup,
 	setDraftGroup,
+	writeProfileFile,
 } from "@oh-my-pi/pi-coding-agent/profiles/setups";
 import type { ProfileDraft } from "@oh-my-pi/pi-coding-agent/profiles/types";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -168,5 +173,74 @@ describe("setup drafts", () => {
 		const setup = createSetupDraft(settings, { provider: "openai", id: "gpt-5.4", thinkingLevel: "auto" });
 
 		expect(setup.config.modelRoles).toEqual({ default: "openai/gpt-5.4:auto", smol: "openai/gpt-5.4-mini" });
+	});
+});
+
+describe("profile sharing", () => {
+	const shared: ProfileDraft = {
+		metadata: { version: 1, emoji: "⚡", enabledGroups: ["context", "tasks"] },
+		config: {
+			modelRoles: { default: "anthropic/claude-sonnet-4-5:high", smol: null, task: "@default" },
+			compaction: { enabled: false },
+			task: { disabledAgents: ["reviewer"], agentModelOverrides: { scout: ["openai/gpt-5.4-mini", "@smol"] } },
+		},
+	};
+
+	it("round-trips an exported profile through a file exactly, and a models-only export keeps only roles", async () => {
+		using dir = TempDir.createSync("@omp-profile-share-");
+		const file = dir.join("focus.profile.yml");
+		await writeProfileFile(file, shared);
+		expect(await readProfileFile(file)).toEqual({ ...shared, warnings: [] });
+
+		expect(parseProfileText(serializeSetup(modelsOnlyDraft(shared)))).toEqual({
+			metadata: { version: 1, emoji: "⚡", enabledGroups: [] },
+			config: { modelRoles: shared.config.modelRoles },
+			warnings: [],
+		});
+	});
+
+	it("never replaces an existing file on export", async () => {
+		using dir = TempDir.createSync("@omp-profile-share-exists-");
+		const file = dir.join("taken.yml");
+		await Bun.write(file, "keep me\n");
+		await expectSetupError(writeProfileFile(file, shared), "exists");
+		expect(await Bun.file(file).text()).toBe("keep me\n");
+	});
+
+	it("imports a plain config.yml-style document without letting credentials or machine-local settings in", () => {
+		const imported = parseProfileText(
+			[
+				"modelRoles:",
+				"  smol: openai/gpt-5.4-mini",
+				"compaction:",
+				"  enabled: true",
+				"auth:",
+				"  broker:",
+				"    token: broker-secret",
+				"providers:",
+				"  fireworksTier: priority",
+				"",
+			].join("\n"),
+		);
+		expect(imported.config).toEqual({ modelRoles: { smol: "openai/gpt-5.4-mini" }, compaction: { enabled: true } });
+		expect(imported.metadata.enabledGroups).toEqual(["context"]);
+		// Skipped entries are named where they leave the profile's own settings, so users can find them.
+		expect(imported.warnings.some(warning => warning.startsWith("Ignored auth:"))).toBe(true);
+		expect(imported.warnings.some(warning => warning.includes("providers.fireworksTier"))).toBe(true);
+	});
+
+	it("rejects model roles whose aliases fan out past the safety budget, but keeps ordinary alias chains", () => {
+		const roles = Array.from({ length: 12 }, (_, index) => `r${index}`);
+		const crafted = roles.map(role => `  ${role}: "${roles.map(other => `@${other}`).join(",")}"`);
+		expect(() => parseProfileText(["modelRoles:", ...crafted, ""].join("\n"))).toThrow(SetupError);
+
+		const chain = parseProfileText(
+			'modelRoles:\n  default: anthropic/claude-sonnet-4-5\n  task: "@default"\n  scout: "@task,*"\n',
+		);
+		expect(chain.config.modelRoles).toEqual({
+			default: "anthropic/claude-sonnet-4-5",
+			task: "@default",
+			scout: "@task,*",
+		});
 	});
 });

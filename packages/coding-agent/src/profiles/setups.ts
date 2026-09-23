@@ -5,6 +5,7 @@
  * version of omp cannot own are skipped with a warning instead of rejecting the
  * whole file, so setups survive setting renames and removals across upgrades.
  */
+import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { formatModelSelectorValue } from "@oh-my-pi/pi-tui/overlays/model-selector";
@@ -12,6 +13,11 @@ import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { getAgentDir, isEexist, isEnoent, logger, stringifyYamlConfig } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
 import type { RawSettings, Settings } from "../config/settings";
+import {
+	DEFAULT_MODEL_ROLE_ALIAS,
+	LEGACY_MODEL_ROLE_ALIAS_PREFIX,
+	MODEL_ROLE_ALIAS_PREFIX,
+} from "../config/model-roles";
 import { getUi, isCredential, isMachineLocal, SETTINGS_SCHEMA, type SettingPath } from "../config/settings-schema";
 import { replaceFileAtomically } from "../utils/atomic-file";
 import {
@@ -30,6 +36,8 @@ const SETUP_METADATA_KEY = "$setup";
 const SETUP_FORMAT_VERSION = 1;
 const MAX_SETUP_BYTES = 1024 * 1024;
 const MAX_SETUP_NAME_LENGTH = 64;
+/** Alias expansions one profile's model roles may need; bounds preview work for crafted files. */
+const MAX_ROLE_REFERENCE_WORK = 10_000;
 const WINDOWS_INVALID_FILENAME_RE = /[\p{Cc}\p{Cf}<>:"/\\|?*]/u;
 const WINDOWS_RESERVED_BASENAME_RE = /^(?:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(?:\..*)?$/iu;
 const PROTOTYPE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
@@ -286,9 +294,44 @@ function parseModelRoles(value: unknown, warnings: string[]): ModelRoleAssignmen
 	return roles;
 }
 
+/** The role a selector pattern aliases (`@role`, `pi/role`, `*`), ignoring any `:level` suffix. */
+function aliasedRole(pattern: string): string | undefined {
+	const base = pattern.trim().split(":", 1)[0]!;
+	if (base === DEFAULT_MODEL_ROLE_ALIAS) return "default";
+	for (const prefix of [MODEL_ROLE_ALIAS_PREFIX, LEGACY_MODEL_ROLE_ALIAS_PREFIX]) {
+		if (base.startsWith(prefix)) return base.slice(prefix.length);
+	}
+	return undefined;
+}
+
 /**
- * Read a setup document. Only a non-mapping document or an unsupported format
- * version is fatal; every other problem skips the affected entry with a warning.
+ * Whether expanding `roles`' aliases stays within budget. Role resolution walks
+ * every alias path with its own visited set, so roles that all list each other
+ * expand combinatorially and would freeze the preview. An alias to a role the
+ * profile leaves unset counts as one to `default`, which that role inherits.
+ */
+function roleReferencesWithinBudget(roles: ModelRoleAssignments): boolean {
+	let work = 0;
+	const visit = (role: string, visited: ReadonlySet<string>): boolean => {
+		const selector = roles[role];
+		if (typeof selector !== "string") return true;
+		for (const pattern of selector.split(",")) {
+			const alias = aliasedRole(pattern);
+			if (alias === undefined) continue;
+			const target = Object.hasOwn(roles, alias) ? alias : Object.hasOwn(roles, "default") ? "default" : undefined;
+			if (target === undefined || visited.has(target)) continue;
+			if (++work > MAX_ROLE_REFERENCE_WORK) return false;
+			if (!visit(target, new Set([...visited, target]))) return false;
+		}
+		return true;
+	};
+	return Object.keys(roles).every(role => visit(role, new Set([role])));
+}
+
+/**
+ * Read a setup document. Only a non-mapping document, an unsupported format
+ * version, or model roles whose aliases expand past a safety budget are fatal;
+ * every other problem skips the affected entry with a warning.
  * Groups owning a kept setting stay enabled even if metadata omitted them, so a
  * setting moved between Settings tabs keeps its saved value.
  */
@@ -297,6 +340,9 @@ export function parseSetupDocument(document: unknown): ProfileDraft & { warnings
 	const warnings: string[] = [];
 	const metadata = parseMetadata(document[SETUP_METADATA_KEY], warnings);
 	const config: RawSettings = { modelRoles: parseModelRoles(document.modelRoles, warnings) };
+	if (!roleReferencesWithinBudget(config.modelRoles as ModelRoleAssignments)) {
+		throw new SetupError("invalid", "This profile's model roles reference each other too many times to load safely");
+	}
 	const groups = new Set(metadata.enabledGroups);
 	for (const settingPath of SETUP_SETTING_PATHS) {
 		const found = readConfigPath(document, settingPath);
@@ -337,6 +383,11 @@ export function draftModelRoles(draft: ProfileDraft): ModelRoleAssignments {
 		if (selector === null || typeof selector === "string") roles[role] = selector;
 	}
 	return roles;
+}
+
+/** Only the model roles of `draft`, for a models-only export. */
+export function modelsOnlyDraft(draft: ProfileDraft): ProfileDraft {
+	return { metadata: { ...draft.metadata, enabledGroups: [] }, config: { modelRoles: draftModelRoles(draft) } };
 }
 
 /** Flatten a setup's settings into path-keyed overrides for a read-only preview `Settings`. */
@@ -397,6 +448,14 @@ export function setDraftGroup(
 
 // ─── Storage ─────────────────────────────────────────────────────────────────
 
+function parseYamlDocument(content: string, subject: string): unknown {
+	try {
+		return YAML.parse(content);
+	} catch (error) {
+		throw new SetupError("invalid", `${subject} is not valid YAML`, { cause: error });
+	}
+}
+
 async function readSetupDocument(filePath: string, name: string): Promise<unknown> {
 	const file = Bun.file(filePath);
 	let content: string;
@@ -408,11 +467,7 @@ async function readSetupDocument(filePath: string, name: string): Promise<unknow
 		if (isEnoent(error)) throw new SetupError("not-found", `Profile "${name}" was not found`, { cause: error });
 		throw error;
 	}
-	try {
-		return YAML.parse(content);
-	} catch (error) {
-		throw new SetupError("invalid", `Profile "${name}" is not valid YAML`, { cause: error });
-	}
+	return parseYamlDocument(content, `Profile "${name}"`);
 }
 
 async function readSetupFile(filePath: string, name: string): Promise<ProfileDraft & { warnings: string[] }> {
@@ -579,6 +634,49 @@ export async function deleteSavedSetup(name: string, agentDir: string = getAgent
 		await fs.rm(setupFilePath(normalized, agentDir));
 	} catch (error) {
 		if (isEnoent(error)) throw new SetupError("not-found", `Profile "${normalized}" was not found`, { cause: error });
+		throw error;
+	}
+}
+
+// ─── Sharing ─────────────────────────────────────────────────────────────────
+// An exported profile is the same document as a saved one, so imports follow
+// the same tolerant rules: entries this version cannot load are skipped and named.
+
+/** Parse profile text from an exported file or the clipboard. */
+export function parseProfileText(text: string): ProfileDraft & { warnings: string[] } {
+	if (Buffer.byteLength(text) > MAX_SETUP_BYTES) throw new SetupError("too-large", "The profile is larger than 1 MiB");
+	return parseSetupDocument(parseYamlDocument(text, "The profile"));
+}
+
+/** Read an exported profile file. `label` names the file in errors (default: its path). */
+export async function readProfileFile(
+	filePath: string,
+	label: string = filePath,
+): Promise<ProfileDraft & { warnings: string[] }> {
+	let stats: Stats;
+	try {
+		stats = await fs.stat(filePath);
+	} catch (error) {
+		if (isEnoent(error)) throw new SetupError("not-found", `No file at ${label}`, { cause: error });
+		throw error;
+	}
+	if (!stats.isFile()) throw new SetupError("invalid", `${label} is not a file`);
+	if (stats.size > MAX_SETUP_BYTES) throw new SetupError("too-large", "The profile is larger than 1 MiB");
+	return parseProfileText(await Bun.file(filePath).text());
+}
+
+/** Write `draft` as an exported profile file; an existing file is never replaced. `label` names it in errors. */
+export async function writeProfileFile(filePath: string, draft: ProfileDraft, label: string = filePath): Promise<void> {
+	const content = serializeSetup(draft);
+	if (Buffer.byteLength(content) > MAX_SETUP_BYTES) {
+		throw new SetupError("too-large", "The profile is larger than 1 MiB");
+	}
+	try {
+		await fs.writeFile(filePath, content, { flag: "wx" });
+	} catch (error) {
+		if (isEexist(error)) throw new SetupError("exists", `${label} already exists`, { cause: error });
+		if (isEnoent(error))
+			throw new SetupError("not-found", `The folder for ${label} does not exist`, { cause: error });
 		throw error;
 	}
 }

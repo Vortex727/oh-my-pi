@@ -10,9 +10,10 @@ import type { ProfileDashboard } from "@oh-my-pi/pi-coding-agent/modes/component
 import type { ProfileEditorComponent } from "@oh-my-pi/pi-coding-agent/modes/components/profile-editor";
 import { ProfilesController, type ProfilesHost } from "@oh-my-pi/pi-coding-agent/modes/controllers/profiles-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
-import { saveSetup } from "@oh-my-pi/pi-coding-agent/profiles/setups";
+import { parseProfileText, saveSetup } from "@oh-my-pi/pi-coding-agent/profiles/setups";
 import { PROFILE_EMOJIS } from "@oh-my-pi/pi-coding-agent/profiles/types";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
+import * as clipboard from "@oh-my-pi/pi-coding-agent/utils/clipboard";
 import type { Component, OverlayHandle } from "@oh-my-pi/pi-tui";
 import type { SettingsSelectorComponent } from "@oh-my-pi/pi-tui/overlays/settings-selector";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
@@ -103,6 +104,7 @@ describe("ProfilesController", () => {
 	afterEach(async () => {
 		authStorage.close();
 		AgentStorage.close();
+		vi.restoreAllMocks();
 		restoreSettingsTestState(state);
 		state = undefined;
 		await tempDir.remove();
@@ -112,6 +114,8 @@ describe("ProfilesController", () => {
 		const settings = await Settings.loadIsolated({ cwd: projectDir, agentDir });
 		const modelRegistry = new ModelRegistry(authStorage, path.join(agentDir, "models.yml"), { settings });
 		const choice = Promise.withResolvers<string | undefined>();
+		/** Queued selector answers, used before the pending `choice`. */
+		const choices: Array<string | undefined> = [];
 		const confirm = Promise.withResolvers<boolean>();
 		const confirmShown = Promise.withResolvers<ShownDialog<boolean>>();
 		const refreshed = Promise.withResolvers<void>();
@@ -138,7 +142,7 @@ describe("ProfilesController", () => {
 			showWarning: () => {},
 			startNewSession,
 			showHookSelector: (_title: string, _items: unknown, options?: DialogOptions) =>
-				dialog(choice.promise, undefined, options?.signal),
+				dialog(choices.length > 0 ? Promise.resolve(choices.shift()) : choice.promise, undefined, options?.signal),
 			showHookConfirm: (_title: string, message: string, options?: DialogOptions) => {
 				const promise = dialog(confirm.promise, false, options?.signal);
 				confirmShown.resolve({ promise, signal: options?.signal, message });
@@ -180,6 +184,7 @@ describe("ProfilesController", () => {
 			settings,
 			controller,
 			choice,
+			choices,
 			confirm,
 			confirmShown: confirmShown.promise,
 			refreshed: refreshed.promise,
@@ -330,6 +335,52 @@ describe("ProfilesController", () => {
 		h.confirm.resolve(false);
 		expect(await shown.promise).toBe(false);
 		expect(await Bun.file(focusPath).bytes()).toEqual(before);
+	});
+
+	it("exports a saved profile models-only to a new file and never replaces an existing one", async () => {
+		const taken = path.join(projectDir, "taken.yml");
+		await Bun.write(taken, "keep me\n");
+		const target = path.join(projectDir, "shared.yml");
+		const h = await harness();
+		h.choices.push("Models only", "Save to file");
+		h.inputs.push(taken, target);
+		const done = h.nextSettingsShown();
+		h.dashboard().handleInput("\x1b[B");
+		h.dashboard().handleInput("x");
+		await done;
+
+		expect(await Bun.file(taken).text()).toBe("keep me\n");
+		expect(h.prompts[1]).toContain("already exists");
+		expect(parseProfileText(await Bun.file(target).text())).toEqual({
+			metadata: { version: 1, enabledGroups: [] },
+			config: { modelRoles: { smol: "anthropic/claude-haiku-4-5" } },
+			warnings: [],
+		});
+	});
+
+	it("imports clipboard text into the editor, flags skipped entries and unavailable models, and saves it new", async () => {
+		vi.spyOn(clipboard, "readTextFromClipboard").mockResolvedValue(
+			"$setup:\n  version: 1\nmodelRoles:\n  smol: nowhere/unknown-model\nretiredSection:\n  flag: true\n",
+		);
+		const h = await harness();
+		h.choices.push("From clipboard");
+		h.inputs.push("focus", "shared");
+		const editorShown = h.nextEditor();
+		h.dashboard().handleInput("i");
+		const editor = await editorShown;
+
+		expect(stripVTControlCharacters(editor.render(160).join("\n"))).toContain("retiredSection");
+		editor.handleInput("\x1b[B");
+		expect(stripVTControlCharacters(editor.render(160).join("\n"))).toContain("not available");
+		const saved = h.nextSettingsShown();
+		editor.handleInput("\x13");
+		await saved;
+
+		expect(h.prompts).toHaveLength(2);
+		expect(h.prompts[1]).toContain("already exists");
+		const stored = parseProfileText(await Bun.file(path.join(agentDir, "setups", "shared.yml")).text());
+		expect(stored.config).toEqual({ modelRoles: { smol: "nowhere/unknown-model" } });
+		expect(h.screen()).toContain("Imported profile shared");
 	});
 
 	it("returning to Profiles rediscovers added setups and drops missing ones", async () => {

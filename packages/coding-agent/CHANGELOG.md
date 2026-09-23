@@ -5,6 +5,7 @@
 ### Added
 
 - Added **Profiles** to Settings (also `/profiles`): save your current models, agents, and chosen settings groups as a named profile, preview it read-only, edit it as an isolated draft, and load it either into this conversation (models and thinking only) or into a new session (everything it includes) without rewriting your configuration. Profiles written by other omp versions load what this version understands and name every skipped entry ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727))
+- Added profile export and import in the Profiles tab: export a profile whole or models-only to a file (never replacing one) or the clipboard, and import one back from either. Imports skip and name anything this version cannot load, open in the profile editor with unavailable models flagged, and save under a new name ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727))
 - Added `/changelog last [N]` to show the latest release, or the last N releases. `/changelog` still shows the recent default and `/changelog full` still shows the complete history.
 - Added `omp login` command for terminal-based OAuth authentication, including automated model discovery refresh and browser-opening support
 - Enabled `org-scoped-identity` and `oauth-token-env` configuration parsing for authentication providers

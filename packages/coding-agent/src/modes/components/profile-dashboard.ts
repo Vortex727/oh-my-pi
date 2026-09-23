@@ -46,6 +46,8 @@ export interface ProfileDashboardCallbacks {
 	loadSetup(setup: ProfileDashboardSavedSetupRef): void | Promise<void>;
 	editProfile(setup: ProfileDashboardSetupRef): void | Promise<void>;
 	saveCurrentSetup(): void | Promise<void>;
+	importProfile(): void | Promise<void>;
+	exportProfile(setup: ProfileDashboardSetupRef): void | Promise<void>;
 	deleteSetup(setup: ProfileDashboardSavedSetupRef): void | Promise<void>;
 	renameSetup(setup: ProfileDashboardSavedSetupRef): void | Promise<void>;
 	openActiveControl(control: ProfileDashboardActiveControl): void;
@@ -61,7 +63,7 @@ interface HitZone {
 	line: number;
 	start: number;
 	end: number;
-	action: "edit-profile" | "load" | "save" | "delete" | "rename" | "close" | DetailAction;
+	action: "edit-profile" | "load" | "save" | "import" | "export" | "delete" | "rename" | "close" | DetailAction;
 }
 
 interface FooterHint {
@@ -339,6 +341,15 @@ export class ProfileDashboard implements Component {
 		}
 		if (data === "s") {
 			void this.#callbacks.saveCurrentSetup();
+			return;
+		}
+		if (data === "i") {
+			void this.#callbacks.importProfile();
+			return;
+		}
+		if (data === "x") {
+			const selected = this.selectedSetup;
+			if (selected) void this.#callbacks.exportProfile(selected);
 			return;
 		}
 		if (data === "e") {
@@ -651,7 +662,11 @@ export class ProfileDashboard implements Component {
 				{ text: "n to rename profile", action: "rename" },
 			);
 		}
-		hints.push({ text: "s to save current", action: "save" });
+		hints.push(
+			{ text: "s to save current", action: "save" },
+			{ text: "i to import profile", action: "import" },
+			{ text: "x to export profile", action: "export" },
+		);
 		if (selected?.kind === "current") {
 			hints.push(
 				{ text: "m to choose model", action: "model" },
@@ -793,6 +808,14 @@ export class ProfileDashboard implements Component {
 			case "rename": {
 				const setup = this.selectedSetup;
 				if (setup?.kind === "saved") void this.#callbacks.renameSetup(setup);
+				break;
+			}
+			case "import":
+				void this.#callbacks.importProfile();
+				break;
+			case "export": {
+				const setup = this.selectedSetup;
+				if (setup) void this.#callbacks.exportProfile(setup);
 				break;
 			}
 			case "close":

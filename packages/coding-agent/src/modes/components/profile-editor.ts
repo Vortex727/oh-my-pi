@@ -19,7 +19,6 @@ import {
 	type SettingsRuntimeContext,
 	type SettingsSelectorSection,
 } from "@oh-my-pi/pi-tui/overlays/settings-selector";
-import type { ModelRegistry } from "../../config/model-registry";
 import { type RawSettings, type Settings } from "../../config/settings";
 import { createSettingsHost } from "../../config/settings-ui";
 import {
@@ -148,6 +147,8 @@ export interface ProfileEditorCallbacks {
 	 * emoji saves with the rest of the draft.
 	 */
 	onSaveEmoji?(value: ProfileEmoji | undefined): Promise<boolean>;
+	/** Per-role warnings for `draft`, e.g. a model that is not available here. Re-read after each change. */
+	roleWarnings?(draft: ProfileDraft): ReadonlyMap<string, string>;
 }
 
 export interface ProfileEditorOptions {
@@ -155,7 +156,8 @@ export interface ProfileEditorOptions {
 	effectiveSettings: Settings;
 	/** Base/workspace/CLI settings without the selected profile overlay. */
 	inheritedSettings?: Settings;
-	registry?: ModelRegistry;
+	/** Leads the editor's banner, e.g. entries skipped while importing. */
+	notice?: string;
 	name?: string;
 	title?: string;
 	saveLabel?: string;
@@ -279,7 +281,7 @@ export class ProfileEditorComponent implements Component {
 				includePlugins: false,
 				title: options.title ?? "Edit profile",
 				terminalHeight: this.#terminalHeight,
-				notice: `${draftNotice} ${PORTABLE_SETTINGS_NOTICE}`,
+				notice: [options.notice, draftNotice, PORTABLE_SETTINGS_NOTICE].filter(Boolean).join(" "),
 				sections: () => this.#buildSections(),
 			},
 		);
@@ -346,12 +348,14 @@ export class ProfileEditorComponent implements Component {
 			const configuredCount = paths.filter(path => readConfigPath(this.#draft.config, path).present).length;
 			const items: ProfileEditorSectionItem[] = [];
 			if (group.id === "model") {
+				const warnings = this.#callbacks.roleWarnings?.(this.#draft);
 				for (const [role, selector] of Object.entries(draftModelRoles(this.#draft))) {
 					items.push({
 						id: `role:${role}`,
 						label: `Model role · ${cleanImportedLine(role)}`,
 						currentValue: selector === null ? "Automatic" : cleanImportedLine(selector),
 						description: "Edit this model role in the isolated profile draft.",
+						warning: warnings?.get(role),
 						onActivate: () => {
 							void this.#editRole(role);
 						},

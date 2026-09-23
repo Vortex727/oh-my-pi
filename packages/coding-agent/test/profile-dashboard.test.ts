@@ -54,6 +54,12 @@ function setup(height = 24, savedSetupNames: readonly string[] = ["beta"]) {
 			saveCurrentSetup: () => {
 				actions.push("save");
 			},
+			importProfile: () => {
+				actions.push("import");
+			},
+			exportProfile: value => {
+				actions.push(`export:${label(value)}`);
+			},
 			deleteSetup: value => {
 				actions.push(`delete:${value.name}`);
 			},
@@ -205,7 +211,7 @@ describe("profile dashboard interaction boundaries", () => {
 
 		const width = 96;
 		const height = 18;
-		const overview = pageOverviewUntil(dashboard, width, height, "zz-last-agent", lines => {
+		const overview = pageOverviewUntil(dashboard, width, height, "Profile-local default storage", lines => {
 			expect(lines).toHaveLength(height);
 			for (const line of lines) expect(Bun.stringWidth(line)).toBeLessThanOrEqual(width);
 			const rightPane = lines
@@ -687,18 +693,31 @@ describe("profile dashboard interaction boundaries", () => {
 		searchable.dashboard.handleInput("s");
 		searchable.dashboard.handleInput("d");
 		searchable.dashboard.handleInput("n");
+		searchable.dashboard.handleInput("i");
+		searchable.dashboard.handleInput("x");
 		expect(searchable.dashboard.selectedSetup).toEqual(savedSetup("gamma"));
-		expect(searchable.actions.some(action => /^(load:|save$|delete:|rename:)/.test(action))).toBe(false);
+		expect(searchable.actions.some(action => /^(load:|save$|delete:|rename:|import$|export:)/.test(action))).toBe(
+			false,
+		);
 		searchable.dashboard.handleInput("\x1b");
 		expect(searchable.actions).not.toContain("close");
 
 		const wide = setup(24, []);
 		clickRenderedHint(wide.dashboard, 180, "s to save current");
+		clickRenderedHint(wide.dashboard, 180, "i to import profile");
+		clickRenderedHint(wide.dashboard, 180, "x to export profile");
 		clickRenderedHint(wide.dashboard, 180, "m to choose model");
 		clickRenderedHint(wide.dashboard, 180, "a to edit agents");
 		clickRenderedHint(wide.dashboard, 180, ", to edit settings");
 		expect(wide.actions).toEqual(
-			expect.arrayContaining(["save", "control:model", "control:agents", "control:settings"]),
+			expect.arrayContaining([
+				"save",
+				"import",
+				"export:current",
+				"control:model",
+				"control:agents",
+				"control:settings",
+			]),
 		);
 
 		const lastGood = snapshot();

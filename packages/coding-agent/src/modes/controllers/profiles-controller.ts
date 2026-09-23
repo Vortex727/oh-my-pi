@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import { THINKING_EFFORTS } from "@oh-my-pi/pi-catalog/effort";
 import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
@@ -20,15 +21,20 @@ import {
 	type LoadedSetup,
 	listSavedSetups,
 	loadSavedSetup,
+	modelsOnlyDraft,
+	parseProfileText,
 	readConfigPath,
+	readProfileFile,
 	renameSavedSetup,
 	type SavedSetupDescriptor,
 	SetupError,
 	saveSetup,
+	serializeSetup,
 	setSavedSetupEmoji,
 	setupOverrides,
+	writeProfileFile,
 } from "../../profiles/setups";
-import { buildProfileSnapshot } from "../../profiles/snapshot";
+import { buildProfileSnapshot, projectProfileRoles } from "../../profiles/snapshot";
 import type { ProfileDraft, ProfileEmoji, ProfileSnapshot } from "../../profiles/types";
 import {
 	ProfileDashboard,
@@ -38,6 +44,8 @@ import {
 } from "../components/profile-dashboard";
 import { ProfileEditorComponent } from "../components/profile-editor";
 import { createModelBrowserSource } from "../model-browser-source";
+import { resolveToCwd } from "../../tools/path-utils";
+import { copyToClipboard, readTextFromClipboard } from "../../utils/clipboard";
 import type { InteractiveModeContext } from "../types";
 import type { AgentsDashboardHostOptions, ModelHubHostOptions } from "./selector-controller";
 
@@ -57,6 +65,24 @@ interface Notice {
 const CURRENT_SETUP: ProfileDashboardSetupRef = { kind: "current" };
 const APPLY_MODELS_CHOICE = "Apply models to this conversation";
 const NEW_SESSION_CHOICE = "Start a new session";
+const FROM_FILE = "From file";
+const FROM_CLIPBOARD = "From clipboard";
+const WHOLE_PROFILE = "Whole profile";
+const MODELS_ONLY = "Models only";
+const TO_FILE = "Save to file";
+const TO_CLIPBOARD = "Copy to clipboard";
+
+interface EditorOptions {
+	/** Entries the saved file holds that this version could not load; an overwrite drops them. */
+	skipped?: readonly string[];
+	title?: string;
+	name?: string;
+	notice?: string;
+}
+
+function skippedSummary(warnings: readonly string[]): string {
+	return `${warnings.length} entr${warnings.length === 1 ? "y" : "ies"} this version of omp cannot load: ${cleanText(warnings[0])}`;
+}
 
 function setupKey(setup: ProfileDashboardSetupRef): string {
 	return setup.kind === "current" ? "current" : `saved\0${setup.name}`;
@@ -136,6 +162,8 @@ export class ProfilesController {
 				loadSetup: setup => this.#loadSetup(setup),
 				editProfile: setup => this.#editSetup(setup),
 				saveCurrentSetup: () => this.#editSetup(CURRENT_SETUP),
+				importProfile: () => this.#importProfile(),
+				exportProfile: setup => this.#exportProfile(setup),
 				deleteSetup: setup => this.#deleteSetup(setup),
 				renameSetup: setup => this.#renameSetup(setup),
 				openActiveControl: control => this.#openActiveControl(control),
@@ -302,7 +330,7 @@ export class ProfilesController {
 			const saved = await this.#openEditor(
 				setup,
 				{ metadata: draft.metadata, config: draft.config },
-				loaded?.warnings,
+				{ skipped: loaded?.warnings },
 			);
 			if (saved === undefined) return undefined;
 			await this.#refresh({ kind: "saved", name: saved });
@@ -323,10 +351,7 @@ export class ProfilesController {
 	): Promise<string | undefined> {
 		const signal = this.#dialogs.signal;
 		if (setup.kind === "saved" && !saveAsNew) {
-			const drops =
-				skipped.length > 0
-					? `\nSaving also drops ${skipped.length} entr${skipped.length === 1 ? "y" : "ies"} this version of omp cannot load: ${cleanText(skipped[0])}`
-					: "";
+			const drops = skipped.length > 0 ? `\nSaving also drops ${skippedSummary(skipped)}` : "";
 			const confirmed = await this.ctx.showHookConfirm(
 				`Save changes to ${cleanText(setup.name)}?`,
 				`This replaces the saved profile only. The current session does not change.${drops}`,
@@ -363,8 +388,9 @@ export class ProfilesController {
 	async #openEditor(
 		setup: ProfileDashboardSetupRef,
 		draft: ProfileDraft,
-		skipped: readonly string[] = [],
+		options: EditorOptions = {},
 	): Promise<string | undefined> {
+		const skipped = options.skipped ?? [];
 		const effective = this.#draftSettings(draft, "default", "PROFILE DRAFT");
 		const inherited = setup.kind === "saved" ? await this.#previewSettings(undefined) : this.ctx.settings;
 		const availableThemes = await getAvailableThemes();
@@ -393,9 +419,9 @@ export class ProfilesController {
 			draft,
 			effectiveSettings: effective.settings,
 			inheritedSettings: inherited,
-			registry: this.ctx.session.modelRegistry,
-			name: setup.kind === "saved" ? setup.name : "Current profile",
-			title: "Edit profile",
+			name: options.name ?? (setup.kind === "saved" ? setup.name : "Current profile"),
+			title: options.title ?? "Edit profile",
+			notice: options.notice,
 			saveLabel: "Save",
 			allowSaveAsNew: setup.kind === "saved",
 			terminalHeight: this.ctx.ui.terminal.rows,
@@ -440,6 +466,7 @@ export class ProfilesController {
 				onCancel: cancel,
 				onSaveEmoji:
 					setup.kind === "saved" ? emoji => this.#saveEmoji(setup.name, emoji, () => finished) : undefined,
+				roleWarnings: value => this.#roleWarnings(value),
 			},
 		});
 		const handle = this.host.showFullscreenMenu(editor);
@@ -447,21 +474,40 @@ export class ProfilesController {
 		return result.promise;
 	}
 
-	/**
-	 * Isolated settings describing `draft` on top of the effective configuration,
-	 * plus a model-hub source whose role lookups read the draft. Kept in one
-	 * global scope: a setup is a single overlay, not a global/project pair.
-	 */
-	#draftSettings(draft: ProfileDraft, role: string, label: string): { settings: Settings; source: ModelHubSource } {
+	/** The preview's per-role warnings for `draft`, so the editor flags models that are not available here. */
+	#roleWarnings(draft: ProfileDraft): ReadonlyMap<string, string> {
 		const roles = draftModelRoles(draft);
+		const rows = projectProfileRoles({
+			cwd: this.ctx.sessionManager.getCwd(),
+			settings: this.#isolatedDraftSettings(draft),
+			modelRegistry: this.ctx.session.modelRegistry,
+		});
+		const warnings = new Map<string, string>();
+		for (const row of rows) {
+			if (row.warning && Object.hasOwn(roles, row.role)) warnings.set(row.role, row.warning);
+		}
+		return warnings;
+	}
+
+	/**
+	 * Isolated settings describing `draft` on top of the effective configuration.
+	 * Kept in one global scope: a profile is a single overlay, not a global/project pair.
+	 */
+	#isolatedDraftSettings(draft: ProfileDraft): Settings {
 		const overrides: Partial<Record<SettingPath, unknown>> = {};
 		for (const settingPath of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
 			const saved = readConfigPath(draft.config, settingPath);
 			overrides[settingPath] = saved.present ? saved.value : this.ctx.settings.get(settingPath);
 		}
-		overrides.modelRoles = { ...this.ctx.settings.getModelRoles(), ...roles };
+		overrides.modelRoles = { ...this.ctx.settings.getModelRoles(), ...draftModelRoles(draft) };
 		overrides.modelRoleStorage = "global";
-		const settings = Settings.isolated(overrides, { storage: this.ctx.settings.getStorage() });
+		return Settings.isolated(overrides, { storage: this.ctx.settings.getStorage() });
+	}
+
+	/** Draft settings plus a model-hub source whose role lookups read the draft. */
+	#draftSettings(draft: ProfileDraft, role: string, label: string): { settings: Settings; source: ModelHubSource } {
+		const roles = draftModelRoles(draft);
+		const settings = this.#isolatedDraftSettings(draft);
 		const baseSource = createModelBrowserSource(settings);
 		return {
 			settings,
@@ -609,6 +655,132 @@ export class ProfilesController {
 			await this.#refresh(CURRENT_SETUP);
 			return { message: `Deleted profile ${cleanText(setup.name)}`, tone: "success" };
 		});
+	}
+
+	#importProfile(): Promise<void> {
+		return this.#interaction(async () => {
+			const source = await this.ctx.showHookSelector(
+				"Import profile",
+				[
+					{ label: FROM_FILE, description: "Read an exported profile file" },
+					{ label: FROM_CLIPBOARD, description: "Read profile text copied from omp" },
+					"Cancel",
+				],
+				{ signal: this.#dialogs.signal },
+			);
+			const imported =
+				source === FROM_FILE
+					? await this.#readImportFile()
+					: source === FROM_CLIPBOARD
+						? parseProfileText(await readTextFromClipboard())
+						: undefined;
+			if (!imported) return undefined;
+			const saved = await this.#openEditor(
+				CURRENT_SETUP,
+				{ metadata: imported.metadata, config: imported.config },
+				{
+					title: "Import profile",
+					name: "Imported profile",
+					notice: imported.warnings.length > 0 ? `Skipped ${skippedSummary(imported.warnings)}` : undefined,
+				},
+			);
+			if (saved === undefined) return undefined;
+			await this.#refresh({ kind: "saved", name: saved });
+			return { message: `Imported profile ${cleanText(saved)}. Load it to use it.`, tone: "success" };
+		});
+	}
+
+	/** Prompt for an exported profile file until one reads; undefined when cancelled or left empty. */
+	async #readImportFile(): Promise<(ProfileDraft & { warnings: string[] }) | undefined> {
+		let prompt = "Import profile from file";
+		for (;;) {
+			const input = await this.ctx.showHookInput(prompt, "Path to an exported profile", {
+				signal: this.#dialogs.signal,
+			});
+			if (!input?.trim()) return undefined;
+			try {
+				const target = resolveToCwd(input.trim(), this.ctx.sessionManager.getCwd());
+				return await readProfileFile(target, this.#displayPath(target));
+			} catch (error) {
+				if (!(error instanceof SetupError)) throw error;
+				prompt = `${cleanText(error.message)}\nImport profile from file`;
+			}
+		}
+	}
+
+	#exportProfile(setup: ProfileDashboardSetupRef): Promise<void> {
+		return this.#interaction(async () => {
+			const signal = this.#dialogs.signal;
+			const label = setup.kind === "saved" ? setup.name : "Current profile";
+			let draft: ProfileDraft;
+			let skipped: readonly string[] = [];
+			if (setup.kind === "saved") {
+				const loaded = await loadSavedSetup(setup.name, this.#agentDir());
+				const scope = await this.ctx.showHookSelector(
+					`Export profile ${cleanText(label)}`,
+					[
+						{ label: WHOLE_PROFILE, description: "Every model role and setting this profile includes" },
+						{ label: MODELS_ONLY, description: "Model roles and thinking only" },
+						"Cancel",
+					],
+					{ signal },
+				);
+				if (scope !== WHOLE_PROFILE && scope !== MODELS_ONLY) return undefined;
+				draft = scope === WHOLE_PROFILE ? loaded : modelsOnlyDraft(loaded);
+				skipped = loaded.warnings;
+			} else {
+				// The current profile is already models-only; save it first to share settings groups.
+				draft = this.#currentDraft();
+			}
+			const destination = await this.ctx.showHookSelector(
+				`Export profile ${cleanText(label)}`,
+				[
+					{ label: TO_FILE, description: "Write a profile file; an existing file is never replaced" },
+					{ label: TO_CLIPBOARD, description: "Copy the profile text" },
+					"Cancel",
+				],
+				{ signal },
+			);
+			let where: string;
+			if (destination === TO_CLIPBOARD) {
+				await copyToClipboard(serializeSetup(draft));
+				where = "the clipboard";
+			} else if (destination === TO_FILE) {
+				const written = await this.#writeExportFile(draft, setup.kind === "saved" ? setup.name : "profile");
+				if (written === undefined) return undefined;
+				where = this.#displayPath(written);
+			} else {
+				return undefined;
+			}
+			const without = skipped.length > 0 ? `, without ${skippedSummary(skipped)}` : "";
+			return { message: `Exported profile ${cleanText(label)} to ${cleanText(where)}${without}`, tone: "success" };
+		});
+	}
+
+	/** Prompt for an export path (empty accepts the suggestion) until the create-only write succeeds. */
+	async #writeExportFile(draft: ProfileDraft, baseName: string): Promise<string | undefined> {
+		const cwd = this.ctx.sessionManager.getCwd();
+		const suggested = path.join(cwd, `${baseName}.profile.yml`);
+		const title = `Export profile to file (empty saves ${this.#displayPath(suggested)})`;
+		let prompt = title;
+		for (;;) {
+			const input = await this.ctx.showHookInput(prompt, suggested, { signal: this.#dialogs.signal });
+			if (input === undefined) return undefined;
+			const target = input.trim() ? resolveToCwd(input.trim(), cwd) : suggested;
+			try {
+				await writeProfileFile(target, draft, this.#displayPath(target));
+				return target;
+			} catch (error) {
+				if (!(error instanceof SetupError)) throw error;
+				prompt = `${cleanText(error.message)}\n${title}`;
+			}
+		}
+	}
+
+	/** `target` relative to the session folder when inside it, so prompts and notices stay readable. */
+	#displayPath(target: string): string {
+		const relative = path.relative(this.ctx.sessionManager.getCwd(), target);
+		return relative && !relative.startsWith("..") && !path.isAbsolute(relative) ? relative : target;
 	}
 
 	#loadSetup(setup: ProfileDashboardSavedSetupRef): Promise<void> {

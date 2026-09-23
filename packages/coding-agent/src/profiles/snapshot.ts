@@ -202,6 +202,15 @@ function projectMemory(settings: Settings): ProfileSnapshot["memory"] {
 	return { backend, storageLabel: backend === "local" ? "Default local storage" : "No memory storage" };
 }
 
+/**
+ * Resolve every visible model role the way the preview shows it, including
+ * the "not available" warning. Synchronous, so editors can re-check a draft
+ * after each change.
+ */
+export function projectProfileRoles(options: BuildProfileSnapshotOptions): ProfileRoleRow[] {
+	return projectRoles(options, withModel(options.modelRegistry.getAvailable(), options.currentModel));
+}
+
 /** Describe the model roles, agents, memory, and settings a configuration resolves to. */
 export async function buildProfileSnapshot(options: BuildProfileSnapshotOptions): Promise<ProfileSnapshot> {
 	const { settings, modelRegistry, currentModel } = options;

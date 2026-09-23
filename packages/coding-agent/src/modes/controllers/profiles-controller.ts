@@ -72,6 +72,8 @@ const WHOLE_PROFILE = "Whole profile";
 const MODELS_ONLY = "Models only";
 const TO_FILE = "Save to file";
 const TO_CLIPBOARD = "Copy to clipboard";
+const REVIEW_IMPORT = "Yes, review it first";
+const SAVE_IMPORT = "No, save it now";
 
 interface EditorOptions {
 	/** Entries the saved file holds that this version could not load; an overwrite drops them. */
@@ -119,6 +121,8 @@ export class ProfilesController {
 	#closeChild: (() => void) | undefined;
 	/** This session's usage reports, once fetched for the current mount. */
 	#usage: UsageReport[] | undefined;
+	/** Profiles imported during this run of omp, marked "(New)". Kept across Settings mounts. */
+	readonly #imported = new Set<string>();
 
 	constructor(
 		private readonly ctx: InteractiveModeContext,
@@ -200,7 +204,12 @@ export class ProfilesController {
 	#setupRefs(): ProfileDashboardSetupRef[] {
 		return [
 			CURRENT_SETUP,
-			...this.#descriptors.map(item => ({ kind: "saved" as const, name: item.name, metadata: item.metadata })),
+			...this.#descriptors.map(item => ({
+				kind: "saved" as const,
+				name: item.name,
+				metadata: item.metadata,
+				...(this.#imported.has(item.name) ? { imported: true } : {}),
+			})),
 		];
 	}
 
@@ -666,6 +675,7 @@ export class ProfilesController {
 			const input = await this.ctx.showHookInput("Rename profile", setup.name, { signal: this.#dialogs.signal });
 			if (input === undefined) return undefined;
 			const renamed = await renameSavedSetup(setup.name, input, this.#agentDir());
+			if (this.#imported.delete(setup.name)) this.#imported.add(renamed);
 			await this.#refresh({ kind: "saved", name: renamed });
 			return { message: `Renamed profile ${cleanText(setup.name)} to ${cleanText(renamed)}`, tone: "success" };
 		});
@@ -680,6 +690,7 @@ export class ProfilesController {
 			);
 			if (!confirmed) return undefined;
 			await deleteSavedSetup(setup.name, this.#agentDir());
+			this.#imported.delete(setup.name);
 			await this.#refresh(CURRENT_SETUP);
 			return { message: `Deleted profile ${cleanText(setup.name)}`, tone: "success" };
 		});
@@ -703,19 +714,43 @@ export class ProfilesController {
 						? parseProfileText(await readTextFromClipboard())
 						: undefined;
 			if (!imported) return undefined;
-			const saved = await this.#openEditor(
-				CURRENT_SETUP,
-				{ metadata: imported.metadata, config: imported.config },
-				{
+			const draft: ProfileDraft = { metadata: imported.metadata, config: imported.config };
+			const unavailable = this.#roleWarnings(draft).size;
+			const findings = [
+				...(unavailable > 0
+					? [`${unavailable} model${unavailable === 1 ? "" : "s"} not available on this machine`]
+					: []),
+				...(imported.warnings.length > 0
+					? [`${imported.warnings.length} entr${imported.warnings.length === 1 ? "y" : "ies"} skipped`]
+					: []),
+			];
+			const review = await this.ctx.showHookSelector(
+				"Look over the imported profile before saving it?",
+				[
+					{
+						label: REVIEW_IMPORT,
+						description: `Open the full settings menu to check or change it${findings.length > 0 ? ` (${findings.join(", ")})` : ""}`,
+					},
+					{ label: SAVE_IMPORT, description: "Name it and save it as a new profile" },
+					"Cancel",
+				],
+				{ signal: this.#dialogs.signal },
+			);
+			let saved: string | undefined;
+			if (review === SAVE_IMPORT) {
+				saved = await this.#saveDraft(CURRENT_SETUP, draft, true, []);
+			} else if (review === REVIEW_IMPORT) {
+				saved = await this.#openEditor(CURRENT_SETUP, draft, {
 					title: "Import profile",
 					name: "Imported profile",
 					notice: [
 						"Not imported yet: review it, fix any ⚠ model, then Ctrl+S to save it as a new profile (Esc discards).",
 						...(imported.warnings.length > 0 ? [`Skipped ${skippedSummary(imported.warnings)}.`] : []),
 					].join(" "),
-				},
-			);
+				});
+			}
 			if (saved === undefined) return undefined;
+			this.#imported.add(saved);
 			await this.#refresh({ kind: "saved", name: saved });
 			return { message: `Imported profile ${cleanText(saved)}. Load it to use it.`, tone: "success" };
 		});

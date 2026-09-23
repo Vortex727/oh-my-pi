@@ -26,7 +26,15 @@ import type { ProfileSnapshot, SetupMetadata } from "../../profiles/types";
 import { buildProfilePreviewOverview } from "./profile-preview-content";
 
 export type ProfileDashboardActiveControl = "model" | "agents" | "settings";
-export type ProfileDashboardSetupRef = { kind: "current" } | { kind: "saved"; name: string; metadata?: SetupMetadata };
+export type ProfileDashboardSetupRef =
+	| { kind: "current" }
+	| {
+			kind: "saved";
+			name: string;
+			metadata?: SetupMetadata;
+			/** Imported during this run of omp; marked "(New)" until omp exits. */
+			imported?: boolean;
+	  };
 export type ProfileDashboardSavedSetupRef = Extract<ProfileDashboardSetupRef, { kind: "saved" }>;
 type DashboardFocus = "profiles" | "details";
 type DetailAction = "save" | ProfileDashboardActiveControl;
@@ -93,10 +101,11 @@ function setupKey(setup: ProfileDashboardSetupRef): string {
 	return setup.kind === "current" ? "current" : `saved\0${setup.name}`;
 }
 
-function setupSidebarLabel(setup: ProfileDashboardSetupRef): string {
-	const emoji = setup.kind === "saved" && setup.metadata?.emoji ? `${cleanLine(setup.metadata.emoji)} ` : "";
-	const name = setup.kind === "current" ? "Current profile" : cleanLine(setup.name);
-	return `${emoji}${name}`;
+/** Name with its emoji, plus "(New)" when imported during this run. */
+function setupTitle(setup: ProfileDashboardSetupRef): string {
+	if (setup.kind === "current") return "Current profile";
+	const emoji = setup.metadata?.emoji ? `${cleanLine(setup.metadata.emoji)} ` : "";
+	return `${emoji}${cleanLine(setup.name)}${setup.imported ? ` ${theme.fg("accent", "(New)")}` : ""}`;
 }
 
 function normalizeSetups(setups: readonly ProfileDashboardSetupRef[]): ProfileDashboardSetupRef[] {
@@ -105,11 +114,7 @@ function normalizeSetups(setups: readonly ProfileDashboardSetupRef[]): ProfileDa
 	for (const setup of setups) {
 		if (setup.kind !== "saved" || savedNames.has(setup.name)) continue;
 		savedNames.add(setup.name);
-		saved.push(
-			setup.metadata
-				? { kind: "saved", name: setup.name, metadata: setup.metadata }
-				: { kind: "saved", name: setup.name },
-		);
+		saved.push(setup);
 	}
 	return [{ kind: "current" }, ...saved];
 }
@@ -252,7 +257,7 @@ export class ProfileDashboard implements Component {
 		const selected = this.selectedSetup;
 		const listWidth = Math.max(
 			4,
-			Math.trunc(sidebarWidth ?? measureSettingsSidebarWidth(this.#setups.map(setupSidebarLabel))),
+			Math.trunc(sidebarWidth ?? measureSettingsSidebarWidth(this.#setups.map(setupTitle))),
 		);
 		const split = safeWidth >= 68 && bodyRows >= 3;
 		const detailWidth = split ? Math.max(1, safeWidth - listWidth - 2) : safeWidth;
@@ -532,7 +537,7 @@ export class ProfileDashboard implements Component {
 			const setup = visible[offset]!;
 			const key = setupKey(setup);
 			lines[offset] = renderSettingsSidebarRow(
-				setupSidebarLabel(setup),
+				setupTitle(setup),
 				width,
 				key === this.#selectedKey,
 				false,
@@ -564,10 +569,8 @@ export class ProfileDashboard implements Component {
 
 		const state = this.#states.get(setupKey(setup));
 		const snapshot = state?.snapshot;
-		const emoji = setup.kind === "saved" && setup.metadata?.emoji ? `${cleanLine(setup.metadata.emoji)} ` : "";
-		const name = setup.kind === "current" ? "Current profile" : cleanLine(setup.name);
 		const focus = this.#focus === "details" ? `${theme.fg("accent", theme.nav.cursor)} ` : "";
-		const header: string[] = [theme.bold(truncateToWidth(`${focus}${emoji}${name}`, width))];
+		const header: string[] = [theme.bold(truncateToWidth(`${focus}${setupTitle(setup)}`, width))];
 		const descriptor =
 			setup.kind === "current"
 				? "Active session · read-only summary"

@@ -139,6 +139,7 @@ describe("ProfilesController", () => {
 		const inputs: Array<string | undefined> = [];
 		const prompts: string[] = [];
 		const editors = signalQueue<ProfileEditorComponent>();
+		let editorsOpened = 0;
 		const settingsShown = signalQueue<void>();
 		const rendered = signalQueue<void>();
 		const startNewSession = vi.fn(async (_label: string) => true);
@@ -175,6 +176,7 @@ describe("ProfilesController", () => {
 		} as unknown as InteractiveModeContext;
 		const host: ProfilesHost = {
 			showFullscreenMenu: (component: Component) => {
+				editorsOpened++;
 				editors.fire(component as ProfileEditorComponent);
 				return { hide: () => {}, setHidden: () => {} } as unknown as OverlayHandle;
 			},
@@ -211,6 +213,7 @@ describe("ProfilesController", () => {
 			inputs,
 			prompts,
 			nextEditor: editors.next,
+			editorsOpened: () => editorsOpened,
 			nextSettingsShown: settingsShown.next,
 			startNewSession,
 			closeSettings,
@@ -378,12 +381,12 @@ describe("ProfilesController", () => {
 		});
 	});
 
-	it("imports clipboard text into the editor, flags skipped entries and unavailable models, and saves it new", async () => {
+	it("imports clipboard text into the editor when reviewing, flags skipped entries and unavailable models, and saves it new", async () => {
 		vi.spyOn(clipboard, "readTextFromClipboard").mockResolvedValue(
 			"$setup:\n  version: 1\nmodelRoles:\n  smol: nowhere/unknown-model\nretiredSection:\n  flag: true\n",
 		);
 		const h = await harness();
-		h.choices.push("From clipboard");
+		h.choices.push("From clipboard", "Yes, review it first");
 		h.inputs.push("focus", "shared");
 		const editorShown = h.nextEditor();
 		h.dashboard().handleInput("i");
@@ -401,6 +404,42 @@ describe("ProfilesController", () => {
 		const stored = parseProfileText(await Bun.file(path.join(agentDir, "setups", "shared.yml")).text());
 		expect(stored.config).toEqual({ modelRoles: { smol: "nowhere/unknown-model" } });
 		expect(h.screen()).toContain("Imported profile shared");
+	});
+
+	it("saves an import straight to a new name when review is declined", async () => {
+		vi.spyOn(clipboard, "readTextFromClipboard").mockResolvedValue("modelRoles:\n  smol: nowhere/unknown-model\n");
+		const h = await harness();
+		h.choices.push("From clipboard", "No, save it now");
+		h.inputs.push("focus", "quick");
+		const done = h.nextSettingsShown();
+		h.dashboard().handleInput("i");
+		await done;
+
+		expect(h.editorsOpened()).toBe(0);
+		expect(h.prompts[1]).toContain("already exists");
+		const stored = parseProfileText(await Bun.file(path.join(agentDir, "setups", "quick.yml")).text());
+		expect(stored.config).toEqual({ modelRoles: { smol: "nowhere/unknown-model" } });
+		expect(h.screen()).toContain("Imported profile quick");
+
+		// The mark outlives closing Settings, and only the imported profile has it.
+		h.controller.close();
+		await h.mount();
+		const rows = h.screen().split("\n");
+		expect(rows.some(row => row.includes("quick (New)"))).toBe(true);
+		expect(rows.some(row => row.includes("focus (New)"))).toBe(false);
+	});
+
+	it("writes nothing when the review question is cancelled", async () => {
+		vi.spyOn(clipboard, "readTextFromClipboard").mockResolvedValue("modelRoles:\n  smol: nowhere/unknown-model\n");
+		const h = await harness();
+		h.choices.push("From clipboard", "Cancel");
+		const done = h.nextSettingsShown();
+		h.dashboard().handleInput("i");
+		await done;
+
+		expect(h.editorsOpened()).toBe(0);
+		expect(h.prompts).toEqual([]);
+		expect(fs.readdirSync(path.join(agentDir, "setups"))).toEqual(["focus.yml"]);
 	});
 
 	it("shows usage on saved profiles too, limited to the providers each one uses", async () => {

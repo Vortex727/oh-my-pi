@@ -836,6 +836,8 @@ function remapLegacyPiSubpath(rest: string): string {
 
 const LEGACY_PI_SPECIFIER_FILTER = new RegExp(`^@(?:${PI_SCOPE_ALTERNATION})/(?:${PI_PACKAGE_ALTERNATION})(?:/.*)?$`);
 const resolvedSpecifierFallbacks = new Map<string, string>();
+/** Source directories of the host's own pi packages, captured before the resolver hook is installed. */
+let hostPiSourceRoots: readonly string[] = [];
 const SOURCE_MODULE_EXTENSIONS = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"] as const;
 const SUPPORTED_PACKAGE_IMPORT_CONDITIONS = new Set(["bun", "node", "import", "default"]);
 const SUPPORTED_PACKAGE_REQUIRE_CONDITIONS = new Set(["bun", "node", "require", "default"]);
@@ -2649,7 +2651,33 @@ function getLoader(path: string): "js" | "jsx" | "ts" | "tsx" {
 	return "js";
 }
 
+/**
+ * Capture the source directory of each host pi package. This must run before
+ * the resolver hook exists: `Bun.resolveSync` re-enters runtime hooks.
+ */
+function captureHostPiSourceRoots(): void {
+	const roots: string[] = [];
+	for (const packageName of PI_PACKAGE_NAMES) {
+		try {
+			roots.push(path.dirname(Bun.resolveSync(`${CANONICAL_PI_SCOPE}/${packageName}`, import.meta.dir)));
+		} catch {
+			// Compiled binaries bundle host packages; there is no filesystem root to capture.
+		}
+	}
+	hostPiSourceRoots = roots;
+}
+
 function resolveLegacyPiSpecifier(args: { path: string; importer: string }): LegacyPiResolveResult | undefined {
+	// Host modules already resolve canonical packages natively, and on Windows Bun
+	// turns a hook-returned `file` path into an unreadable `file:<path>` key. Leave
+	// host-internal imports (e.g. the lazily required model hub) to Bun.
+	if (
+		args.path.startsWith(`${CANONICAL_PI_SCOPE}/`) &&
+		args.importer.length > 0 &&
+		hostPiSourceRoots.some(root => isPathInsideRoot(root, args.importer))
+	) {
+		return undefined;
+	}
 	const remappedSpecifier = remapLegacyPiSpecifier(args.path);
 	if (!remappedSpecifier) {
 		return undefined;
@@ -2687,6 +2715,7 @@ export function installLegacyPiSpecifierShim(): void {
 	if (isLegacyPiSpecifierShimInstalled) {
 		return;
 	}
+	captureHostPiSourceRoots();
 	isLegacyPiSpecifierShimInstalled = true;
 
 	Bun.plugin({

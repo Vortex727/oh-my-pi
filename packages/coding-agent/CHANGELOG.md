@@ -4,10 +4,22 @@
 
 ### Added
 
+- Added `wait` tool for monitoring background jobs, services, and peer messages
+- Added `proc://` protocol for inspecting and managing background jobs and services
+- Added `agent://` path support to `write` tool for direct agent messaging
+- Added supervised service mode to `bash` tool with `proc://` integration
+- Added Jev (TypeSafe Jev 1.13) to `toks` command supported encodings
+- Added `*** Insert Before` and `*** Insert After` to append new lines without replacing existing code
+- Added `toks` command to count tokens via offline tokenizers
+- Added automatic discovery of Apple Foundation Models on supported Apple silicon devices
+- Added recording of idle recaps to `session_recaps` table for durable storage
+- Added GC cleanup of session recap rows when deleting archived sessions
+- Implemented automatic title retry for ambiguous first messages
 - Added **Profiles** to Settings (also `/profiles`): save your current models, agents, and chosen settings groups as a named profile, preview it read-only, edit it as an isolated draft (agents through the `/agents` hub), and load it either into this conversation (models and thinking only) or into a new session (everything it includes, applied live) without rewriting your configuration. The Current profile entry names the loaded profile, and `u` unloads it. Profiles written by other omp versions load what this version understands and name every skipped entry ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727))
 - Added profile export and import in the Profiles tab: export a profile whole or models-only to a file (never replacing one) or the clipboard, and import one back from either. Imports skip and name anything this version cannot load, offer a review in the profile editor (with unavailable models flagged) or go straight to naming, save under a new name, and are marked **(New)** until omp exits. Safety settings such as the tool approval mode never travel: exports leave them out, imports hold them back, and both say which ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727))
 - Added quota to every profile's overview in the Profiles tab: the remaining quota on each provider that profile's models use, and which roles use it, so profiles can be compared before switching ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727))
 - Added `/changelog last [N]` to show the latest release, or the last N releases. `/changelog` still shows the recent default and `/changelog full` still shows the complete history.
+- Added 'daybreak' badge to `omp usage` output for enabled accounts
 - Added `omp login` command for terminal-based OAuth authentication, including automated model discovery refresh and browser-opening support
 - Enabled `org-scoped-identity` and `oauth-token-env` configuration parsing for authentication providers
 - Adopted namespaced `authStorage` API for CLI and session management
@@ -21,15 +33,28 @@
 
 ### Changed
 
+- Changed default `bash.autoBackground.strategy` to `catalog`
+- Renamed `Launch` configuration group to `Services`
+- Improved terminal output for pipe-backed shells by normalizing line endings
+- Updated edit mode syntax to use `*** Edit File:`, `*** Find`, and `*** Replace` instead of `SM:` prefixed headers
 - Unified terminal OAuth flow logic across `omp login` and `omp auth-broker login`
 - Included identity account/organization info in terminal login success messages
 - Changed judgment fallback to consider only native candidates, preventing prompted models from replacing failed natives
+
+### Deprecated
+
+- Deprecated `hub` tool in favor of `wait`, `write`, and `proc://` protocols
+
+### Removed
+
+- Removed `irc.timeoutMs` configuration setting
 
 ### Fixed
 
 - Fixed comma-separated line selectors such as `:19,59` in `read`, `grep` paths, and `fetch` reading from the first number through EOF. A bare number in a list is now that single line; a lone `:50` still reads from line 50.
 - Fixed `write` success text reporting JavaScript string length as bytes. The count is now the UTF-8 byte length.
 - Fixed headless print mode (`-p`) silently dropping MCP servers slower than the startup window; print mode now waits for configured servers (bounded by `OMP_MCP_TIMEOUT_MS`) and warns on stderr when one is not ready ([#12188](https://github.com/can1357/oh-my-pi/issues/12188), reported by [@aaronjmars](https://github.com/aaronjmars)).
+- Fixed reader-mode `fetch` output passing inline SVG icons and base64 `data:` images to the model as unreadable payloads; they are now dropped and their alt text is kept ([#13006](https://github.com/can1357/oh-my-pi/pull/13006) by [@H4vC](https://github.com/H4vC)).
 - Fixed `/model` and the model-role picker crashing omp on Windows with a `file:file:…` module error once extensions support was loaded ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727)).
 - Fixed editing one fallback chain in the model hub, or one agent in `/agents`, saving every chain or agent setting a `--config` overlay supplied into `config.yml`; only the edited entry is saved now ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727)).
 - Fixed the Auto-Compact status indicator not updating when compaction is turned on or off in `/settings` ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727)).

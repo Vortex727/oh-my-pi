@@ -4,17 +4,27 @@
 
 ### Added
 
+- Added proc:// and agent:// URI support for process and agent interaction
+- Added support for xd:// documentation topic URLs
+- Added `wait` tool renderer to display background job state and peer-to-peer messages
+- Added supervised bash service rendering for status, readiness, and output
 - Added a fullscreen annotation overlay for diffs and text, with multi-line notes, editing, deletion, and undo ([#12601](https://github.com/can1357/oh-my-pi/pull/12601) by [@anatoli-tsinovoy](https://github.com/anatoli-tsinovoy))
+- Added Daybreak-enabled account listing to usage dashboard overlay
 - Added a composed settings surface that hosts embedded tabs such as Profiles, native section-sidebar row helpers, and a focused single-role model-hub editor ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727))
 - Exported the model browser's context, cost, intelligence, and measured-performance formatters, and the usage dashboard's quota bar and status-color helpers, for reuse ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727))
 - Added `SettingsSelectorComponent.clearSearch()` so embedded editors can reveal errors hidden by a search filter ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727))
 
 ### Changed
 
+- Updated status line context usage to include tool examples in token estimation
 - Mermaid flowcharts and state diagrams now re-pick layout on terminal resize: the shortest orientation that fits the width wins, and the narrowest is used only when none fit.
 - Updated model hub and oauth selector components to use namespaced `authStorage` API
 - Plan Review annotations can now be edited or deleted, span multiple lines, and be undone ([#12601](https://github.com/can1357/oh-my-pi/pull/12601) by [@anatoli-tsinovoy](https://github.com/anatoli-tsinovoy))
 - `AgentsHubDeps` now persists one agent at a time through `setAgentDisabled(name, disabled)` and `setAgentOverride(property, name, value)`, replacing the whole-list `setDisabledAgents`/`setOverrides`; `generateAgent`/`saveAgent` are optional and the hub offers no agent creation without them; `AgentsHubComponent.create` accepts `{ title, initialAgent }` ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727))
+
+### Removed
+
+- Removed `hub` tool renderer and associated messaging components
 
 ### Fixed
 

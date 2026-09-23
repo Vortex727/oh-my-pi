@@ -1,4 +1,4 @@
-import { afterAll, afterEach, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -16,11 +16,10 @@ import {
 } from "@oh-my-pi/pi-catalog/models";
 import { Type as TypeBoxShimType } from "@oh-my-pi/pi-coding-agent/extensibility/legacy-typebox";
 import {
-	__resetLegacyPiResolutionCache,
 	installLegacyPiSpecifierShim,
 	loadLegacyPiModule,
 } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/legacy-pi-compat";
-import { removeWithRetries } from "@oh-my-pi/pi-utils";
+import { isCompiledBinary, removeWithRetries } from "@oh-my-pi/pi-utils";
 
 // pi-ai 15.1.0 removed the runtime `Type` export from `@oh-my-pi/pi-ai`'s
 // package root. Legacy extensions (and their aliased-scope variants such as
@@ -40,7 +39,6 @@ const COMPLETE_API_SOURCE_ID = "legacy-pi-ai-type-remap.test";
 const tempRoots: string[] = [];
 
 afterEach(() => {
-	vi.restoreAllMocks();
 	unregisterCustomApis(COMPLETE_API_SOURCE_ID);
 });
 
@@ -188,14 +186,7 @@ describe("legacy-pi @(scope)/pi-ai root `Type` remap (issue #1437)", () => {
 });
 
 describe("legacy pi package root remaps (issue #1474)", () => {
-	it("loads @earendil-works/pi-coding-agent root imports when host package resolution is unavailable", async () => {
-		const realResolveSync = Bun.resolveSync.bind(Bun);
-		vi.spyOn(Bun, "resolveSync").mockImplementation((specifier: string, from: string) => {
-			if (specifier === "@oh-my-pi/pi-coding-agent" && from.endsWith(path.join("src", "extensibility", "plugins"))) {
-				throw new Error("compiled binary host package resolution unavailable");
-			}
-			return realResolveSync(specifier, from);
-		});
+	it("loads @earendil-works/pi-coding-agent root imports through the host compat shim", async () => {
 		const entry = await writeFixtureExtension(
 			['import { VERSION } from "@earendil-works/pi-coding-agent";', "export const loadedVersion = VERSION;"].join(
 				"\n",
@@ -316,29 +307,24 @@ describe("legacy pi package root remaps (issue #1474)", () => {
 		expect(loaded.stripped).toBe("# Body");
 	});
 
-	it("falls back to legacy-scoped subpath peers for direct plugin imports", async () => {
-		const realResolveSync = Bun.resolveSync.bind(Bun);
-		vi.spyOn(Bun, "resolveSync").mockImplementation((specifier: string, from: string) => {
-			if (specifier === "@oh-my-pi/pi-ai/oauth") {
-				throw new Error(`canonical peer unavailable from ${from}`);
-			}
-			return realResolveSync(specifier, from);
-		});
-
+	it("falls back to legacy-scoped peers when the host does not export the requested subpath", async () => {
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-legacy-direct-subpath-"));
 		tempRoots.push(dir);
 		const packageDir = path.join(dir, "node_modules", "@mariozechner", "pi-ai");
 		await fs.mkdir(packageDir, { recursive: true });
 		await fs.writeFile(
 			path.join(packageDir, "package.json"),
-			JSON.stringify({ type: "module", exports: { "./oauth": "./oauth.js" } }),
+			JSON.stringify({ type: "module", exports: { "./legacy-only-probe": "./oauth.js" } }),
 			"utf8",
 		);
 		await fs.writeFile(path.join(packageDir, "oauth.js"), 'export const marker = "legacy-oauth";', "utf8");
 		const entry = path.join(dir, "index.ts");
 		await fs.writeFile(
 			entry,
-			['import { marker } from "@mariozechner/pi-ai/oauth";', "export const loadedMarker = marker;"].join("\n"),
+			[
+				'import { marker } from "@mariozechner/pi-ai/legacy-only-probe";',
+				"export const loadedMarker = marker;",
+			].join("\n"),
 			"utf8",
 		);
 
@@ -348,25 +334,7 @@ describe("legacy pi package root remaps (issue #1474)", () => {
 		expect(loaded.loadedMarker).toBe("legacy-oauth");
 	});
 
-	it("routes @earendil-works/pi-utils through canonical Bun.resolveSync in non-compiled mode", async () => {
-		// Regression: when omp runs from a node_modules install (not the monorepo
-		// and not a compiled binary), the bundled packages live at
-		// `node_modules/@oh-my-pi/pi-*`, not next to the source tree. Hardcoding
-		// a sibling `packages/<pkg>/src/index.ts` path would miss them, so the
-		// non-compiled branch must delegate to `Bun.resolveSync` against the
-		// canonical specifier.
-		// The resolver memoizes canonical lookups process-wide; clear it so this
-		// assertion observes the Bun.resolveSync delegation rather than a warm
-		// cache populated by an earlier test in the full suite.
-		__resetLegacyPiResolutionCache();
-		const realResolveSync = Bun.resolveSync.bind(Bun);
-		let canonicalLookupSeen = false;
-		vi.spyOn(Bun, "resolveSync").mockImplementation((specifier: string, from: string) => {
-			if (specifier === "@oh-my-pi/pi-utils") {
-				canonicalLookupSeen = true;
-			}
-			return realResolveSync(specifier, from);
-		});
+	it("routes @earendil-works/pi-utils to the canonical host module in non-compiled mode", async () => {
 		const entry = await writeFixtureExtension(
 			[
 				'import { isCompiledBinary } from "@earendil-works/pi-utils";',
@@ -375,8 +343,7 @@ describe("legacy pi package root remaps (issue #1474)", () => {
 		);
 
 		const loaded = (await loadLegacyPiModule(entry)) as { probe: () => boolean };
-		expect(typeof loaded.probe).toBe("function");
-		expect(canonicalLookupSeen).toBe(true);
+		expect(loaded.probe).toBe(isCompiledBinary);
 	});
 });
 it("runs the legacy pi-ai compat `complete` export with SoL-Pi's reducer call shape", async () => {

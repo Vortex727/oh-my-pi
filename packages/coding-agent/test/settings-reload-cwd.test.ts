@@ -3,7 +3,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { getProjectAgentDir, removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
+import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
+import { getProjectAgentDir, removeSyncWithRetries, removeWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
 
@@ -61,7 +62,7 @@ it("distinguishes runtime provenance from global when raw values are identical",
 	expect(settings.getModelRole("default")).toBe(shared);
 });
 
-it("reports overlay provenance for a null tombstone that blocks the global fallback after project clear", async () => {
+it("lets explicit model-role edits override an overlay tombstone while preserving clear semantics", async () => {
 	const testDir = path.join(os.tmpdir(), `provenance-null-${Snowflake.next()}`);
 	const projectDir = path.join(testDir, "project");
 	const overlayPath = path.join(testDir, "overlay.yml");
@@ -75,20 +76,24 @@ it("reports overlay provenance for a null tombstone that blocks the global fallb
 			configFiles: [overlayPath],
 			overrides: { modelRoleStorage: "project" },
 		});
-		settings.setModelRole("default", "anthropic/global");
-		settings.setProjectModelRole("default", "anthropic/project");
-
-		// The overlay null tombstone suppresses the role in the merged view.
 		expect(settings.getModelRole("default")).toBeUndefined();
 		expect(settings.getModelRoleProvenance("default")).toBe("overlay");
 
-		// Clearing the project role must not expose the global layer: the
-		// overlay null is still the effective source.
+		settings.setModelRole("default", "anthropic/global");
+		expect(settings.getModelRole("default")).toBe("anthropic/global");
+		expect(settings.getModelRoleProvenance("default")).toBe("runtime");
+
+		settings.setProjectModelRole("default", "anthropic/project");
+		expect(settings.getModelRole("default")).toBe("anthropic/project");
+		expect(settings.getModelRoleProvenance("default")).toBe("runtime");
+
+		// Clearing remains an explicit edit. Its runtime tombstone blocks both
+		// the overlay and the persisted global fallback for the live project.
 		settings.clearProjectModelRole("default");
 		expect(settings.getProjectModelRole("default")).toBeUndefined();
 		expect(settings.getGlobalModelRole("default")).toBe("anthropic/global");
 		expect(settings.getModelRole("default")).toBeUndefined();
-		expect(settings.getModelRoleProvenance("default")).toBe("overlay");
+		expect(settings.getModelRoleProvenance("default")).toBe("runtime");
 	} finally {
 		if (fs.existsSync(testDir)) removeSyncWithRetries(testDir);
 	}
@@ -226,11 +231,10 @@ describe("Settings.reloadForCwd", () => {
 			);
 		});
 
-		afterEach(() => {
+		afterEach(async () => {
 			resetSettingsForTest();
-			if (fs.existsSync(testDir)) {
-				removeSyncWithRetries(testDir);
-			}
+			AgentStorage.close();
+			await removeWithRetries(testDir);
 		});
 
 		it("loads and drops project settings as the working directory changes", async () => {
@@ -280,6 +284,78 @@ describe("Settings.reloadForCwd", () => {
 			expect(await Bun.file(globalConfigPath).exists()).toBe(false);
 			const reloaded = await Settings.loadIsolated({ cwd: startDir, agentDir });
 			expect(reloaded.getProjectModelRole("default")).toBe("anthropic/claude-sonnet-4-5");
+		});
+		it("keeps an overlay-shadowed project role local to its project", async () => {
+			const overlayPath = path.join(testDir, "saved-setup.yml");
+			await Bun.write(
+				overlayPath,
+				YAML.stringify(
+					{
+						modelRoleStorage: "project",
+						modelRoles: { default: "anthropic/overlay-default" },
+					},
+					null,
+					2,
+				),
+			);
+			const settings = await Settings.init({
+				cwd: startDir,
+				agentDir,
+				configFiles: [overlayPath],
+			});
+			expect(settings.getModelRole("default")).toBe("anthropic/overlay-default");
+
+			settings.setProjectModelRole("default", "openai/project-default");
+			expect(settings.getModelRole("default")).toBe("openai/project-default");
+			await settings.flush();
+
+			expect(YAML.parse(await Bun.file(path.join(startDir, ".omp", "config.yml")).text())).toEqual({
+				modelRoles: { default: "openai/project-default" },
+			});
+			expect(YAML.parse(await Bun.file(overlayPath).text())).toEqual({
+				modelRoleStorage: "project",
+				modelRoles: { default: "anthropic/overlay-default" },
+			});
+
+			const cloned = await settings.cloneForCwd(bareProject);
+			expect(cloned.getModelRole("default")).toBe("anthropic/overlay-default");
+			expect(settings.getModelRole("default")).toBe("openai/project-default");
+
+			await settings.reloadForCwd(bareProject);
+			expect(settings.getModelRole("default")).toBe("anthropic/overlay-default");
+		});
+		it("keeps an overlay-shadowed project role clear local to its project", async () => {
+			const overlayPath = path.join(testDir, "saved-setup.yml");
+			await Bun.write(
+				overlayPath,
+				YAML.stringify(
+					{
+						modelRoleStorage: "project",
+						modelRoles: { default: "anthropic/overlay-default" },
+					},
+					null,
+					2,
+				),
+			);
+			const settings = await Settings.init({
+				cwd: startDir,
+				agentDir,
+				configFiles: [overlayPath],
+			});
+
+			settings.clearProjectModelRole("default");
+			expect(settings.getModelRole("default")).toBeUndefined();
+			await settings.flush();
+			expect(YAML.parse(await Bun.file(path.join(startDir, ".omp", "config.yml")).text())).toEqual({
+				modelRoles: { default: null },
+			});
+
+			const cloned = await settings.cloneForCwd(bareProject);
+			expect(cloned.getModelRole("default")).toBe("anthropic/overlay-default");
+			expect(settings.getModelRole("default")).toBeUndefined();
+
+			await settings.reloadForCwd(bareProject);
+			expect(settings.getModelRole("default")).toBe("anthropic/overlay-default");
 		});
 		it("does not copy unedited roles from other project settings providers", async () => {
 			await Bun.write(

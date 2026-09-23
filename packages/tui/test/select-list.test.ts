@@ -129,6 +129,57 @@ describe("SelectList", () => {
 		expect(visibleIndexOf(rendered[0]!, "Show changelog")).toBe(visibleIndexOf(rendered[1]!, "Show all"));
 	});
 
+	it("keeps label-first emoji rows readable when terminal glyph widths disagree", () => {
+		const items = [
+			{ value: "", label: "None", description: "Remove the icon" },
+			{ value: "budget", label: "Budget", icon: "🪙", description: "Budget profile" },
+			{ value: "local", label: "Local", icon: "🖥️", description: "Local profile" },
+			{ value: "cloud", label: "Cloud", icon: "☁️", description: "Cloud profile" },
+			{ value: "architecture", label: "Architecture", icon: "🏗️", description: "Architecture profile" },
+		];
+		const list = new SelectList(
+			items,
+			10,
+			{ ...testTheme, hovered: text => `\x1b[7m${text}\x1b[27m` },
+			{
+				iconPosition: "after",
+				iconGap: 2,
+				maxPrimaryColumnWidth: 14,
+			},
+		);
+		list.setSelectedValue("cloud");
+		list.setHoverIndex(1);
+		const rendered = list.render(80).map(Bun.stripANSI);
+
+		const labelColumn = visibleIndexOf(rendered[0], "None");
+		const iconColumns = items.slice(1).map(item => {
+			const line = rendered.find(candidate => candidate.includes(item.label))!;
+			const iconColumn = visibleIndexOf(line, item.icon!);
+			const labelEnd = line.indexOf(item.label) + item.label.length;
+			expect(line.slice(labelEnd, line.indexOf(item.icon!))).toMatch(/^ {2,}$/);
+			expect(visibleIndexOf(line, item.label)).toBe(labelColumn);
+			return iconColumn;
+		});
+		expect(new Set(iconColumns).size).toBe(1);
+		const descriptionColumn = visibleIndexOf(rendered[0], "Remove the icon");
+		expect(descriptionColumn).toBe(visibleIndexOf(rendered[1], "Budget profile"));
+		expect(descriptionColumn - 4).toBe(iconColumns[0]);
+
+		const narrowItems = [
+			{ value: "coding", label: "Coding", icon: "💻" },
+			{ value: "architecture", label: "Architecture", icon: "🏗️" },
+		];
+		const narrow = new SelectList(narrowItems, 2, testTheme, {
+			iconPosition: "after",
+			iconGap: 2,
+			maxPrimaryColumnWidth: 14,
+		});
+		narrow.setSelectedValue("architecture");
+		const narrowRows = narrow.render(10);
+		expect(visibleIndexOf(narrowRows[0], "💻")).toBe(visibleIndexOf(narrowRows[1], "🏗️"));
+		expect(narrowRows).toEqual(["  Co  💻", "→ Ar  🏗️"]);
+	});
+
 	it("styles icons on unselected rows only, leaving the selected row to selectedText", () => {
 		const themeWithIcon: SelectListTheme = { ...testTheme, icon: (text: string) => `«${text}»` };
 		const items = [

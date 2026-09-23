@@ -164,7 +164,9 @@ Within either overlay list, later files override earlier files. Overlay paths ar
 Write behavior:
 
 - `settings.set(...)` writes to the **global** layer (the global YAML file selected at startup) and queues a background save.
-- Project settings and config overlays are read-only from the settings API.
+- If a config overlay supplies the edited setting, the explicit edit also updates the runtime layer so the new value takes effect immediately. Without an overlay for that setting, existing project/runtime precedence is unchanged.
+- Model-role edits use the selected global or project storage. Edits that override a loaded preset take effect in the current session; project-scoped edits do not follow the session into another project's settings.
+- Overlay files remain read-only. Editing a loaded saved setup does not rewrite its preset; save the current setup explicitly to update it.
 
 ### Settings load failures
 

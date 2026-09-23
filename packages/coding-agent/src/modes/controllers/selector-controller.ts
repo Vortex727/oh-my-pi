@@ -1,6 +1,9 @@
+import * as path from "node:path";
 import { type AgentMessage, type AgentToolResult, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { CompactionOutcome } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Model, PASTE_CODE_LOGIN_PROVIDERS as PasteCodeLoginProviders, UsageReport } from "@oh-my-pi/pi-ai";
+import { THINKING_EFFORTS } from "@oh-my-pi/pi-catalog/effort";
+import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import type { getOAuthProviders as GetOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import type { OAuthProvider } from "@oh-my-pi/pi-ai/oauth/types";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
@@ -13,6 +16,7 @@ import {
 	normalizePathForComparison,
 	sanitizeText,
 } from "@oh-my-pi/pi-utils";
+import { getActiveProfile } from "@oh-my-pi/pi-utils/dirs";
 import {
 	ADVISOR_DEFAULT_TOOL_NAMES,
 	discoverAdvisorConfigs,
@@ -23,10 +27,12 @@ import {
 import { reset as resetCapabilities } from "../../capability";
 import type { AdvisorConfigScope } from "@oh-my-pi/pi-tui/overlays/advisor-config";
 import { showGitOverlay } from "../../cli/git-tui";
+import { collectUsageSnapshot } from "../../cli/usage-cli";
+import { getProfileLaunchConfigFiles } from "../../cli/profile-bootstrap";
 import { resolveAdvisorRoleSelection, resolveModelRoleValue } from "../../config/model-resolver";
 import { formatModelSelectorValue } from "@oh-my-pi/pi-tui/overlays/model-selector";
 import { getRoleInfo } from "../../config/model-roles";
-import { settings } from "../../config/settings";
+import { SETTINGS_SCHEMA, Settings, settings, type RawSettings, type SettingPath } from "../../config/settings";
 import { createSettingsHost } from "../../config/settings-ui";
 import { createPluginSettingsHost } from "../../extensibility/plugins/settings-host";
 import type { disableProvider as DisableProvider, enableProvider as EnableProvider } from "../../discovery";
@@ -49,6 +55,14 @@ import {
 	theme,
 } from "@oh-my-pi/pi-tui/theme";
 import type { AgentHubOpenOptions, InteractiveModeContext } from "../../modes/types";
+import {
+	ProfileDashboard,
+	type ProfileDashboardActiveControl,
+	type ProfileDashboardSavedSetupRef,
+	type ProfileDashboardSetupRef,
+} from "../components/profile-dashboard";
+import { ProfileEditorComponent } from "../components/profile-editor";
+import { ProfileImportPreview } from "../components/profile-import-preview";
 import type { SessionOAuthAccountList } from "../../session/agent-session-types";
 import type { ResetCreditAccountStatus, ResetCreditRedeemOutcome } from "../../session/auth-storage";
 import {
@@ -64,6 +78,43 @@ import type { SessionEntry, SessionTreeNode } from "../../session/session-entrie
 import type { SessionInfo } from "../../session/session-listing";
 import { SessionManager } from "../../session/session-manager";
 import { loadPinnedSessionIds } from "../../session/session-pins";
+import { hasProfileLaunchContext, inspectProfile } from "../../profiles/client";
+import { serializeModelRoles, writeModelRolesFile } from "../../profiles/role-sharing";
+import {
+	parseProfileArtifact,
+	readProfileArtifactFile,
+	serializeProfile,
+	writeProfileFile,
+} from "../../profiles/profile-sharing";
+import {
+	profileAssignmentKey,
+	projectProfileCompatibility,
+	replaceProfileAssignment,
+	removeUnavailableProfileAgent,
+	type ProfileAssignmentIdentity,
+} from "../../profiles/profile-compatibility";
+import { getUi } from "../../config/settings-schema";
+import { applySetupModelRoles } from "../../profiles/apply-model-roles";
+import { applyProfileModelPerformance, buildProfileSnapshot } from "../../profiles/snapshot";
+import {
+	createProfileDraft,
+	deleteSavedSetup,
+	getProfileGroupPaths,
+	listSavedSetups,
+	loadSavedSetup as readSavedSetup,
+	normalizeSetupName,
+	renameSavedSetup,
+	saveProfileDraft,
+	type SavedSetupDescriptor,
+} from "../../profiles/setups";
+import {
+	PROFILE_SETTINGS_GROUPS,
+	type ModelRoleAssignments,
+	type ModelRoleImportRow,
+	type ProfileDraft,
+	type ProfileSnapshot,
+} from "../../profiles/types";
+import { PROFILE_USAGE_STALE_MS, sanitizeProfileUsageSnapshot } from "../../profiles/usage";
 import { FileSessionStorage } from "../../session/session-storage";
 import { toLogoutAccounts } from "../../slash-commands/helpers/logout";
 import type { LogoutAccount } from "@oh-my-pi/pi-tui/overlays/logout-account-selector";
@@ -79,11 +130,13 @@ import {
 import type { ToolSession } from "../../tools";
 import { AskTool, type AskToolInput } from "../../tools/ask";
 import { type AskToolDetails } from "@oh-my-pi/pi-tui/tools/ask";
-import { sanitizeDisplayWarnings, shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
+import { replaceTabs, sanitizeDisplayWarnings, shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
+import { oneLineLabel } from "@oh-my-pi/pi-tui/tools/task";
 import { ToolAbortError } from "../../tools/tool-errors";
+import { resolveToCwd } from "../../tools/path-utils";
 import { applyHyperlinkSetting } from "@oh-my-pi/pi-tui/render/hyperlink";
 import { captureBrowserSession } from "../../utils/browser-session";
-import { copyToClipboard } from "../../utils/clipboard";
+import { copyToClipboard, readTextFromClipboard } from "../../utils/clipboard";
 import { openPath } from "../../utils/open";
 import {
 	setSessionTerminalTitle,
@@ -108,7 +161,9 @@ import { HistorySearchComponent } from "@oh-my-pi/pi-tui/overlays/history-search
 import type { LoginDialogComponent as LoginDialogComponentType } from "@oh-my-pi/pi-tui/overlays/login-dialog";
 import type { LogoutAccountSelectorComponent as LogoutAccountSelectorComponentType } from "@oh-my-pi/pi-tui/overlays/logout-account-selector";
 import type {
+	ModelHubCallbacks,
 	ModelHubComponent as ModelHubComponentType,
+	ModelHubSource,
 	ModelRoleSelectionScope,
 } from "@oh-my-pi/pi-tui/overlays/model-hub";
 import { createModelBrowserSource } from "../model-browser-source";
@@ -121,7 +176,7 @@ import { type BranchVariantPath, RewindSelectorComponent } from "@oh-my-pi/pi-tu
 import { renderSegmentTrack } from "@oh-my-pi/pi-tui/chrome/segment-track";
 import { SessionAccountSelectorComponent } from "@oh-my-pi/pi-tui/overlays/session-account-selector";
 import { SessionSelectorComponent, type SessionSelectorOptions } from "@oh-my-pi/pi-tui/overlays/session-selector";
-import { SettingsSelectorComponent } from "@oh-my-pi/pi-tui/overlays/settings-selector";
+import { SettingsSelectorComponent, type SettingsNavigationTab } from "@oh-my-pi/pi-tui/overlays/settings-selector";
 import { ToolExecutionComponent } from "@oh-my-pi/pi-tui/chat/tool-execution";
 import { TranscriptBlock } from "@oh-my-pi/pi-tui/chrome/transcript-container";
 import { TreeSelectorComponent } from "@oh-my-pi/pi-tui/overlays/tree-selector";
@@ -129,11 +184,100 @@ import { UsageDashboardComponent } from "@oh-my-pi/pi-tui/overlays/usage-dashboa
 import { renderUsageReports } from "./command-controller";
 import type { SessionObserverRegistry } from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
 
+interface CachedProfileSnapshot {
+	snapshot: ProfileSnapshot;
+	storedAt: number;
+	sourceUpdatedAt?: number;
+}
+
+type ProfileDashboardRefresh = (contentChanged: boolean) => Promise<boolean>;
 const MANUAL_LOGIN_PROMPT = "Paste the authorization code (or full redirect URL), then press Enter:";
 
 interface ModelOverlayModules {
 	ModelHubComponent: typeof ModelHubComponentType;
 	ModelPickerComponent: typeof ModelPickerComponentType;
+}
+
+interface ModelHubHostOptions {
+	initialProviderId?: string;
+	initialAssignRole?: string;
+	source?: ModelHubSource;
+	roleCallbacks?: Pick<ModelHubCallbacks, "onAssign" | "onUnassign">;
+	isCancelled?: () => boolean;
+	setClose?: (close: () => void) => void;
+	onDone?: () => void;
+}
+
+interface AgentsDashboardHostOptions {
+	isCancelled?: () => boolean;
+	onDone?: () => void;
+}
+
+interface ProfileRoleSourceOptions {
+	config?: RawSettings;
+	modelRoles?: Readonly<Record<string, string | null>>;
+	snapshot?: ProfileSnapshot;
+	label: string;
+	role: string;
+}
+
+function savedSettingValue(config: RawSettings, settingPath: SettingPath): { found: boolean; value?: unknown } {
+	let current: unknown = config;
+	for (const segment of settingPath.split(".")) {
+		if (
+			typeof current !== "object" ||
+			current === null ||
+			Array.isArray(current) ||
+			!Object.hasOwn(current, segment)
+		) {
+			return { found: false };
+		}
+		current = (current as Record<string, unknown>)[segment];
+	}
+	return { found: true, value: current };
+}
+
+function cleanRoleSharingText(value: unknown): string {
+	const sanitized = replaceTabs(sanitizeText(String(value ?? "")));
+	return oneLineLabel(sanitized, sanitized.length || 1);
+}
+
+function roleImportStatusLabel(status: ModelRoleImportRow["status"]): string {
+	switch (status) {
+		case "ready":
+			return "Ready";
+		case "automatic":
+			return "Automatic";
+		case "provider-missing":
+			return "Provider missing";
+		case "credentials-missing":
+			return "Credentials missing";
+		case "model-missing":
+			return "Model missing";
+		case "needs-review":
+			return "Needs review";
+	}
+}
+
+function describeRoleImportStatus(row: ModelRoleImportRow): string {
+	const detail = row.message ? cleanRoleSharingText(row.message) : "";
+	switch (row.status) {
+		case "ready": {
+			const target = row.provider && row.modelId ? `${row.provider}/${row.modelId}` : "local model";
+			const thinking = row.thinkingLevel ? `, thinking ${row.thinkingLevel}` : "";
+			return [
+				`${roleImportStatusLabel(row.status)} — ${cleanRoleSharingText(target)}${thinking}`,
+				detail ? ` · ${detail}` : "",
+			].join("");
+		}
+		case "automatic":
+			return "Automatic model assignment";
+		case "provider-missing":
+		case "credentials-missing":
+		case "model-missing":
+		case "needs-review":
+			return `${roleImportStatusLabel(row.status)}${detail ? ` — ${detail}` : ""}`;
+	}
 }
 
 /** Synchronous first-use boundary for model overlays; key callbacks require immediate mounting. */
@@ -177,6 +321,13 @@ function loadProviderToggles(): ProviderToggleModules {
 
 export class SelectorController {
 	constructor(private ctx: InteractiveModeContext) {}
+	readonly #profileSnapshotCache = new Map<string, CachedProfileSnapshot>();
+	#closeProfileDashboard: (() => void) | undefined;
+	#profileDashboardOpeningGeneration = 0;
+	#closeSettingsOverlay: (() => void) | undefined;
+	#settingsSelector: SettingsSelectorComponent | undefined;
+	#mountProfilesContent: (() => Promise<void>) | undefined;
+	#settingsOpeningGeneration = 0;
 	/**
 	 * Mount a primary fullscreen menu through the one polished modal path shared
 	 * by Settings, Model Hub, and Agent Hub.
@@ -202,6 +353,52 @@ export class SelectorController {
 		this.#defaultRoleMutationTail = previous.then(() => promise);
 		await previous;
 		return resolve;
+	}
+
+	#createProfileRoleSource(options: ProfileRoleSourceOptions): {
+		settings: Settings;
+		source: ModelHubSource;
+	} {
+		const overrides: Partial<Record<SettingPath, unknown>> = {};
+		const displayed = new Map(
+			options.snapshot?.settings.filter(row => !row.hidden).map(row => [row.path, row.value]),
+		);
+		for (const settingPath of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
+			const saved = options.config ? savedSettingValue(options.config, settingPath) : undefined;
+			overrides[settingPath] = saved?.found
+				? saved.value
+				: displayed.has(settingPath)
+					? displayed.get(settingPath)
+					: this.ctx.settings.get(settingPath);
+		}
+		if (options.modelRoles) {
+			overrides.modelRoles = {
+				...this.ctx.settings.getModelRoles(),
+				...options.modelRoles,
+			};
+		}
+		// A saved or imported setup is one atomic overlay, not a
+		// global/project settings pair. Keeping its editor in one scope prevents
+		// scope controls from promising writes to layers that the setup file does
+		// not have.
+		overrides.modelRoleStorage = "global";
+		const previewSettings = Settings.isolated(overrides, { storage: this.ctx.settings.getStorage() });
+		const baseSource = createModelBrowserSource(previewSettings);
+		return {
+			settings: previewSettings,
+			source: {
+				...baseSource,
+				getModelRole: candidate =>
+					options.modelRoles && Object.hasOwn(options.modelRoles, candidate)
+						? (options.modelRoles[candidate] ?? undefined)
+						: baseSource.getModelRole(candidate),
+				getRoleInfo: candidate => {
+					const info = baseSource.getRoleInfo(candidate);
+					if (candidate !== options.role) return info;
+					return { ...info, tag: `${options.label} · ${info.tag ?? info.name ?? candidate}` };
+				},
+			},
+		};
 	}
 
 	async #refreshOAuthProviderAuthState(): Promise<void> {
@@ -254,91 +451,163 @@ export class SelectorController {
 		this.ctx.ui.requestRender();
 	}
 
-	showSettingsSelector(): void {
-		getAvailableThemes().then(availableThemes => {
-			// Fullscreen settings editor on the alternate screen: the overlay
-			// enables mouse tracking (click/hover/wheel) for its lifetime and
-			// the transcript stays untouched underneath.
-			const done = () => {
-				overlayHandle?.hide();
-				this.focusActiveEditorArea();
-				this.ctx.ui.requestRender();
-			};
-			const selector = new SettingsSelectorComponent(
-				{
-					availableThinkingLevels: [...this.ctx.session.getAvailableThinkingLevels()],
-					thinkingLevel: this.ctx.session.thinkingLevel,
-					availableThemes,
-					providers: [...new Set(this.ctx.session.getAvailableModels().map(model => model.provider))].sort(
-						(a, b) => a.localeCompare(b),
-					),
-					settings: createSettingsHost(),
-					plugins: createPluginSettingsHost(getProjectDir()),
-					model: this.ctx.session.model,
-					imageBudget: this.ctx.ui.imageBudget,
-					requestRender: () => this.ctx.ui.requestRender(),
-					composerPreviewStatus: this.ctx.statusLine,
+	closeSettingsSelector(): void {
+		this.#settingsOpeningGeneration++;
+		this.#profileDashboardOpeningGeneration++;
+		this.#closeSettingsOverlay?.();
+	}
+
+	async showSettingsSelector(initialTab?: SettingsNavigationTab): Promise<void> {
+		const requestedTab = initialTab ?? "appearance";
+		if (this.#closeSettingsOverlay) {
+			const selector = this.#settingsSelector;
+			if (selector) {
+				selector.selectTab(requestedTab);
+				if (requestedTab === "profiles") await this.#mountProfilesContent?.();
+			}
+			return;
+		}
+
+		const generation = ++this.#settingsOpeningGeneration;
+		const availableThemes = await getAvailableThemes();
+		if (generation !== this.#settingsOpeningGeneration || this.ctx.isShuttingDown) return;
+
+		let closed = false;
+		let profilesRequested = false;
+		let profileRefresh: ProfileDashboardRefresh | undefined;
+		let profileRefreshPromise: Promise<boolean> | undefined;
+		let profileMountPromise: Promise<ProfileDashboardRefresh | undefined> | undefined;
+		const settingsOverlay: {
+			selector?: SettingsSelectorComponent;
+			handle?: OverlayHandle;
+		} = {};
+		const restoreStatusLine = () => {
+			this.ctx.statusLine.updateSettings({
+				preset: this.ctx.settings.get("statusLine.preset"),
+				leftSegments: this.ctx.settings.get("statusLine.leftSegments"),
+				rightSegments: this.ctx.settings.get("statusLine.rightSegments"),
+				separator: this.ctx.settings.get("statusLine.separator"),
+				showHookStatus: this.ctx.settings.get("statusLine.showHookStatus"),
+				sessionAccent: this.ctx.settings.get("statusLine.sessionAccent"),
+				transparent: this.ctx.settings.get("statusLine.transparent"),
+				compactThinkingLevel: this.ctx.settings.get("statusLine.compactThinkingLevel"),
+				contextLine: this.ctx.settings.get("statusLine.contextLine"),
+			});
+			this.ctx.ui.requestRender();
+		};
+		const done = () => {
+			if (closed) return;
+			closed = true;
+			this.#settingsOpeningGeneration++;
+			this.#profileDashboardOpeningGeneration++;
+			this.#closeProfileDashboard?.();
+			settingsOverlay.handle?.hide();
+			if (this.#closeSettingsOverlay === done) {
+				this.#closeSettingsOverlay = undefined;
+				this.#mountProfilesContent = undefined;
+				this.#settingsSelector = undefined;
+			}
+			restoreStatusLine();
+			this.focusActiveEditorArea();
+			this.ctx.ui.requestRender();
+		};
+		const mountProfiles = async (): Promise<void> => {
+			profilesRequested = true;
+			const { selector, handle } = settingsOverlay;
+			if (!selector || !handle || closed) return;
+			if (!profileMountPromise) {
+				profileMountPromise = this.#mountProfilesDashboard(selector, handle, done);
+				profileRefresh = await profileMountPromise;
+				return;
+			}
+			if (!profileRefresh) {
+				await profileMountPromise;
+				return;
+			}
+			if (profileRefreshPromise) {
+				await profileRefreshPromise;
+				return;
+			}
+			const pending = profileRefresh(false);
+			profileRefreshPromise = pending;
+			try {
+				await pending;
+			} finally {
+				if (profileRefreshPromise === pending) profileRefreshPromise = undefined;
+			}
+		};
+
+		const selector = new SettingsSelectorComponent(
+			{
+				availableThinkingLevels: [...this.ctx.session.getAvailableThinkingLevels()],
+				thinkingLevel: this.ctx.session.thinkingLevel,
+				availableThemes,
+				providers: [...new Set(this.ctx.session.getAvailableModels().map(model => model.provider))].sort((a, b) =>
+					a.localeCompare(b),
+				),
+				settings: createSettingsHost({
+					source: this.ctx.settings,
+				}),
+				plugins: createPluginSettingsHost(getProjectDir()),
+				model: this.ctx.session.model,
+				imageBudget: this.ctx.ui.imageBudget,
+				requestRender: () => this.ctx.ui.requestRender(),
+				composerPreviewStatus: this.ctx.statusLine,
+			},
+			{
+				onChange: (id, value) => this.handleSettingChange(id, value),
+				onThemePreview: async themeName => {
+					const result = await previewTheme(themeName);
+					if (result.success) {
+						this.ctx.statusLine.invalidate();
+						this.ctx.ui.invalidate();
+						this.ctx.ui.requestRender();
+					}
 				},
-				{
-					onChange: (id, value) => this.handleSettingChange(id, value),
-					onThemePreview: async themeName => {
-						const result = await previewTheme(themeName);
-						if (result.success) {
-							this.ctx.statusLine.invalidate();
-							this.ctx.ui.invalidate();
-							this.ctx.ui.requestRender();
-						}
-					},
-					onStatusLinePreview: previewSettings => {
-						// Update status line with preview settings
-						this.ctx.statusLine.updateSettings({
-							preset: settings.get("statusLine.preset"),
-							leftSegments: settings.get("statusLine.leftSegments"),
-							rightSegments: settings.get("statusLine.rightSegments"),
-							separator: settings.get("statusLine.separator"),
-							showHookStatus: settings.get("statusLine.showHookStatus"),
-							sessionAccent: settings.get("statusLine.sessionAccent"),
-							transparent: settings.get("statusLine.transparent"),
-							compactThinkingLevel: settings.get("statusLine.compactThinkingLevel"),
-							contextLine: settings.get("statusLine.contextLine"),
-							...previewSettings,
-						});
-						this.ctx.ui.requestRender();
-					},
-					getStatusLinePreview: () => {
-						// The bar exactly as the active composer shape renders it (box top
-						// border, claude rule + chip, or the plain standalone bottom bar).
-						const availableWidth = this.ctx.editor.getTopBorderAvailableWidth(this.ctx.ui.terminal.columns);
-						return this.ctx.statusLine.getPreviewLines(availableWidth).join("\n");
-					},
-					onPluginsChanged: async () => {
-						const projectPath = await resolveActiveProjectRegistryPath(this.ctx.sessionManager.getCwd());
-						clearPluginRootsAndCaches(projectPath ? [projectPath] : undefined);
-						await this.ctx.refreshSkillState();
-						await this.ctx.refreshSlashCommandState();
-						resetCapabilities();
-						this.ctx.ui.requestRender();
-					},
-					onCancel: () => {
-						done();
-						// Restore status line to saved settings
-						this.ctx.statusLine.updateSettings({
-							preset: settings.get("statusLine.preset"),
-							leftSegments: settings.get("statusLine.leftSegments"),
-							rightSegments: settings.get("statusLine.rightSegments"),
-							separator: settings.get("statusLine.separator"),
-							showHookStatus: settings.get("statusLine.showHookStatus"),
-							sessionAccent: settings.get("statusLine.sessionAccent"),
-							transparent: settings.get("statusLine.transparent"),
-							compactThinkingLevel: settings.get("statusLine.compactThinkingLevel"),
-							contextLine: settings.get("statusLine.contextLine"),
-						});
-						this.ctx.ui.requestRender();
-					},
+				onStatusLinePreview: previewSettings => {
+					this.ctx.statusLine.updateSettings({
+						preset: this.ctx.settings.get("statusLine.preset"),
+						leftSegments: this.ctx.settings.get("statusLine.leftSegments"),
+						rightSegments: this.ctx.settings.get("statusLine.rightSegments"),
+						separator: this.ctx.settings.get("statusLine.separator"),
+						showHookStatus: this.ctx.settings.get("statusLine.showHookStatus"),
+						sessionAccent: this.ctx.settings.get("statusLine.sessionAccent"),
+						transparent: this.ctx.settings.get("statusLine.transparent"),
+						compactThinkingLevel: this.ctx.settings.get("statusLine.compactThinkingLevel"),
+						contextLine: this.ctx.settings.get("statusLine.contextLine"),
+						...previewSettings,
+					});
+					this.ctx.ui.requestRender();
 				},
-			);
-			const overlayHandle = this.#showFullscreenMenu(selector);
-		});
+				getStatusLinePreview: () => {
+					const availableWidth = this.ctx.editor.getTopBorderAvailableWidth(this.ctx.ui.terminal.columns);
+					return this.ctx.statusLine.getPreviewLines(availableWidth).join("\n");
+				},
+				onPluginsChanged: async () => {
+					const projectPath = await resolveActiveProjectRegistryPath(this.ctx.sessionManager.getCwd());
+					clearPluginRootsAndCaches(projectPath ? [projectPath] : undefined);
+					await this.ctx.refreshSkillState();
+					await this.ctx.refreshSlashCommandState();
+					resetCapabilities();
+					this.ctx.ui.requestRender();
+				},
+				onProfilesSelected: () => {
+					void mountProfiles();
+				},
+				onCancel: done,
+			},
+			{
+				initialTab: requestedTab,
+				profiles: new Text(theme.fg("muted", "Loading profiles…"), 1, 0),
+			},
+		);
+		settingsOverlay.selector = selector;
+		const overlayHandle = this.#showFullscreenMenu(selector);
+		settingsOverlay.handle = overlayHandle;
+		this.#settingsSelector = selector;
+		this.#closeSettingsOverlay = done;
+		this.#mountProfilesContent = mountProfiles;
+		if (profilesRequested || requestedTab === "profiles") await mountProfiles();
 	}
 
 	/**
@@ -542,6 +811,1256 @@ export class SelectorController {
 	}
 
 	/**
+	 * Mount the saved-setup control center inside the active Settings overlay.
+	 * Every asynchronous request is scoped to that parent lifetime so closing
+	 * Settings cannot be followed by a late child mount or mutation.
+	 */
+	async #mountProfilesDashboard(
+		settingsSelector: SettingsSelectorComponent,
+		overlayHandle: OverlayHandle,
+		closeParent: () => void,
+	): Promise<ProfileDashboardRefresh | undefined> {
+		this.#profileDashboardOpeningGeneration++;
+		this.#closeProfileDashboard?.();
+		const openingGeneration = this.#profileDashboardOpeningGeneration;
+		const agentDir = this.ctx.settings.getAgentDir();
+		let descriptors: SavedSetupDescriptor[];
+		try {
+			descriptors = await listSavedSetups(agentDir);
+		} catch {
+			if (openingGeneration === this.#profileDashboardOpeningGeneration) {
+				settingsSelector.setProfilesContent(new Text(theme.fg("error", "Unable to discover saved profiles"), 1, 0));
+				this.ctx.ui.requestRender();
+			}
+			return;
+		}
+		if (openingGeneration !== this.#profileDashboardOpeningGeneration || this.ctx.isShuttingDown) return;
+
+		const currentSetup: ProfileDashboardSetupRef = { kind: "current" };
+		const toSetupRefs = (items: readonly SavedSetupDescriptor[]): ProfileDashboardSetupRef[] => [
+			currentSetup,
+			...items.map(item => ({ kind: "saved" as const, name: item.name, metadata: item.metadata })),
+		];
+		let setups = toSetupRefs(descriptors);
+		const cwd = this.ctx.sessionManager.getCwd();
+		const activeProfile = getActiveProfile() ?? "default";
+		const canLaunchSetups = hasProfileLaunchContext();
+		const launchRequiredMessage = "Saved setup preview and loading require the OMP CLI";
+		const versions = new Map<string, number>();
+		const controllers = new Map<string, AbortController>();
+		const dialogController = new AbortController();
+		const snapshots = new Map<string, ProfileSnapshot>();
+		let refreshedSettingsRevision = this.ctx.settings.revision;
+		let closed = false;
+		let interactionPending = false;
+		let closeRoleEditor: (() => void) | undefined;
+		let closeDraftEditor: (() => void) | undefined;
+		let closeActiveControl: (() => void) | undefined;
+
+		const setupKey = (setup: ProfileDashboardSetupRef): string =>
+			setup.kind === "current" ? "current" : `saved\0${setup.name}`;
+		const cacheKey = (setup: ProfileDashboardSetupRef): string => `${cwd}\0${activeProfile}\0${setupKey(setup)}`;
+		const setupExists = (setup: ProfileDashboardSetupRef): boolean =>
+			setup.kind === "current" || descriptors.some(item => item.name === setup.name);
+		const setupUpdatedAt = (setup: ProfileDashboardSetupRef): number | undefined =>
+			setup.kind === "saved" ? descriptors.find(item => item.name === setup.name)?.updatedAt : undefined;
+		const teardown = (): void => {
+			if (closed) return;
+			closed = true;
+			for (const controller of controllers.values()) controller.abort();
+			controllers.clear();
+			dialogController.abort();
+			closeRoleEditor?.();
+			closeRoleEditor = undefined;
+			closeDraftEditor?.();
+			closeDraftEditor = undefined;
+			closeActiveControl?.();
+			closeActiveControl = undefined;
+			dashboard.dispose();
+			if (this.#closeProfileDashboard === teardown) this.#closeProfileDashboard = undefined;
+		};
+		const handleUserClose = (): void => {
+			if (!closed) closeParent();
+		};
+		const shareCurrentUsage = (usage: ProfileSnapshot["usage"], storedAt: number): void => {
+			if (!usage) return;
+			for (const setup of setups) {
+				if (setup.kind !== "saved") continue;
+				const snapshot = snapshots.get(setupKey(setup));
+				if (!snapshot) continue;
+				snapshot.usage = usage;
+				this.#profileSnapshotCache.set(cacheKey(setup), {
+					snapshot,
+					storedAt,
+					sourceUpdatedAt: setupUpdatedAt(setup),
+				});
+			}
+		};
+		const commitSnapshot = (
+			setup: ProfileDashboardSetupRef,
+			version: number,
+			snapshot: ProfileSnapshot,
+			storedAt: number,
+			refreshError?: string,
+			cache = true,
+		): void => {
+			const key = setupKey(setup);
+			if (closed || versions.get(key) !== version || !setupExists(setup)) return;
+			snapshots.set(key, snapshot);
+			if (cache) {
+				this.#profileSnapshotCache.set(cacheKey(setup), {
+					snapshot,
+					storedAt,
+					sourceUpdatedAt: setupUpdatedAt(setup),
+				});
+			}
+			dashboard.setSetupState(setup, { snapshot, loading: false, refreshError });
+			if (setup.kind === "current") shareCurrentUsage(snapshot.usage, storedAt);
+		};
+		const loadSetup = async (setup: ProfileDashboardSetupRef, force = false): Promise<void> => {
+			if (closed || !setupExists(setup)) return;
+			const key = setupKey(setup);
+			const scopedCacheKey = cacheKey(setup);
+			const cached = this.#profileSnapshotCache.get(scopedCacheKey);
+			const previous = snapshots.get(key) ?? cached?.snapshot;
+			const cacheFresh = cached !== undefined && Date.now() - cached.storedAt < PROFILE_USAGE_STALE_MS;
+			const sourceUnchanged = cached?.sourceUpdatedAt === setupUpdatedAt(setup);
+			if (setup.kind === "saved" && !force && cached && cacheFresh && sourceUnchanged) {
+				snapshots.set(key, cached.snapshot);
+				dashboard.setSetupState(setup, { snapshot: cached.snapshot, loading: false });
+				return;
+			}
+			if (setup.kind === "saved" && !canLaunchSetups) {
+				dashboard.setSetupState(setup, {
+					snapshot: previous,
+					loading: false,
+					error: previous ? undefined : launchRequiredMessage,
+				});
+				return;
+			}
+
+			controllers.get(key)?.abort();
+			const controller = new AbortController();
+			controllers.set(key, controller);
+			const version = (versions.get(key) ?? 0) + 1;
+			versions.set(key, version);
+			dashboard.setSetupState(setup, { snapshot: previous, loading: true });
+
+			try {
+				if (setup.kind === "saved") {
+					const snapshot = await inspectProfile(
+						activeProfile,
+						{ cwd, usage: false, setup: setup.name },
+						controller.signal,
+					);
+					if (controller.signal.aborted) return;
+					applyProfileModelPerformance(snapshot.roles, this.ctx.settings.getStorage()?.getModelPerf());
+					const currentUsageCache = this.#profileSnapshotCache.get(cacheKey(currentSetup));
+					const sharedUsage =
+						snapshots.get(setupKey(currentSetup))?.usage ?? cached?.snapshot.usage ?? previous?.usage;
+					const usageStoredAt = currentUsageCache?.storedAt ?? cached?.storedAt ?? Date.now();
+					commitSnapshot(
+						setup,
+						version,
+						sharedUsage ? { ...snapshot, usage: sharedUsage } : snapshot,
+						usageStoredAt,
+					);
+					return;
+				}
+
+				const baseSnapshot = await buildProfileSnapshot({
+					profile: activeProfile,
+					cwd,
+					settings: this.ctx.settings,
+					modelRegistry: this.ctx.session.modelRegistry,
+					authStorage: this.ctx.session.modelRegistry.authStorage,
+					sessionId: this.ctx.session.sessionId,
+					currentModel: this.ctx.session.model ?? undefined,
+					currentThinkingLevel: this.ctx.session.configuredThinkingLevel(),
+				});
+				if (closed || controller.signal.aborted || versions.get(key) !== version) return;
+				const cachedUsage = cached?.snapshot.usage ?? previous?.usage;
+				const projected = cachedUsage ? { ...baseSnapshot, usage: cachedUsage } : baseSnapshot;
+				snapshots.set(key, projected);
+				dashboard.setSetupState(setup, { snapshot: projected, loading: !cacheFresh || force });
+				shareCurrentUsage(projected.usage, cached?.storedAt ?? Date.now());
+				if (!force && cached && cacheFresh) {
+					this.#profileSnapshotCache.set(scopedCacheKey, { snapshot: projected, storedAt: cached.storedAt });
+					dashboard.setSetupState(setup, { snapshot: projected, loading: false });
+					return;
+				}
+
+				try {
+					const collection = await collectUsageSnapshot(this.ctx.session.modelRegistry.authStorage, {
+						signal: controller.signal,
+						modelRegistry: this.ctx.session.modelRegistry,
+					});
+					if (controller.signal.aborted) return;
+					commitSnapshot(
+						setup,
+						version,
+						{ ...baseSnapshot, usage: sanitizeProfileUsageSnapshot(collection.snapshot) },
+						Date.now(),
+					);
+				} catch {
+					if (controller.signal.aborted) return;
+					commitSnapshot(setup, version, projected, cached?.storedAt ?? Date.now(), "Usage refresh failed", false);
+				}
+			} catch {
+				if (controller.signal.aborted || closed || versions.get(key) !== version) return;
+				dashboard.setSetupState(setup, {
+					snapshot: previous,
+					loading: false,
+					error: previous
+						? undefined
+						: setup.kind === "saved"
+							? "Saved setup preview failed"
+							: "Current setup failed",
+					refreshError: previous ? "Setup refresh failed" : undefined,
+				});
+			} finally {
+				if (controllers.get(key) === controller) controllers.delete(key);
+			}
+		};
+		const restoreDashboard = (): void => {
+			if (closed) return;
+			dashboard.setLoadBlockReason(canLaunchSetups ? this.ctx.getProfileSwitchBlockReason() : launchRequiredMessage);
+			overlayHandle.setHidden(false);
+			this.ctx.ui.setFocus(settingsSelector);
+			this.ctx.ui.requestRender();
+		};
+		const syncSetups = async (selectedSetup?: ProfileDashboardSetupRef): Promise<boolean> => {
+			const discovered = await listSavedSetups(agentDir);
+			if (closed) return false;
+			const descriptorsChanged =
+				discovered.length !== descriptors.length ||
+				descriptors.some((item, index) => {
+					const next = discovered[index];
+					return (
+						!next ||
+						next.name !== item.name ||
+						next.updatedAt !== item.updatedAt ||
+						!Bun.deepEquals(next.metadata, item.metadata)
+					);
+				});
+			for (const setup of setups) {
+				if (setup.kind !== "saved") continue;
+				const next = discovered.find(item => item.name === setup.name);
+				if (next && next.updatedAt === setupUpdatedAt(setup) && Bun.deepEquals(next.metadata, setup.metadata)) {
+					continue;
+				}
+				const key = setupKey(setup);
+				controllers.get(key)?.abort();
+				controllers.delete(key);
+				versions.set(key, (versions.get(key) ?? 0) + 1);
+				snapshots.delete(key);
+				this.#profileSnapshotCache.delete(cacheKey(setup));
+			}
+			descriptors = discovered;
+			setups = toSetupRefs(descriptors);
+			if (descriptorsChanged) dashboard.setSetups(setups, selectedSetup);
+			return true;
+		};
+		const refreshDashboard: ProfileDashboardRefresh = async contentChanged => {
+			if (closed || interactionPending) return false;
+			interactionPending = true;
+			try {
+				const refreshContent = contentChanged || this.ctx.settings.revision !== refreshedSettingsRevision;
+				if (refreshContent) await this.ctx.settings.flush();
+				if (closed) return false;
+				const settingsRevision = this.ctx.settings.revision;
+				const selected = dashboard.selectedSetup;
+				if (!(await syncSetups(selected))) return false;
+				for (const setup of setups) {
+					if (!refreshContent && snapshots.has(setupKey(setup))) continue;
+					void loadSetup(setup, refreshContent && setup.kind === "saved");
+				}
+				refreshedSettingsRevision = settingsRevision;
+				return true;
+			} catch {
+				if (!closed) this.ctx.showError("Unable to refresh saved setups");
+				return false;
+			} finally {
+				interactionPending = false;
+			}
+		};
+		const readDraft = async (setup: ProfileDashboardSetupRef): Promise<ProfileDraft> => {
+			if (setup.kind === "saved") {
+				const { config, metadata } = await readSavedSetup(setup.name, agentDir);
+				return { config, metadata };
+			}
+			const snapshot = snapshots.get(setupKey(currentSetup));
+			if (!snapshot) throw new Error("Current setup is not ready");
+			return createProfileDraft(this.ctx.settings, snapshot);
+		};
+		const chooseDraftRole = async (
+			role: string,
+			draft: ProfileDraft,
+			label = "PROFILE DRAFT",
+		): Promise<ProfileDraft | undefined> => {
+			if (closed) return undefined;
+			const staged = structuredClone(draft);
+			const stagedRoles = staged.config.modelRoles as ModelRoleAssignments;
+			const preview = this.#createProfileRoleSource({
+				config: staged.config,
+				modelRoles: stagedRoles,
+				label,
+				role,
+			});
+			const result = Promise.withResolvers<ProfileDraft | undefined>();
+			let changed = false;
+			let finished = false;
+			const closeEditor = this.#showModelHub({
+				initialAssignRole: role,
+				source: preview.source,
+				roleCallbacks: {
+					onAssign: (model, assignedRole, thinkingLevel, selector) => {
+						if (closed || finished || assignedRole !== role) return false;
+						stagedRoles[role] = formatModelSelectorValue(
+							selector ?? `${model.provider}/${model.id}`,
+							thinkingLevel,
+						);
+						changed = true;
+						return true;
+					},
+					onUnassign: assignedRole => {
+						if (closed || finished || assignedRole !== role) return false;
+						stagedRoles[role] = null;
+						changed = true;
+						return true;
+					},
+				},
+				onDone: () => {
+					finished = true;
+					result.resolve(closed || !changed ? undefined : staged);
+				},
+			});
+			closeRoleEditor = closeEditor;
+			const value = await result.promise;
+			if (closeRoleEditor === closeEditor) closeRoleEditor = undefined;
+			return value;
+		};
+		const chooseDraftAgent = async (agent: string, source: ProfileDraft): Promise<ProfileDraft | undefined> => {
+			const draft = structuredClone(source);
+			const task = (draft.config.task ??= {}) as RawSettings;
+			const overrides = (task.agentModelOverrides ??= {}) as Record<string, string | string[] | null>;
+			let edited = false;
+			for (;;) {
+				if (closed) return undefined;
+				const configured = overrides[agent];
+				const chain = Array.isArray(configured) ? configured : typeof configured === "string" ? [configured] : [];
+				const entries = chain.map((selector, index) => ({
+					label: `${index + 1}. ${cleanRoleSharingText(selector)}`,
+					description: "Replace this assignment without changing other fallback positions",
+				}));
+				const actions = [
+					...entries,
+					"Choose model",
+					...(chain.length > 0 ? ["Add fallback", "Remove fallback"] : []),
+					...(chain.length > 1 ? ["Move fallback earlier"] : []),
+					"Use Automatic",
+					"Remove saved override",
+					"Use changes",
+					"Cancel profile edit",
+				];
+				const choice = await this.ctx.showHookSelector(
+					`Agent ${cleanRoleSharingText(agent)} — draft only`,
+					actions,
+					{ signal: dialogController.signal },
+				);
+				if (closed || choice === undefined || choice === "Cancel profile edit") return undefined;
+				if (choice === "Use changes") return edited ? draft : source;
+				edited = true;
+				if (choice === "Use Automatic") {
+					overrides[agent] = null;
+					continue;
+				}
+				if (choice === "Remove saved override") {
+					delete overrides[agent];
+					continue;
+				}
+				if (choice === "Remove fallback" || choice === "Move fallback earlier") {
+					const candidates = choice === "Move fallback earlier" ? entries.slice(1) : entries;
+					const selected = await this.ctx.showHookSelector(choice, [...candidates, "Cancel profile edit"], {
+						signal: dialogController.signal,
+					});
+					if (closed || selected === undefined || selected === "Cancel profile edit") return undefined;
+					const index = entries.findIndex(entry => entry.label === selected);
+					if (index < 0) continue;
+					const next = [...chain];
+					if (choice === "Remove fallback") next.splice(index, 1);
+					else [next[index - 1], next[index]] = [next[index]!, next[index - 1]!];
+					if (next.length === 0) delete overrides[agent];
+					else overrides[agent] = Array.isArray(configured) ? next : next[0]!;
+					continue;
+				}
+				const index = entries.findIndex(entry => entry.label === choice);
+				if (index < 0 && choice !== "Choose model" && choice !== "Add fallback") continue;
+				const picked = await chooseDraftRole("default", draft, `AGENT ${cleanRoleSharingText(agent)} DRAFT`);
+				if (closed || !picked) return undefined;
+				const selector = (picked.config.modelRoles as ModelRoleAssignments).default ?? null;
+				if (selector === null || choice === "Choose model") overrides[agent] = selector;
+				else if (choice === "Add fallback") overrides[agent] = [...chain, selector];
+				else if (Array.isArray(configured)) {
+					const next = [...configured];
+					next[index] = selector;
+					overrides[agent] = next;
+				} else overrides[agent] = selector;
+			}
+		};
+		const reviewDraft = async (
+			setup: ProfileDashboardSetupRef,
+			draft: ProfileDraft,
+			forExport = false,
+			saveDraft?: (draft: ProfileDraft, saveAsNew: boolean) => Promise<boolean>,
+		): Promise<{ draft: ProfileDraft; saveAsNew: boolean } | undefined> => {
+			// Construct once: even Settings.isolated().override() invokes global setting hooks.
+			const effective = this.#createProfileRoleSource({
+				config: draft.config,
+				snapshot: snapshots.get(setupKey(setup)),
+				label: "PROFILE DRAFT",
+				role: "default",
+			});
+			const inheritedSettings =
+				setup.kind === "saved"
+					? await Settings.loadReadOnly({ cwd, agentDir, configFiles: [...getProfileLaunchConfigFiles()] })
+					: this.ctx.settings;
+			const availableThemes = await getAvailableThemes();
+			const availableModels = this.ctx.session.modelRegistry.getAll();
+			const draftModel = resolveModelRoleValue(effective.settings.getModelRole("default"), availableModels, {
+				settings: effective.settings,
+			}).model;
+			if (closed) return undefined;
+			const result = Promise.withResolvers<{ draft: ProfileDraft; saveAsNew: boolean } | undefined>();
+			let finished = false;
+			const finish = (value?: { draft: ProfileDraft; saveAsNew: boolean }): void => {
+				if (finished) return;
+				finished = true;
+				handle.hide();
+				result.resolve(closed ? undefined : value);
+			};
+			const editor = new ProfileEditorComponent({
+				draft,
+				effectiveSettings: effective.settings,
+				inheritedSettings,
+				registry: this.ctx.session.modelRegistry,
+				name: setup.kind === "saved" ? setup.name : "Current setup",
+				title: forExport ? "Prepare profile export" : "Edit profile",
+				saveLabel: forExport ? "Continue to export" : "Save",
+				allowSaveAsNew: !forExport,
+				terminalHeight: this.ctx.ui.terminal.rows,
+				agentNames: snapshots.get(setupKey(currentSetup))?.agents.map(agent => agent.name) ?? [],
+				settingsContext: {
+					availableThinkingLevels: [...(draftModel ? getSupportedEfforts(draftModel) : THINKING_EFFORTS)],
+					availableThemes,
+					providers: [...new Set(availableModels.map(model => model.provider))].sort((a, b) => a.localeCompare(b)),
+					model: draftModel,
+					imageBudget: this.ctx.ui.imageBudget,
+					composerPreviewStatus: this.ctx.statusLine,
+				},
+				callbacks: {
+					requestRender: () => {
+						if (!closed && !finished) this.ctx.ui.requestRender();
+					},
+					onSaveEmoji:
+						setup.kind === "saved" && !forExport
+							? async emoji => {
+									if (closed || finished) return false;
+									const { config, metadata } = await readSavedSetup(setup.name, agentDir);
+									if (closed || finished) return false;
+									metadata.emoji = emoji;
+									const saved = await saveProfileDraft(
+										setup.name,
+										{ config, metadata },
+										{ overwrite: true, agentDir },
+									);
+									if (closed || finished) return false;
+									descriptors = descriptors.map(item => (item.name === saved.name ? saved : item));
+									setups = toSetupRefs(descriptors);
+									const cached = this.#profileSnapshotCache.get(cacheKey(setup));
+									if (cached) cached.sourceUpdatedAt = saved.updatedAt;
+									dashboard.setSetups(setups, {
+										kind: "saved",
+										name: saved.name,
+										metadata: saved.metadata,
+									});
+									return true;
+								}
+							: undefined,
+					onEditRole: async (role, value) => {
+						handle.setHidden(true);
+						const next = await chooseDraftRole(role, value);
+						if (!closed && !finished) {
+							handle.setHidden(false);
+							this.ctx.ui.setFocus(editor);
+							this.ctx.ui.requestRender();
+						}
+						return next;
+					},
+					onEditAgent: async (agent, value) => {
+						handle.setHidden(true);
+						const next = await chooseDraftAgent(agent, value);
+						if (!closed && !finished) {
+							handle.setHidden(false);
+							this.ctx.ui.setFocus(editor);
+							this.ctx.ui.requestRender();
+						}
+						return next;
+					},
+					onSave: async (value, saveAsNew) => {
+						if (!saveDraft) {
+							finish({ draft: value, saveAsNew });
+							return;
+						}
+						handle.setHidden(true);
+						try {
+							if (!(await saveDraft(value, saveAsNew))) {
+								finish();
+								return;
+							}
+							finish({ draft: value, saveAsNew });
+						} catch (error) {
+							if (!closed && !finished) {
+								handle.setHidden(false);
+								this.ctx.ui.setFocus(editor);
+								this.ctx.ui.requestRender();
+							}
+							throw error;
+						}
+					},
+					onCancel: () => finish(),
+				},
+			});
+			const handle = this.#showFullscreenMenu(editor);
+			const cancel = (): void => finish();
+			closeDraftEditor = cancel;
+			const value = await result.promise;
+			if (closeDraftEditor === cancel) closeDraftEditor = undefined;
+			return value;
+		};
+		const editProfile = async (setup: ProfileDashboardSetupRef): Promise<void> => {
+			if (closed || interactionPending || !setupExists(setup)) return;
+			interactionPending = true;
+			overlayHandle.setHidden(true);
+			let notice: { message: string; tone: "error" | "success" } | undefined;
+			try {
+				await reviewDraft(setup, await readDraft(setup), false, async (draft, saveAsNew) => {
+					const overwrite = setup.kind === "saved" && !saveAsNew;
+					let name = setup.kind === "saved" ? setup.name : "";
+					if (overwrite) {
+						const confirmed = await this.ctx.showHookConfirm(
+							`Save changes to ${cleanRoleSharingText(name)}?`,
+							"This replaces this saved profile only. It does not reapply it to the current session.",
+							{ signal: dialogController.signal },
+						);
+						if (!confirmed || closed) return false;
+					} else {
+						let prompt = "Save profile as";
+						for (;;) {
+							const input = await this.ctx.showHookInput(prompt, "Setup name", {
+								signal: dialogController.signal,
+							});
+							if (input === undefined || closed) return false;
+							try {
+								name = normalizeSetupName(input);
+							} catch (error) {
+								prompt = `${cleanRoleSharingText(error instanceof Error ? error.message : "Invalid setup name")}\nSave profile as`;
+								continue;
+							}
+							const existing = (await listSavedSetups(agentDir)).some(
+								item =>
+									item.name === name ||
+									(process.platform === "win32" && item.name.toLowerCase() === name.toLowerCase()),
+							);
+							if (closed) return false;
+							if (!existing) break;
+							prompt = "That setup already exists. Choose another name.\nSave profile as";
+						}
+					}
+					if (closed) return false;
+					const saved = await saveProfileDraft(name, draft, { overwrite, agentDir });
+					if (closed) return false;
+					const savedRef: ProfileDashboardSavedSetupRef = {
+						kind: "saved",
+						name: saved.name,
+						metadata: saved.metadata,
+					};
+					if (!(await syncSetups(savedRef))) return false;
+					await loadSetup(savedRef, true);
+					notice = {
+						message: `Saved profile ${cleanRoleSharingText(saved.name)}. Load it explicitly to activate.`,
+						tone: "success",
+					};
+					return true;
+				});
+			} catch (error) {
+				notice = {
+					message: cleanRoleSharingText(error instanceof Error ? error.message : "Unable to save profile"),
+					tone: "error",
+				};
+			} finally {
+				interactionPending = false;
+				restoreDashboard();
+				if (!closed && notice) dashboard.setActionNotice(notice.message, notice.tone);
+			}
+		};
+		const saveCurrentSetup = (): Promise<void> => editProfile(currentSetup);
+		const exportRoles = async (setup: ProfileDashboardSetupRef): Promise<void> => {
+			if (closed || interactionPending || !setupExists(setup)) return;
+			interactionPending = true;
+			overlayHandle.setHidden(true);
+			let notice: { message: string; tone: "error" | "success" } | undefined;
+			try {
+				const scope = await this.ctx.showHookSelector(
+					"Export scope",
+					[
+						{ label: "Profile", description: "Models, emoji and only this profile's enabled settings groups" },
+						{
+							label: "Model roles only",
+							description: "Explicitly omit emoji, optional groups and agent overrides",
+						},
+						"Cancel",
+					],
+					{ signal: dialogController.signal },
+				);
+				if (closed || scope === undefined || scope === "Cancel") return;
+				let draft = await readDraft(setup);
+				if (closed) return;
+				if (scope === "Profile" && setup.kind === "current") {
+					const reviewed = await reviewDraft(setup, draft, true);
+					if (!reviewed || closed) return;
+					draft = reviewed.draft;
+				}
+				const name = setup.kind === "saved" ? setup.name : undefined;
+				const roles = draft.config.modelRoles as ModelRoleAssignments;
+				// Validate before touching either transport; legacy exclusions name the saved path.
+				const payload = scope === "Profile" ? serializeProfile(draft, name) : serializeModelRoles(roles);
+				const transport = await this.ctx.showHookSelector(
+					`Export ${scope === "Profile" ? "profile" : "model roles"}`,
+					[
+						{ label: "Copy to clipboard", description: "Copy the portable YAML payload" },
+						{ label: "To file", description: "Create a YAML file without replacing an existing file" },
+						"Cancel",
+					],
+					{ signal: dialogController.signal },
+				);
+				if (closed || transport === undefined || transport === "Cancel") return;
+				if (transport === "Copy to clipboard") {
+					await copyToClipboard(payload);
+					notice = {
+						message: `Copied ${scope === "Profile" ? "profile" : "model roles"} to clipboard`,
+						tone: "success",
+					};
+					return;
+				}
+				let prompt = "Export to";
+				for (;;) {
+					const input = await this.ctx.showHookInput(
+						prompt,
+						scope === "Profile" ? "profile.yml" : "model-roles.yml",
+						{
+							signal: dialogController.signal,
+						},
+					);
+					if (closed || input === undefined) return;
+					let filePath: string;
+					try {
+						filePath = resolveToCwd(input.trim(), cwd);
+					} catch {
+						prompt = "Invalid export path\nExport to";
+						continue;
+					}
+					try {
+						if (scope === "Profile") await writeProfileFile(filePath, draft, name);
+						else await writeModelRolesFile(filePath, roles);
+					} catch (error) {
+						if (error instanceof Error && /exist/i.test(error.message)) {
+							prompt = "That file already exists. Choose another export path.\nExport to";
+							continue;
+						}
+						throw error;
+					}
+					notice = { message: `Exported to ${cleanRoleSharingText(shortenPath(filePath))}`, tone: "success" };
+					return;
+				}
+			} catch (error) {
+				notice = {
+					message: cleanRoleSharingText(
+						shortenPath(error instanceof Error ? error.message : "Unable to export profile"),
+					),
+					tone: "error",
+				};
+			} finally {
+				interactionPending = false;
+				restoreDashboard();
+				if (!closed && notice) dashboard.setActionNotice(notice.message, notice.tone);
+			}
+		};
+		const importRoles = async (): Promise<void> => {
+			if (closed || interactionPending) return;
+			interactionPending = true;
+			overlayHandle.setHidden(true);
+			let notice: { message: string; tone: "error" | "success" } | undefined;
+			try {
+				const transport = await this.ctx.showHookSelector(
+					"Import profile or model roles",
+					[
+						{ label: "From clipboard", description: "Read an omp-profile or omp-model-roles YAML payload" },
+						{ label: "From file", description: "Read a portable YAML file" },
+						"Cancel",
+					],
+					{ signal: dialogController.signal },
+				);
+				if (closed || transport === undefined || transport === "Cancel") return;
+				let artifact;
+				if (transport === "From clipboard") {
+					const content = await readTextFromClipboard();
+					if (closed) return;
+					artifact = parseProfileArtifact(content);
+				} else {
+					const input = await this.ctx.showHookInput("Import from", "profile.yml", {
+						signal: dialogController.signal,
+					});
+					if (closed || input === undefined) return;
+					artifact = await readProfileArtifactFile(resolveToCwd(input.trim(), cwd));
+				}
+				if (closed) return;
+				let draft = artifact.draft;
+				const registry = this.ctx.session.modelRegistry;
+				const snapshot =
+					snapshots.get(setupKey(currentSetup)) ??
+					(await buildProfileSnapshot({
+						profile: activeProfile,
+						cwd,
+						settings: this.ctx.settings,
+						modelRegistry: registry,
+						authStorage: registry.authStorage,
+						sessionId: this.ctx.session.sessionId,
+					}));
+				if (closed) return;
+				const knownAgents = new Set(snapshot.agents.map(agent => agent.name));
+				const project = () => projectProfileCompatibility(draft, this.ctx.settings, registry, knownAgents);
+				const original = project();
+				const assignmentLabel = (identity: ProfileAssignmentIdentity): string =>
+					identity.kind === "role"
+						? `Role ${cleanRoleSharingText(identity.role)}`
+						: `Agent ${cleanRoleSharingText(identity.agent)}${identity.fallbackIndex === null ? "" : ` fallback ${identity.fallbackIndex + 1}`}`;
+				const explicitlyResolved = new Set<string>();
+				const oauthProviderIds = new Set(
+					loadProviderAuthUi()
+						.getOAuthProviders()
+						.map(provider => provider.id),
+				);
+				const showPreview = async (final: boolean): Promise<boolean> => {
+					const review = project();
+					const entries: Array<{ label: string; description: string }> = [
+						{
+							label: `${draft.metadata.emoji ?? "None"} · ${cleanRoleSharingText(artifact.name ?? "Imported profile")}`,
+							description: "Emoji is a user label, not a price, speed or offline guarantee.",
+						},
+					];
+					for (const row of review.assignments) {
+						const before = original.assignments.find(
+							item => profileAssignmentKey(item.identity) === profileAssignmentKey(row.identity),
+						);
+						entries.push({
+							label: `${assignmentLabel(row.identity)} — ${roleImportStatusLabel(row.status)} — ${
+								final ? `${cleanRoleSharingText(before?.selector ?? "Automatic")} → ` : ""
+							}${cleanRoleSharingText(row.selector ?? "Automatic")}`,
+							description: describeRoleImportStatus({ ...row, role: assignmentLabel(row.identity) }),
+						});
+					}
+					for (const agent of review.agents) {
+						entries.push({
+							label: `Agent ${cleanRoleSharingText(agent.agent)} — ${agent.status}`,
+							description:
+								agent.status === "missing"
+									? "No local definition. Explicit removal is required; no agent will be created."
+									: "Local definition available; imported enable/disable and assignment values remain draft-only.",
+						});
+					}
+					for (const group of PROFILE_SETTINGS_GROUPS) {
+						const enabled = draft.metadata.enabledGroups.includes(group.id);
+						entries.push({
+							label: `${group.label} — ${enabled ? "ON" : "OFF"}`,
+							description: enabled
+								? "Only the saved paths below are owned. Local service availability is unverified."
+								: "Use local configuration",
+						});
+						if (!enabled) continue;
+						for (const settingPath of getProfileGroupPaths(group.id)) {
+							const saved = savedSettingValue(draft.config, settingPath);
+							if (!saved.found) continue;
+							const ui = getUi(settingPath);
+							entries.push({
+								label: `${cleanRoleSharingText(settingPath)}: ${cleanRoleSharingText(JSON.stringify(saved.value))}`,
+								description: [
+									`Local: ${cleanRoleSharingText(JSON.stringify(this.ctx.settings.get(settingPath)))}`,
+									ui?.warning,
+								]
+									.filter(Boolean)
+									.join(" · "),
+							});
+						}
+					}
+					if (closed || dialogController.signal.aborted) return false;
+					const result = Promise.withResolvers<boolean>();
+					let finished = false;
+					const finish = (proceed: boolean): void => {
+						if (finished) return;
+						finished = true;
+						dialogController.signal.removeEventListener("abort", abort);
+						preview.dispose();
+						previewHandle.hide();
+						result.resolve(proceed);
+					};
+					const abort = (): void => finish(false);
+					const preview = new ProfileImportPreview({
+						title: final ? "Final imported profile preview" : "Imported profile preview",
+						entries,
+						nextStep: final
+							? "Continue to choose a setup name. Saving does not activate the profile or transfer credentials."
+							: "Continue to resolve compatibility requirements. Saving remains blocked until every required item is resolved.",
+						terminalHeight: this.ctx.ui.terminal.rows,
+						onContinue: () => finish(true),
+						onCancel: () => finish(false),
+						requestRender: () => {
+							if (!closed && !finished) this.ctx.ui.requestRender();
+						},
+					});
+					dialogController.signal.addEventListener("abort", abort, { once: true });
+					const previewHandle = this.#showFullscreenMenu(preview);
+					if (closed || dialogController.signal.aborted) finish(false);
+					return result.promise;
+				};
+				if (!(await showPreview(false)) || closed) return;
+				for (;;) {
+					const review = project();
+					const missingAgent = review.agents.find(agent => agent.status === "missing");
+					if (missingAgent) {
+						const choice = await this.ctx.showHookSelector(
+							`Missing local agent: ${cleanRoleSharingText(missingAgent.agent)}`,
+							[
+								{
+									label: "Remove this agent from the draft",
+									description:
+										"Remove its saved override and disabled-agent entry; leave other agents unchanged",
+								},
+								"Cancel import",
+							],
+							{ signal: dialogController.signal },
+						);
+						if (closed || choice !== "Remove this agent from the draft") return;
+						draft = removeUnavailableProfileAgent(draft, missingAgent.agent);
+						continue;
+					}
+					const attention = review.assignments.find(
+						row =>
+							row.status !== "ready" &&
+							row.status !== "automatic" &&
+							!explicitlyResolved.has(profileAssignmentKey(row.identity)),
+					);
+					if (!attention) break;
+					const identity = attention.identity;
+					const key = profileAssignmentKey(identity);
+					const before = original.assignments.find(row => profileAssignmentKey(row.identity) === key);
+					let currentSelector: string | null = null;
+					if (identity.kind === "role") currentSelector = this.ctx.settings.getModelRole(identity.role) ?? null;
+					else {
+						const overrides = this.ctx.settings.get("task.agentModelOverrides");
+						const current = Object.hasOwn(overrides, identity.agent) ? overrides[identity.agent] : undefined;
+						currentSelector = Array.isArray(current)
+							? (current[identity.fallbackIndex ?? 0] ?? null)
+							: (current ?? null);
+					}
+					const loginLabel = attention.provider
+						? `Login to ${cleanRoleSharingText(attention.provider)}`
+						: undefined;
+					const actions: Array<string | { label: string; description: string }> = [
+						{
+							label: "Keep current assignment",
+							description: cleanRoleSharingText(currentSelector ?? "Automatic"),
+						},
+						{
+							label: "Use Automatic",
+							description:
+								identity.kind === "agent" && identity.fallbackIndex !== null
+									? "Replace this agent's entire fallback chain with Automatic"
+									: "Save a null assignment; this is not :auto thinking",
+						},
+						{
+							label: "Choose replacement model",
+							description: "Choose a replacement for this draft assignment only",
+						},
+					];
+					if (attention.provider && loginLabel && oauthProviderIds.has(attention.provider)) {
+						actions.push({
+							label: loginLabel,
+							description: "Explicitly save local credentials; cancellation does not undo login",
+						});
+					}
+					actions.push("Show provider configuration help", "Recheck provider", "Cancel import");
+					const action = await this.ctx.showHookSelector(
+						`${assignmentLabel(identity)}\nRequested: ${cleanRoleSharingText(before?.selector ?? "Automatic")}\n${describeRoleImportStatus({ ...attention, role: assignmentLabel(identity) })}`,
+						actions,
+						{ signal: dialogController.signal },
+					);
+					if (closed || action === undefined || action === "Cancel import") return;
+					if (action === "Keep current assignment" || action === "Use Automatic") {
+						draft = replaceProfileAssignment(
+							draft,
+							identity,
+							action === "Use Automatic" ? null : currentSelector,
+						);
+						explicitlyResolved.add(key);
+						continue;
+					}
+					if (attention.provider && loginLabel && action === loginLabel) {
+						await this.#handleOAuthLogin(attention.provider);
+						if (closed) return;
+						continue;
+					}
+					if (action === "Show provider configuration help") {
+						const choice = await this.ctx.showHookSelector(
+							"Configure the provider explicitly outside this importer",
+							[
+								{
+									label: "Back",
+									description: `Set its API-key environment variable or edit ${cleanRoleSharingText(shortenPath(path.join(agentDir, "models.yml")))}`,
+								},
+								"Cancel import",
+							],
+							{ signal: dialogController.signal },
+						);
+						if (closed || choice !== "Back") return;
+						continue;
+					}
+					if (action === "Recheck provider") {
+						if (attention.provider) await registry.refreshProvider(attention.provider, "online");
+						else await registry.refresh("offline");
+						if (closed) return;
+						continue;
+					}
+					if (action !== "Choose replacement model") continue;
+					const pickerRole = identity.kind === "role" ? identity.role : "default";
+					const picked = await chooseDraftRole(pickerRole, draft, `${assignmentLabel(identity)} · IMPORT DRAFT`);
+					if (closed || !picked) return;
+					const replacement = (picked.config.modelRoles as ModelRoleAssignments)[pickerRole] ?? null;
+					draft = replaceProfileAssignment(draft, identity, replacement);
+					explicitlyResolved.add(key);
+					const matching = project().assignments.filter(
+						row =>
+							row.status !== "ready" &&
+							row.status !== "automatic" &&
+							!explicitlyResolved.has(profileAssignmentKey(row.identity)) &&
+							original.assignments.some(
+								item =>
+									profileAssignmentKey(item.identity) === profileAssignmentKey(row.identity) &&
+									item.selector === before?.selector,
+							),
+					);
+					if (matching.length === 0) continue;
+					const grouped = await this.ctx.showHookConfirm(
+						`Replace ${matching.length} matching assignments too?`,
+						"These roles or agent fallback entries requested the identical original selector. Other fallback positions retain their order.",
+						{ signal: dialogController.signal },
+					);
+					if (closed) return;
+					if (grouped) {
+						for (const row of matching) {
+							if (
+								!project().assignments.some(
+									item => profileAssignmentKey(item.identity) === profileAssignmentKey(row.identity),
+								)
+							)
+								continue;
+							draft = replaceProfileAssignment(draft, row.identity, replacement);
+							explicitlyResolved.add(profileAssignmentKey(row.identity));
+						}
+					}
+				}
+				if (!(await showPreview(true)) || closed) return;
+				let prompt = "Save imported profile as";
+				for (;;) {
+					const input = await this.ctx.showHookInput(prompt, artifact.name ?? "Setup name", {
+						signal: dialogController.signal,
+					});
+					if (closed || input === undefined) return;
+					let name: string;
+					try {
+						name = normalizeSetupName(input);
+					} catch {
+						prompt = "Invalid setup name\nSave imported profile as";
+						continue;
+					}
+					const confirmed = await this.ctx.showHookConfirm(
+						`Save imported profile as ${cleanRoleSharingText(name)}?`,
+						"This creates a new setup only. The current session, models, settings and conversation are unchanged.",
+						{ signal: dialogController.signal },
+					);
+					if (closed || !confirmed) return;
+					let saved: SavedSetupDescriptor;
+					try {
+						saved = await saveProfileDraft(name, draft, { agentDir });
+					} catch (error) {
+						if (error instanceof Error && /already exists/i.test(error.message)) {
+							prompt = "That setup already exists. Choose another name.\nSave imported profile as";
+							continue;
+						}
+						throw error;
+					}
+					if (closed) return;
+					const savedRef: ProfileDashboardSavedSetupRef = {
+						kind: "saved",
+						name: saved.name,
+						metadata: saved.metadata,
+					};
+					if (!(await syncSetups(savedRef))) return;
+					await loadSetup(savedRef, true);
+					notice = {
+						message: `Saved imported profile ${cleanRoleSharingText(saved.name)}. Press l to load it.`,
+						tone: "success",
+					};
+					return;
+				}
+			} catch (error) {
+				notice = {
+					message: `Unable to import profile: ${cleanRoleSharingText(error instanceof Error ? error.message : "Invalid artifact")}`,
+					tone: "error",
+				};
+			} finally {
+				interactionPending = false;
+				restoreDashboard();
+				if (!closed && notice) dashboard.setActionNotice(notice.message, notice.tone);
+			}
+		};
+		const renameSetup = async (setup: ProfileDashboardSavedSetupRef): Promise<void> => {
+			if (closed || interactionPending || !setupExists(setup)) return;
+			interactionPending = true;
+			overlayHandle.setHidden(true);
+			try {
+				const input = await this.ctx.showHookInput("Rename saved setup", setup.name, {
+					signal: dialogController.signal,
+				});
+				if (closed || input === undefined) return;
+				const renamed = await renameSavedSetup(setup.name, input, agentDir);
+				if (closed) return;
+				const renamedRef: ProfileDashboardSavedSetupRef = { kind: "saved", name: renamed.name };
+				if (!(await syncSetups(renamedRef))) return;
+				await loadSetup(renamedRef, true);
+				if (!closed) this.ctx.showStatus(`Renamed setup ${setup.name} to ${renamed.name}`);
+			} catch (error) {
+				if (!closed) this.ctx.showError(error instanceof Error ? error.message : "Unable to rename setup");
+			} finally {
+				interactionPending = false;
+				restoreDashboard();
+			}
+		};
+		const deleteSetup = async (setup: ProfileDashboardSavedSetupRef): Promise<void> => {
+			if (closed || interactionPending || !setupExists(setup)) return;
+			interactionPending = true;
+			overlayHandle.setHidden(true);
+			try {
+				const confirmed = await this.ctx.showHookConfirm(
+					`Delete setup ${setup.name}?`,
+					"This deletes only the saved setup. Your current session, accounts, and credentials are unchanged.",
+					{ signal: dialogController.signal },
+				);
+				if (closed || !confirmed) return;
+				await deleteSavedSetup(setup.name, agentDir);
+				if (closed || !(await syncSetups(currentSetup))) return;
+				await loadSetup(currentSetup);
+				if (!closed) this.ctx.showStatus(`Deleted setup ${setup.name}`);
+			} catch (error) {
+				if (!closed) this.ctx.showError(error instanceof Error ? error.message : "Unable to delete setup");
+			} finally {
+				interactionPending = false;
+				restoreDashboard();
+			}
+		};
+		const loadSavedSetup = async (setup: ProfileDashboardSavedSetupRef): Promise<void> => {
+			if (closed || interactionPending || !setupExists(setup)) return;
+			interactionPending = true;
+			overlayHandle.setHidden(true);
+			let noticeAfterRestore: { message: string; tone: "error" | "success" } | undefined;
+			let choice: string | undefined;
+			try {
+				choice = await this.ctx.showHookSelector(
+					`Load setup ${cleanRoleSharingText(setup.name)}`,
+					[
+						{
+							label: "Apply models to current session",
+							description:
+								"Model roles and thinking only; keeps this conversation and draft. Optional settings require a fresh session",
+						},
+						{
+							label: "Start a new session",
+							description:
+								"Loads models and only enabled groups' saved paths; OFF groups inherit local configuration",
+						},
+						"Cancel",
+					],
+					{ signal: dialogController.signal },
+				);
+				if (closed || choice === undefined || choice === "Cancel") return;
+
+				const blockReason = canLaunchSetups ? this.ctx.getProfileSwitchBlockReason() : launchRequiredMessage;
+				dashboard.setLoadBlockReason(blockReason);
+				if (blockReason) {
+					noticeAfterRestore = { message: cleanRoleSharingText(blockReason), tone: "error" };
+					return;
+				}
+
+				if (choice === "Start a new session") {
+					await this.ctx.requestProfileSwitch(activeProfile, setup.name);
+					return;
+				}
+
+				const { config } = await readSavedSetup(setup.name, agentDir);
+				if (closed || dialogController.signal.aborted) return;
+				const recheckReason = this.ctx.getProfileSwitchBlockReason();
+				if (recheckReason) {
+					noticeAfterRestore = { message: cleanRoleSharingText(recheckReason), tone: "error" };
+					return;
+				}
+
+				const releaseDefaultMutation = await this.#acquireDefaultRoleMutation();
+				try {
+					if (closed || dialogController.signal.aborted) return;
+					await applySetupModelRoles({
+						session: this.ctx.session,
+						settings: this.ctx.settings,
+						roles: { ...(config.modelRoles as ModelRoleAssignments) },
+						signal: dialogController.signal,
+						getBlockReason: () => this.ctx.getProfileSwitchBlockReason(),
+					});
+				} finally {
+					releaseDefaultMutation();
+				}
+				if (closed || dialogController.signal.aborted) return;
+				dashboard.setSetups(setups, currentSetup);
+				await loadSetup(currentSetup, true);
+				if (!closed) {
+					noticeAfterRestore = {
+						message: `Applied setup ${cleanRoleSharingText(setup.name)} models to current session`,
+						tone: "success",
+					};
+				}
+			} catch (error) {
+				if (closed) return;
+				if (choice === "Apply models to current session") {
+					const detail = error instanceof Error ? cleanRoleSharingText(error.message) : "";
+					noticeAfterRestore = {
+						message: `Unable to apply setup models${detail ? `: ${detail}` : ""}`,
+						tone: "error",
+					};
+				} else {
+					this.ctx.showError("Unable to load saved setup");
+				}
+			} finally {
+				interactionPending = false;
+				restoreDashboard();
+				if (!closed && noticeAfterRestore) {
+					dashboard.setActionNotice(noticeAfterRestore.message, noticeAfterRestore.tone);
+				}
+			}
+		};
+		const openActiveControl = (control: ProfileDashboardActiveControl): void => {
+			if (dashboard.selectedSetup?.kind !== "current" || closeActiveControl) return;
+			if (control === "settings") {
+				settingsSelector.selectTab("appearance");
+				return;
+			}
+			interactionPending = true;
+			overlayHandle.setHidden(true);
+			if (control === "model") {
+				const closeModelHub = this.#showModelHub({
+					isCancelled: () => closed,
+					setClose: close => {
+						if (closed) close();
+						else closeActiveControl = close;
+					},
+					onDone: () => {
+						closeActiveControl = undefined;
+						interactionPending = false;
+						restoreDashboard();
+						void refreshDashboard(true);
+					},
+				});
+				closeActiveControl = closeModelHub;
+				return;
+			}
+			let cancelled = false;
+			const pendingClose = () => {
+				cancelled = true;
+			};
+			closeActiveControl = pendingClose;
+			void this.showAgentsDashboard({
+				isCancelled: () => closed || cancelled,
+				onDone: () => {
+					closeActiveControl = undefined;
+					interactionPending = false;
+					restoreDashboard();
+					void refreshDashboard(true);
+				},
+			})
+				.then(closeAgents => {
+					if (closed || cancelled) {
+						closeAgents();
+					} else if (closeActiveControl === pendingClose) {
+						closeActiveControl = closeAgents;
+					}
+				})
+				.catch(error => {
+					if (closed) return;
+					closeActiveControl = undefined;
+					interactionPending = false;
+					restoreDashboard();
+					this.ctx.showError(error instanceof Error ? error.message : "Unable to open Agents");
+				});
+		};
+
+		const dashboard = new ProfileDashboard({
+			setups,
+			terminalHeight: this.ctx.ui.terminal.rows,
+			loadBlockReason: canLaunchSetups ? this.ctx.getProfileSwitchBlockReason() : launchRequiredMessage,
+			callbacks: {
+				requestRender: () => {
+					if (!closed) this.ctx.ui.requestRender();
+				},
+				close: handleUserClose,
+				selected: setup => {
+					if (closed || interactionPending) return;
+					dashboard.setLoadBlockReason(
+						canLaunchSetups ? this.ctx.getProfileSwitchBlockReason() : launchRequiredMessage,
+					);
+					const key = setupKey(setup);
+					if (!snapshots.has(key) && !controllers.has(key)) void loadSetup(setup);
+				},
+				deleteSetup,
+				renameSetup,
+				loadSetup: loadSavedSetup,
+				editProfile,
+				saveCurrentSetup,
+				importRoles,
+				exportRoles,
+				openActiveControl,
+			},
+		});
+		this.#closeProfileDashboard = teardown;
+		settingsSelector.setProfilesContent(dashboard);
+		this.ctx.ui.setFocus(settingsSelector);
+		this.ctx.ui.requestRender();
+		const selected = dashboard.selectedSetup;
+		if (selected) void loadSetup(selected);
+		for (const setup of setups) {
+			if (selected && setupKey(setup) === setupKey(selected)) continue;
+			void loadSetup(setup);
+		}
+		return refreshDashboard;
+	}
+
+	/**
 	 * Fullscreen git UI on the alternate screen (the /models idiom): split
 	 * diff viewer, staging sidebar, and commit composer. Resolves focus back
 	 * to the editor when the user closes it.
@@ -560,7 +2079,7 @@ export class SelectorController {
 	 * Fullscreen agents hub on the alternate screen (the /models idiom): scope
 	 * sidebar, agent rows, and chip strips that dive into the model browser.
 	 */
-	async showAgentsDashboard(): Promise<void> {
+	async showAgentsDashboard(options: AgentsDashboardHostOptions = {}): Promise<() => void> {
 		const activeModel = this.ctx.session.model;
 		const activeModelPattern = activeModel ? `${activeModel.provider}/${activeModel.id}` : undefined;
 		const defaultModelPattern = this.ctx.settings.getModelRole("default");
@@ -569,9 +2088,12 @@ export class SelectorController {
 			if (closed) return;
 			closed = true;
 			hub?.dispose();
-			overlayHandle?.hide();
-			this.focusActiveEditorArea();
-			this.ctx.ui.requestRender();
+			overlayHandle.hide();
+			if (options.onDone) options.onDone();
+			else {
+				this.focusActiveEditorArea();
+				this.ctx.ui.requestRender();
+			}
 		};
 		const hub = await AgentsHubComponent.create(
 			this.ctx.ui,
@@ -583,9 +2105,15 @@ export class SelectorController {
 				activeModelPattern,
 				defaultModelPattern,
 			),
-			{ onCancel: () => done() },
+			{ onCancel: done },
 		);
+		if (options.isCancelled?.()) {
+			closed = true;
+			hub.dispose();
+			return () => {};
+		}
 		const overlayHandle = this.#showFullscreenMenu(hub);
+		return done;
 	}
 
 	/**
@@ -1051,29 +2579,37 @@ export class SelectorController {
 	/**
 	 * Fullscreen model hub on the alternate screen (the /settings idiom): the
 	 * overlay enables mouse tracking for its lifetime and the transcript stays
-	 * untouched underneath. `initialProviderId` preselects a provider's sidebar
-	 * entry — used when reopening the hub after a /login round-trip.
+	 * untouched underneath. Provider and focused-role entry points share the
+	 * same live mutation callbacks unless an isolated role destination is supplied.
 	 */
-	#showModelHub(hubOptions: { initialProviderId?: string }): void {
+	#showModelHub(hubOptions: ModelHubHostOptions): () => void {
 		const { ModelHubComponent } = loadModelOverlayComponents();
 		let closed = false;
-		const done = () => {
-			// Re-entrant guard: cancel paths (Esc, login forward) may race;
-			// the overlay must hide exactly once.
-			if (closed) return;
+		const closeOverlay = (): boolean => {
+			if (closed) return false;
 			closed = true;
 			hub?.dispose();
 			overlayHandle?.hide();
-			this.focusActiveEditorArea();
-			this.ctx.ui.requestRender();
+			return true;
+		};
+		const done = () => {
+			if (!closeOverlay()) return;
+			if (hubOptions.onDone) hubOptions.onDone();
+			else {
+				this.focusActiveEditorArea();
+				this.ctx.ui.requestRender();
+			}
 		};
 		const hub = new ModelHubComponent(
 			this.ctx.ui,
-			createModelBrowserSource(this.ctx.settings),
+			hubOptions.source ?? createModelBrowserSource(this.ctx.settings),
 			this.ctx.session.modelRegistry,
 			this.ctx.session.scopedModels,
 			{
 				onAssign: async (model, role, thinkingLevel, selector, scope?: ModelRoleSelectionScope) => {
+					if (hubOptions.roleCallbacks) {
+						return hubOptions.roleCallbacks.onAssign(model, role, thinkingLevel, selector, scope);
+					}
 					const releaseDefaultMutation = role === "default" ? await this.#acquireDefaultRoleMutation() : undefined;
 					const configuredStorage = this.ctx.settings.get("modelRoleStorage");
 					const targetScope = configuredStorage === "project" ? (scope ?? "project") : "global";
@@ -1160,6 +2696,7 @@ export class SelectorController {
 					}
 				},
 				onUnassign: async (role, scope?: ModelRoleSelectionScope) => {
+					if (hubOptions.roleCallbacks) return hubOptions.roleCallbacks.onUnassign(role, scope);
 					const releaseDefaultMutation = role === "default" ? await this.#acquireDefaultRoleMutation() : undefined;
 					const configuredStorage = this.ctx.settings.get("modelRoleStorage");
 					const targetScope = configuredStorage === "project" ? (scope ?? "project") : "global";
@@ -1231,61 +2768,83 @@ export class SelectorController {
 								}
 							}
 						}
+						return true;
 					} catch (error) {
 						this.ctx.showError(error instanceof Error ? error.message : String(error));
+						return false;
 					} finally {
 						releaseDefaultMutation?.();
 						hub?.refreshAfterExternalMutation();
 					}
 				},
-				onFallbackChainChange: (role, chain) => {
-					try {
-						const chains = { ...this.ctx.settings.get("retry.fallbackChains") };
-						if (chain.length === 0) {
-							delete chains[role];
-						} else {
-							chains[role] = chain;
-						}
-						this.ctx.settings.set("retry.fallbackChains", chains);
-						const roleInfo = getRoleInfo(role, settings);
-						this.ctx.showStatus(
-							chain.length > 0
-								? `${roleInfo?.tag ?? roleInfo?.name ?? role} fallbacks: ${chain.join(" → ")}`
-								: `${roleInfo?.tag ?? roleInfo?.name ?? role} fallbacks cleared`,
-						);
-					} catch (error) {
-						this.ctx.showError(error instanceof Error ? error.message : String(error));
-					}
-				},
+				onFallbackChainChange: hubOptions.roleCallbacks
+					? undefined
+					: (role, chain) => {
+							try {
+								const chains = { ...this.ctx.settings.get("retry.fallbackChains") };
+								if (chain.length === 0) {
+									delete chains[role];
+								} else {
+									chains[role] = chain;
+								}
+								this.ctx.settings.set("retry.fallbackChains", chains);
+								const roleInfo = getRoleInfo(role, settings);
+								this.ctx.showStatus(
+									chain.length > 0
+										? `${roleInfo?.tag ?? roleInfo?.name ?? role} fallbacks: ${chain.join(" → ")}`
+										: `${roleInfo?.tag ?? roleInfo?.name ?? role} fallbacks cleared`,
+								);
+							} catch (error) {
+								this.ctx.showError(error instanceof Error ? error.message : String(error));
+							}
+						},
 
-				onLoginRequest: providerId => {
-					done();
-					void this.#loginThenReopenModelHub(providerId);
-				},
-				onCycleOrderChange: order => {
-					try {
-						this.ctx.settings.set("cycleOrder", order);
-						this.ctx.showStatus(
-							order.length > 0 ? `Quick-switch cycle: ${order.join(" → ")}` : "Quick-switch cycle cleared",
-						);
-					} catch (error) {
-						this.ctx.showError(error instanceof Error ? error.message : String(error));
-					}
-				},
+				onLoginRequest: hubOptions.initialAssignRole
+					? undefined
+					: providerId => {
+							if (hubOptions.onDone) {
+								if (!closeOverlay()) return;
+								void this.#loginThenReopenModelHub(providerId, hubOptions);
+							} else {
+								done();
+								void this.#loginThenReopenModelHub(providerId);
+							}
+						},
+				onCycleOrderChange: hubOptions.roleCallbacks
+					? undefined
+					: order => {
+							try {
+								this.ctx.settings.set("cycleOrder", order);
+								this.ctx.showStatus(
+									order.length > 0 ? `Quick-switch cycle: ${order.join(" → ")}` : "Quick-switch cycle cleared",
+								);
+							} catch (error) {
+								this.ctx.showError(error instanceof Error ? error.message : String(error));
+							}
+						},
 				onCancel: () => done(),
 			},
 			{
 				initialProviderId: hubOptions.initialProviderId,
+				initialAssignRole: hubOptions.initialAssignRole,
 			},
 		);
 		const overlayHandle = this.#showFullscreenMenu(hub);
+		hubOptions.setClose?.(done);
+		return done;
 	}
 
 	/** /login round-trip for a locked provider; reopen the hub on that provider only after a successful login. */
-	async #loginThenReopenModelHub(providerId: string): Promise<void> {
+	async #loginThenReopenModelHub(
+		providerId: string,
+		hostOptions?: Pick<ModelHubHostOptions, "isCancelled" | "onDone" | "setClose">,
+	): Promise<void> {
 		const succeeded = await this.#handleOAuthLogin(providerId);
+		if (hostOptions?.isCancelled?.()) return;
 		if (succeeded) {
-			this.#showModelHub({ initialProviderId: providerId });
+			this.#showModelHub({ initialProviderId: providerId, ...hostOptions });
+		} else {
+			hostOptions?.onDone?.();
 		}
 	}
 

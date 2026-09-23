@@ -20,7 +20,7 @@ import {
 import { AuthBrokerClient } from "@oh-my-pi/pi-ai/auth-broker";
 import type { ClientUsageClientSummary } from "@oh-my-pi/pi-ai/usage";
 import { formatProviderName } from "@oh-my-pi/pi-tui/chrome/format";
-import { formatDuration, formatNumber, sanitizeText } from "@oh-my-pi/pi-utils";
+import { formatDuration, formatNumber, sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { ModelRegistry } from "../config/model-registry";
 import { discoverAuthStorage } from "../sdk";
@@ -53,6 +53,22 @@ export interface UsageAccountIdentity {
 	orgName?: string;
 	/** Epoch ms of the interactive login that minted the OAuth grant (see `OAuthCredentials.authorizedAt`). */
 	authorizedAt?: number;
+}
+
+/** Token-free account quota data shared by CLI and profile inspection. */
+export interface ProfileUsageSnapshot {
+	generatedAt: number;
+	reports: Omit<UsageReport, "raw">[];
+	accountsWithoutUsage: UsageAccountIdentity[];
+	capacity: Record<string, ProviderWindowStat[]>;
+}
+
+export interface UsageSnapshotCollection {
+	snapshot: ProfileUsageSnapshot;
+	/** Filtered account list used by the text formatter. */
+	accounts: UsageAccountIdentity[];
+	/** All stored accounts, before usage-capability or provider filtering. */
+	storedAccountCount: number;
 }
 
 /**
@@ -478,8 +494,10 @@ export interface ProviderWindowStat {
 	/** Compact window label, e.g. "5h", "7d". */
 	window: string;
 	durationMs?: number;
-	/** Meter identity when a provider keeps independent meters in one window. */
+	/** Display label when a provider keeps independent meters in one window. */
 	meter?: string;
+	/** Internal normalized identity used to correlate the meter with its reset. */
+	meterKey?: string;
 	/** Accounts reporting a limit in this window. */
 	accounts: number;
 	/** Sum of each account's binding used fraction - accounts' worth of quota burned. */
@@ -488,41 +506,103 @@ export interface ProviderWindowStat {
 	remainingAccounts: number;
 }
 
-function meterForLimit(report: UsageReport, limit: UsageLimit): string | undefined {
-	if (report.provider !== "openai-codex") return undefined;
+interface UsageMeter {
+	key: string;
+	label: string;
+}
+
+interface UsageWindowIdentity {
+	key: string;
+	label: string;
+	durationMs?: number;
+}
+
+function usageWindowIdentity(limit: UsageLimit): UsageWindowIdentity {
+	const durationMs = limit.window?.durationMs;
+	return {
+		key: durationMs !== undefined ? `d:${durationMs}` : (limit.scope.windowId ?? limit.window?.label ?? limit.label),
+		label:
+			durationMs !== undefined
+				? formatDuration(durationMs)
+				: (limit.window?.label ?? limit.scope.windowId ?? limit.label),
+		durationMs,
+	};
+}
+
+function explicitMeterForLimit(report: UsageReport, limit: UsageLimit): UsageMeter | undefined {
+	const provider = report.provider.trim().toLowerCase();
+	const sharedGroup = limit.scope.sharedGroup?.trim();
+	if (sharedGroup) {
+		return {
+			key: `${provider}\0shared:${sharedGroup.toLowerCase()}`,
+			label: limit.label,
+		};
+	}
+
+	// Preserve the established Codex chat/Spark presentation until its parser
+	// supplies a normalized shared-group identity for the chat allowance.
+	if (provider !== "openai-codex") return undefined;
 	const tier = limit.scope.tier?.trim().toLowerCase();
-	if (tier) return tier;
+	if (tier) return { key: `${provider}\0tier:${tier}`, label: tier };
 	const slug = limit.id.toLowerCase().split(":")[1];
-	return slug && slug !== "primary" && slug !== "secondary" ? slug : "chat";
+	const label = slug && slug !== "primary" && slug !== "secondary" ? slug : "chat";
+	return { key: `${provider}\0legacy:${label}`, label };
+}
+
+function independentMeterWindows(reports: UsageReport[]): Set<string> {
+	const windows = new Set<string>();
+	for (const report of reports) {
+		for (const limit of report.limits) {
+			if (explicitMeterForLimit(report, limit)) windows.add(usageWindowIdentity(limit).key);
+		}
+	}
+	return windows;
+}
+
+function meterForLimit(
+	report: UsageReport,
+	limit: UsageLimit,
+	independentWindows: ReadonlySet<string>,
+): UsageMeter | undefined {
+	const explicit = explicitMeterForLimit(report, limit);
+	if (explicit) return explicit;
+	const window = usageWindowIdentity(limit);
+	if (!independentWindows.has(window.key)) return undefined;
+	const label = limit.label.trim() || window.label;
+	return {
+		key: `${report.provider.trim().toLowerCase()}\0label:${label.toLowerCase()}`,
+		label,
+	};
 }
 
 /**
  * Aggregate one provider's reports into per-window quota capacity stats.
  *
  * Limits are bucketed by window duration (5h, 7d, ...). Within a bucket each
- * account contributes its single highest used fraction. Codex keeps each meter
- * in its own bucket because chat and Spark can share a window duration.
+ * account contributes its single highest used fraction. Normalized
+ * `sharedGroup` identities keep independent allowances separate while routing
+ * aliases of one allowance collapse into a single meter.
  */
 export function computeProviderWindowStats(reports: UsageReport[]): ProviderWindowStat[] {
-	const buckets = new Map<string, { window: string; durationMs?: number; meter?: string; fractions: number[] }>();
+	const independentWindows = independentMeterWindows(reports);
+	const buckets = new Map<string, { window: string; durationMs?: number; meter?: UsageMeter; fractions: number[] }>();
 	for (const report of reports) {
 		const accountMax = new Map<string, number>();
 		for (const limit of report.limits) {
 			const fraction = resolveUsedFraction(limit);
 			if (fraction === undefined) continue;
-			const durationMs = limit.window?.durationMs;
-			const windowKey =
-				durationMs !== undefined ? `d:${durationMs}` : (limit.scope.windowId ?? limit.window?.label ?? limit.label);
-			const meter = meterForLimit(report, limit);
-			const key = meter === undefined ? windowKey : `m:${meter}\0${windowKey}`;
+			const window = usageWindowIdentity(limit);
+			const meter = meterForLimit(report, limit, independentWindows);
+			const key = meter === undefined ? window.key : `m:${meter.key}\0${window.key}`;
 			const previous = accountMax.get(key);
 			if (previous === undefined || fraction > previous) accountMax.set(key, fraction);
 			if (!buckets.has(key)) {
-				const window =
-					durationMs !== undefined
-						? formatDuration(durationMs)
-						: (limit.window?.label ?? limit.scope.windowId ?? limit.label);
-				buckets.set(key, { window, durationMs, meter, fractions: [] });
+				buckets.set(key, {
+					window: window.label,
+					durationMs: window.durationMs,
+					meter,
+					fractions: [],
+				});
 			}
 		}
 		for (const [key, fraction] of accountMax) buckets.get(key)!.fractions.push(fraction);
@@ -530,19 +610,41 @@ export function computeProviderWindowStats(reports: UsageReport[]): ProviderWind
 	return [...buckets.values()]
 		.sort((a, b) => {
 			const duration = (a.durationMs ?? Number.POSITIVE_INFINITY) - (b.durationMs ?? Number.POSITIVE_INFINITY);
-			return duration !== 0 ? duration : (a.meter ?? "").localeCompare(b.meter ?? "");
+			return duration !== 0 ? duration : (a.meter?.label ?? "").localeCompare(b.meter?.label ?? "");
 		})
 		.map(bucket => {
 			const usedAccounts = bucket.fractions.reduce((sum, fraction) => sum + fraction, 0);
-			return {
+			const stat: ProviderWindowStat = {
 				window: bucket.window,
 				durationMs: bucket.durationMs,
-				...(bucket.meter === undefined ? {} : { meter: bucket.meter }),
+				...(bucket.meter === undefined ? {} : { meter: bucket.meter.label }),
 				accounts: bucket.fractions.length,
 				usedAccounts,
-				remainingAccounts: Math.max(0, bucket.fractions.length - usedAccounts),
+				remainingAccounts: bucket.fractions.reduce((sum, fraction) => sum + Math.max(0, 1 - fraction), 0),
 			};
+			if (bucket.meter) {
+				Object.defineProperty(stat, "meterKey", { value: bucket.meter.key });
+			}
+			return stat;
 		});
+}
+
+/** Reset timestamps belonging to one capacity meter, excluding independent peers in the same window. */
+export function collectProviderWindowResets(reports: UsageReport[], stat: ProviderWindowStat): number[] {
+	const independentWindows = independentMeterWindows(reports);
+	const values = new Set<number>();
+	for (const report of reports) {
+		for (const limit of report.limits) {
+			const window = usageWindowIdentity(limit);
+			const sameDuration = stat.durationMs !== undefined && window.durationMs === stat.durationMs;
+			if (!sameDuration && window.label !== stat.window) continue;
+			const meter = meterForLimit(report, limit, independentWindows);
+			if (meter?.key !== stat.meterKey) continue;
+			const resetsAt = limit.window?.resetsAt;
+			if (resetsAt !== undefined && Number.isFinite(resetsAt)) values.add(resetsAt);
+		}
+	}
+	return [...values].sort((a, b) => a - b);
 }
 
 /** Re-login warnings render once remaining grant life drops below this. */
@@ -721,7 +823,8 @@ export function formatUsageBreakdown(
 		const stats = computeProviderWindowStats(providerReports);
 		if (stats.length > 0) {
 			const parts = stats.map(stat => {
-				const meterLabel = stat.meter ? ` (${stat.meter.charAt(0).toUpperCase()}${stat.meter.slice(1)})` : "";
+				const meter = stat.meter ? sanitizeText(stat.meter.replace(/[\r\n]+/g, " ").replace(/\t/g, "  ")) : "";
+				const meterLabel = meter ? ` (${meter.charAt(0).toUpperCase()}${meter.slice(1)})` : "";
 				return `${stat.window}${meterLabel} → ${stat.usedAccounts.toFixed(2)}/${stat.accounts} ${stat.accounts === 1 ? "account" : "accounts"} used (${stat.remainingAccounts.toFixed(2)}× quota left)`;
 			});
 			lines.push(`  ${chalk.dim(`capacity: ${parts.join(" · ")}`)}`);
@@ -1022,6 +1125,63 @@ export function formatClientUsage(clients: ClientUsageClientSummary[], sinceMs: 
 	return lines.join("\n");
 }
 
+/**
+ * Fetch one quota snapshot while preserving the auth layer's account
+ * selection, broker routing, cache, and backoff behavior.
+ */
+export async function collectUsageSnapshot(
+	authStorage: AuthStorage,
+	options: { provider?: string; signal?: AbortSignal; modelRegistry?: ModelRegistry } = {},
+): Promise<UsageSnapshotCollection> {
+	options.signal?.throwIfAborted();
+	const modelRegistry = options.modelRegistry ?? new ModelRegistry(authStorage);
+	const reports = await authStorage.fetchUsageReports({
+		baseUrlResolver: provider => modelRegistry.getProviderBaseUrl(provider),
+		signal: options.signal,
+	});
+	options.signal?.throwIfAborted();
+	if (reports === null) throw new Error("Usage reports unavailable");
+	// Reports are always fresh (broker-side fetch) but the account list can
+	// come from a disk-cached snapshot up to an hour old — revalidate so a
+	// just-logged-in (or just-rotated-identity) credential isn't rendered
+	// as a stale duplicate. Best-effort: offline broker keeps the cache.
+	try {
+		await untilAborted(options.signal, () => authStorage.revalidateCredentials());
+	} catch {
+		options.signal?.throwIfAborted();
+		// Stale identities beat no output.
+	}
+	const storedAccounts = collectStoredAccounts(authStorage);
+	let accounts = selectReportableAccounts(
+		storedAccounts,
+		provider => authStorage.usageProviderFor(provider) !== undefined,
+		options.provider,
+	);
+	let filteredReports = reports;
+	if (options.provider) {
+		const wanted = options.provider.toLowerCase();
+		filteredReports = reports.filter(report => report.provider.toLowerCase() === wanted);
+		accounts = accounts.filter(account => account.provider.toLowerCase() === wanted);
+	}
+	const trimmed = filteredReports.map(({ raw: _raw, ...rest }) => rest);
+	const capacity: Record<string, ProviderWindowStat[]> = {};
+	for (const report of filteredReports) {
+		if (capacity[report.provider]) continue;
+		const stats = computeProviderWindowStats(filteredReports.filter(peer => peer.provider === report.provider));
+		if (stats.length > 0) capacity[report.provider] = stats;
+	}
+	return {
+		snapshot: {
+			generatedAt: Date.now(),
+			reports: trimmed,
+			accountsWithoutUsage: collectUnreportedAccounts(filteredReports, accounts),
+			capacity,
+		},
+		accounts,
+		storedAccountCount: storedAccounts.length,
+	};
+}
+
 export async function runUsageCommand(cmd: UsageCommandArgs): Promise<void> {
 	const authStorage = await discoverAuthStorage();
 	try {
@@ -1096,26 +1256,9 @@ export async function runUsageCommand(cmd: UsageCommandArgs): Promise<void> {
 			process.stdout.write(`${formatUsageHistory(entries, sinceMs, nowMs, redaction)}\n`);
 			return;
 		}
-		const modelRegistry = new ModelRegistry(authStorage);
-		const reports =
-			(await authStorage.fetchUsageReports({
-				baseUrlResolver: provider => modelRegistry.getProviderBaseUrl(provider),
-			})) ?? [];
-		// Reports are always fresh (broker-side fetch) but the account list can
-		// come from a disk-cached snapshot up to an hour old — revalidate so a
-		// just-logged-in (or just-rotated-identity) credential isn't rendered
-		// as a stale duplicate. Best-effort: offline broker keeps the cache.
-		try {
-			await authStorage.revalidateCredentials();
-		} catch {
-			// Stale identities beat no output.
-		}
-		const storedAccounts = collectStoredAccounts(authStorage);
-		let accounts = selectReportableAccounts(
-			storedAccounts,
-			provider => authStorage.usageProviderFor(provider) !== undefined,
-			cmd.provider,
-		);
+		const collection = await collectUsageSnapshot(authStorage, { provider: cmd.provider });
+		const { snapshot, accounts, storedAccountCount } = collection;
+		const filteredReports = snapshot.reports;
 		// Tombstones ride alongside the live pool so an auto-disabled account
 		// (e.g. an expired Anthropic grant) is loudly visible instead of just
 		// missing. Best-effort: a broker predating the endpoint yields [].
@@ -1125,11 +1268,8 @@ export async function runUsageCommand(cmd: UsageCommandArgs): Promise<void> {
 		} catch {
 			// Usage output must not fail because tombstone listing did.
 		}
-		let filteredReports = reports;
 		if (cmd.provider) {
 			const wanted = cmd.provider.toLowerCase();
-			filteredReports = reports.filter(report => report.provider.toLowerCase() === wanted);
-			accounts = accounts.filter(account => account.provider.toLowerCase() === wanted);
 			disabled = disabled.filter(summary => summary.provider.toLowerCase() === wanted);
 		}
 
@@ -1140,8 +1280,8 @@ export async function runUsageCommand(cmd: UsageCommandArgs): Promise<void> {
 		if (cmd.json) {
 			// Drop the heavy provider-specific `raw` payload — same shape as the
 			// broker/gateway `/v1/usage` endpoints.
-			let trimmed = filteredReports.map(({ raw: _raw, ...rest }) => rest);
-			let unreportedAccounts = collectUnreportedAccounts(filteredReports, accounts);
+			let trimmed = snapshot.reports;
+			let unreportedAccounts = snapshot.accountsWithoutUsage;
 			if (redaction) {
 				trimmed = trimmed.map(report => redactReportForJson(report, redaction));
 				unreportedAccounts = unreportedAccounts.map(account => ({
@@ -1154,12 +1294,7 @@ export async function runUsageCommand(cmd: UsageCommandArgs): Promise<void> {
 					orgName: maskIdentity(redaction, account.orgName),
 				}));
 			}
-			const capacity: Record<string, ProviderWindowStat[]> = {};
-			for (const report of filteredReports) {
-				if (capacity[report.provider]) continue;
-				const stats = computeProviderWindowStats(filteredReports.filter(peer => peer.provider === report.provider));
-				if (stats.length > 0) capacity[report.provider] = stats;
-			}
+			const capacity = snapshot.capacity;
 			let disabledForJson = disabled.filter(summary => isActionableDisable(summary, accounts));
 			if (redaction) {
 				disabledForJson = disabledForJson.map(summary => ({
@@ -1171,7 +1306,7 @@ export async function runUsageCommand(cmd: UsageCommandArgs): Promise<void> {
 				}));
 			}
 			const payload = {
-				generatedAt: Date.now(),
+				generatedAt: snapshot.generatedAt,
 				reports: trimmed,
 				accountsWithoutUsage: unreportedAccounts,
 				disabledCredentials: disabledForJson,
@@ -1186,7 +1321,7 @@ export async function runUsageCommand(cmd: UsageCommandArgs): Promise<void> {
 			// Credentials exist but every one is for a provider without a usage
 			// endpoint — say so rather than implying nothing is logged in.
 			const message =
-				storedAccounts.length > 0
+				storedAccountCount > 0
 					? `No usage data${scope}. Stored credentials are for providers without a usage endpoint.\n`
 					: `No credentials found${scope}. Run \`omp\` and use /login to add accounts.\n`;
 			process.stderr.write(chalk.yellow(message));

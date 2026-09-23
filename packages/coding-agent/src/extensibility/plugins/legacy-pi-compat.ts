@@ -38,6 +38,8 @@ const BUNDLED_VIRTUAL_SCHEME = "omp-legacy-pi-bundled:";
 const BUNDLED_VIRTUAL_NAMESPACE = "omp-legacy-pi-bundled";
 const BUNDLED_HOST_NAMESPACE = "omp-legacy-pi-host";
 const BUNDLED_HOST_SCHEME = `${BUNDLED_HOST_NAMESPACE}:`;
+const FILESYSTEM_HOST_NAMESPACE = "omp-legacy-pi-filesystem";
+const requireFilesystemHostModule = createRequire(import.meta.url);
 const TYPEBOX_BUNDLED_MODULE_KEY = "typebox";
 
 type BundledModule = Readonly<Record<string, unknown>>;
@@ -757,6 +759,21 @@ async function loadBundledModule(moduleKey: string): Promise<BundledModule> {
 	return module;
 }
 
+function projectFilesystemHostModule(modulePath: string): { contents: string; loader: "js" } {
+	const module: unknown = requireFilesystemHostModule(modulePath);
+	if (!isRecord(module)) {
+		throw new Error(`Host Pi module did not expose a module namespace: ${modulePath}`);
+	}
+	const physicalSpecifier = JSON.stringify(url.pathToFileURL(stripWindowsExtendedLengthPathPrefix(modulePath)).href);
+	return {
+		contents: [
+			`export * from ${physicalSpecifier};`,
+			...(Object.hasOwn(module, "default") ? [`export { default } from ${physicalSpecifier};`] : []),
+		].join("\n"),
+		loader: "js",
+	};
+}
+
 function bundledModuleVirtualSpecifier(moduleKey: string): string {
 	return `${BUNDLED_VIRTUAL_SCHEME}${moduleKey}`;
 }
@@ -770,7 +787,7 @@ function toLegacyPiResolveResult(resolvedPath: string): LegacyPiResolveResult {
 		const registryKey = resolvedPath.slice(BUNDLED_VIRTUAL_SCHEME.length);
 		return { path: registryKey, namespace: BUNDLED_VIRTUAL_NAMESPACE };
 	}
-	return { path: resolvedPath };
+	return { path: resolvedPath, namespace: FILESYSTEM_HOST_NAMESPACE };
 }
 
 /** Maps a bundled virtual specifier or registry key to Bun's plugin namespace shape. */
@@ -835,7 +852,18 @@ function remapLegacyPiSubpath(rest: string): string {
 }
 
 const LEGACY_PI_SPECIFIER_FILTER = new RegExp(`^@(?:${PI_SCOPE_ALTERNATION})/(?:${PI_PACKAGE_ALTERNATION})(?:/.*)?$`);
-const resolvedSpecifierFallbacks = new Map<string, string>();
+interface PiPackageLocation {
+	readonly root: string;
+	readonly manifest: Record<string, unknown>;
+}
+interface HostPiPackageLocation extends PiPackageLocation {
+	// The canonical entry directory bounds actual host source. Package roots
+	// can also contain extension fixtures or nested projects that must be remapped.
+	readonly moduleRoot: string;
+}
+
+const hostPiPackageLocations = new Map<string, HostPiPackageLocation>();
+let hostPiPackageLocationsReady = false;
 const SOURCE_MODULE_EXTENSIONS = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"] as const;
 const SUPPORTED_PACKAGE_IMPORT_CONDITIONS = new Set(["bun", "node", "import", "default"]);
 const SUPPORTED_PACKAGE_REQUIRE_CONDITIONS = new Set(["bun", "node", "require", "default"]);
@@ -850,7 +878,6 @@ const nativeAddonResolutionCache = new Map<string, Promise<string | null>>();
 const nativeAddonRequireScanCache = new Map<string, Promise<boolean>>();
 
 function clearLegacyPiResolutionCaches(): void {
-	resolvedSpecifierFallbacks.clear();
 	packageRootCache.clear();
 	packageImportsCache.clear();
 	nodePackageRootCache.clear();
@@ -974,15 +1001,15 @@ const LEGACY_PI_TUI_SHIM_PATH = USE_BUNDLED_PI_MODULES
 // always replace the canonical surface so legacy helpers stay reachable. The
 // other bundled host packages (`pi-agent-core`, `pi-natives`, `pi-utils`) are
 // added in compiled binaries and npm bundles to route extensions onto the
-// in-process module instance — in dev / source-link / source SDK mode the
-// canonical specifier resolves cleanly through `Bun.resolveSync`; hardcoding a
-// source-tree path would miss installs where bundled packages live at
-// `node_modules/@oh-my-pi/pi-*`.
+// in-process module instance — in dev / source-link / source SDK mode their
+// package roots and export maps are captured before the runtime resolver hook
+// is installed. This also supports installs where bundled packages live at
+// `node_modules/@oh-my-pi/pi-*` without resolving re-entrantly from the hook.
 //
 // Bundled entries are `omp-legacy-pi-bundled:<key>` specifiers handed to the
 // synthetic onLoad in `installLegacyPiSpecifierShim()`. Filesystem-shaped
 // overrides are still validated against on-disk presence so a missing dev-mode
-// shim falls through to `getResolvedSpecifier`.
+// shim falls through to the precomputed host package mapping.
 
 /**
  * Drop overrides whose filesystem targets are missing so they can fall
@@ -1068,31 +1095,22 @@ function remapLegacyPiSpecifier(specifier: string): string | null {
 	return `${CANONICAL_PI_SCOPE}/${remappedSubpath}`;
 }
 
-function getResolvedSpecifier(specifier: string): string {
-	const cached = resolvedSpecifierFallbacks.get(specifier);
-	if (cached) {
-		return cached;
-	}
-
-	const resolved = Bun.resolveSync(specifier, import.meta.dir);
-	resolvedSpecifierFallbacks.set(specifier, resolved);
-	return resolved;
-}
-
 /**
- * Resolve a canonical `@oh-my-pi/*` specifier to a filesystem path, preferring
- * a bundled compat shim when one is registered for the package root.
- *
- * Falls back to `getResolvedSpecifier` (which may throw under compiled binary
- * mode); callers handle that the same way they would for non-overridden
- * specifiers.
+ * Resolve a canonical `@oh-my-pi/*` specifier to the host package's filesystem
+ * target, preferring a bundled compat shim when one is registered for the
+ * package root.
  */
 function resolveCanonicalPiSpecifier(remappedSpecifier: string): string {
 	const override = legacyPiPackageRootOverrides[remappedSpecifier];
 	if (override) {
 		return override;
 	}
-	return getResolvedSpecifier(remappedSpecifier);
+	ensureHostPiPackageLocations();
+	const resolved = resolveMappedPiSpecifier(remappedSpecifier, null, SUPPORTED_PACKAGE_IMPORT_CONDITIONS);
+	if (!resolved) {
+		throw new Error(`Unable to resolve host Pi package export: ${remappedSpecifier}`);
+	}
+	return resolved;
 }
 
 function toImportSpecifier(resolvedPath: string): string {
@@ -1415,6 +1433,41 @@ function matchPackagePattern(
 	};
 }
 
+interface PackageExportTarget {
+	readonly target: string;
+	readonly wildcard: string | null;
+}
+
+function selectNodePackageExportTarget(
+	subpath: string | null,
+	exportsField: unknown,
+	conditions: ReadonlySet<string>,
+): PackageExportTarget | null {
+	const rootTarget = subpath === null ? selectPackageImportTarget(exportsField, conditions) : null;
+	if (typeof rootTarget === "string") {
+		return { target: rootTarget, wildcard: null };
+	}
+	if (!isRecord(exportsField)) {
+		return null;
+	}
+
+	const exactKey = subpath === null ? "." : `./${subpath}`;
+	if (Object.hasOwn(exportsField, exactKey)) {
+		const exactTarget = selectPackageImportTarget(exportsField[exactKey], conditions);
+		return typeof exactTarget === "string" ? { target: exactTarget, wildcard: null } : null;
+	}
+	if (subpath === null) {
+		return null;
+	}
+
+	const match = matchPackagePattern(exactKey, exportsField);
+	if (!match) {
+		return null;
+	}
+	const target = selectPackageImportTarget(match.target, conditions);
+	return typeof target === "string" ? { target, wildcard: match.wildcard } : null;
+}
+
 async function resolvePackageImportSpecifier(
 	specifier: string,
 	importerPath: string,
@@ -1480,6 +1533,163 @@ function splitBarePackageSpecifier(specifier: string): BarePackageSpecifier | nu
 	const [name, ...rest] = parts;
 	if (!name) return null;
 	return { name, subpath: rest.length > 0 ? rest.join("/") : null };
+}
+
+function readPiPackageLocation(packageRoot: string, expectedName: string): PiPackageLocation | null {
+	try {
+		const root = fs.realpathSync(packageRoot);
+		const parsed = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+		return isRecord(parsed) && parsed.name === expectedName ? { root, manifest: parsed } : null;
+	} catch {
+		return null;
+	}
+}
+
+function findContainingPiPackageLocation(resolvedPath: string, expectedName: string): HostPiPackageLocation | null {
+	let candidatePath = resolvedPath;
+	if (candidatePath.startsWith("file://")) {
+		try {
+			candidatePath = url.fileURLToPath(candidatePath);
+		} catch {
+			return null;
+		}
+	}
+	let dir = path.dirname(candidatePath);
+	while (true) {
+		const location = readPiPackageLocation(dir, expectedName);
+		if (location) {
+			return { ...location, moduleRoot: fs.realpathSync(path.dirname(candidatePath)) };
+		}
+		const parent = path.dirname(dir);
+		if (parent === dir) {
+			return null;
+		}
+		dir = parent;
+	}
+}
+
+function ensureHostPiPackageLocations(): void {
+	if (hostPiPackageLocationsReady) {
+		return;
+	}
+	hostPiPackageLocationsReady = true;
+	for (const packageName of PI_PACKAGE_NAMES) {
+		const canonicalName = `${CANONICAL_PI_SCOPE}/${packageName}`;
+		try {
+			const resolved = Bun.resolveSync(canonicalName, import.meta.dir);
+			const location = findContainingPiPackageLocation(resolved, canonicalName);
+			if (location) {
+				hostPiPackageLocations.set(canonicalName, location);
+			}
+		} catch {
+			// A compiled runtime has no filesystem package roots; bundled
+			// virtual-module overrides remain the authoritative mapping there.
+		}
+	}
+}
+
+function resolvePackageTargetSync(packageRoot: string, target: string, wildcard: string | null): string | null {
+	if (!target.startsWith("./")) {
+		return null;
+	}
+	const substituted = wildcard === null ? target : target.replaceAll("*", wildcard);
+	const candidate = path.resolve(packageRoot, substituted);
+	if (!isPathInsideRoot(packageRoot, candidate)) {
+		return null;
+	}
+	try {
+		const resolved = fs.realpathSync(candidate);
+		return isPathInsideRoot(packageRoot, resolved) ? resolved : null;
+	} catch {
+		return null;
+	}
+}
+
+function resolvePiPackageExport(
+	location: PiPackageLocation,
+	subpath: string | null,
+	conditions: ReadonlySet<string>,
+): string | null {
+	let selected = selectNodePackageExportTarget(subpath, location.manifest.exports, conditions);
+	// Bun's synchronous require resolver accepts import-only TypeScript package
+	// exports. Preserve that host-package behavior after first preferring an
+	// explicit require branch.
+	if (!selected && conditions === SUPPORTED_PACKAGE_REQUIRE_CONDITIONS) {
+		selected = selectNodePackageExportTarget(subpath, location.manifest.exports, SUPPORTED_PACKAGE_IMPORT_CONDITIONS);
+	}
+	return selected ? resolvePackageTargetSync(location.root, selected.target, selected.wildcard) : null;
+}
+
+function findImporterPiPackageLocation(packageName: string, importerPath: string): PiPackageLocation | null {
+	let importerFile = importerPath;
+	if (importerFile.startsWith("file://")) {
+		try {
+			importerFile = url.fileURLToPath(importerFile);
+		} catch {
+			return null;
+		}
+	}
+	let dir = path.dirname(importerFile);
+	while (true) {
+		const location = readPiPackageLocation(path.join(dir, "node_modules", packageName), packageName);
+		if (location) {
+			return location;
+		}
+		const parent = path.dirname(dir);
+		if (parent === dir) {
+			return null;
+		}
+		dir = parent;
+	}
+}
+
+function isHostPiImporter(importerPath: string): boolean {
+	if (!importerPath) {
+		return false;
+	}
+	let importerFile = importerPath;
+	if (importerFile.startsWith("file://")) {
+		try {
+			importerFile = url.fileURLToPath(importerFile);
+		} catch {
+			return false;
+		}
+	}
+	const absoluteImporter = path.resolve(importerFile);
+	for (const location of hostPiPackageLocations.values()) {
+		if (isPathInsideRoot(location.moduleRoot, absoluteImporter)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+function resolveMappedPiSpecifier(
+	specifier: string,
+	importerPath: string | null,
+	conditions: ReadonlySet<string>,
+): string | null {
+	const parsed = splitBarePackageSpecifier(specifier);
+	if (
+		!parsed ||
+		!parsed.name.startsWith(`${CANONICAL_PI_SCOPE}/`) ||
+		!PI_PACKAGE_NAMES.includes(parsed.name.slice(CANONICAL_PI_SCOPE.length + 1) as (typeof PI_PACKAGE_NAMES)[number])
+	) {
+		return null;
+	}
+
+	const hostLocation = hostPiPackageLocations.get(parsed.name);
+	if (hostLocation) {
+		const hostTarget = resolvePiPackageExport(hostLocation, parsed.subpath, conditions);
+		if (hostTarget) {
+			return hostTarget;
+		}
+	}
+	if (!importerPath) {
+		return null;
+	}
+	const importerLocation = findImporterPiPackageLocation(parsed.name, importerPath);
+	return importerLocation ? resolvePiPackageExport(importerLocation, parsed.subpath, conditions) : null;
 }
 
 async function findNodePackageRoot(packageName: string, importerPath: string): Promise<string | null> {
@@ -1636,28 +1846,8 @@ async function resolveNodePackageExport(
 	manifest: Record<string, unknown>,
 	conditions: ReadonlySet<string> = SUPPORTED_PACKAGE_IMPORT_CONDITIONS,
 ): Promise<string | null> {
-	const exportsField = manifest.exports;
-	const rootTarget = subpath === null ? selectPackageImportTarget(exportsField, conditions) : null;
-	if (rootTarget !== null && rootTarget !== PACKAGE_IMPORT_EXCLUDED) {
-		return resolvePackageTarget(packageRoot, rootTarget, null);
-	}
-	if (!isRecord(exportsField)) {
-		return null;
-	}
-
-	const exactKey = subpath === null ? "." : `./${subpath}`;
-	if (Object.hasOwn(exportsField, exactKey)) {
-		const exactTarget = selectPackageImportTarget(exportsField[exactKey], conditions);
-		return exactTarget !== null && exactTarget !== PACKAGE_IMPORT_EXCLUDED
-			? resolvePackageTarget(packageRoot, exactTarget, null)
-			: null;
-	}
-
-	if (subpath === null) return null;
-	const match = matchPackagePattern(exactKey, exportsField);
-	if (!match) return null;
-	const target = selectPackageImportTarget(match.target, conditions);
-	return typeof target === "string" ? resolvePackageTarget(packageRoot, target, match.wildcard) : null;
+	const selected = selectNodePackageExportTarget(subpath, manifest.exports, conditions);
+	return selected ? resolvePackageTarget(packageRoot, selected.target, selected.wildcard) : null;
 }
 
 async function resolveNodePackageFallback(
@@ -2649,34 +2839,35 @@ function getLoader(path: string): "js" | "jsx" | "ts" | "tsx" {
 	return "js";
 }
 
-function resolveLegacyPiSpecifier(args: { path: string; importer: string }): LegacyPiResolveResult | undefined {
+function resolveLegacyPiSpecifier(args: {
+	path: string;
+	importer: string;
+	kind?: Bun.ImportKind;
+}): LegacyPiResolveResult | undefined {
 	const remappedSpecifier = remapLegacyPiSpecifier(args.path);
 	if (!remappedSpecifier) {
 		return undefined;
 	}
 
-	// Primary: resolve the canonical @oh-my-pi/* specifier from the host binary
-	// location. Works in dev mode and in source-link installs.
-	try {
-		return toLegacyPiResolveResult(resolveCanonicalPiSpecifier(remappedSpecifier));
-	} catch {
-		// Fallback for compiled binary mode: the bundled packages live inside
-		// /$bunfs/root and aren't reachable by filesystem resolution. Prefer the
-		// canonical specifier against the importing file's directory when the
-		// plugin installed @oh-my-pi peer deps, then try the original legacy
-		// specifier for plugins that still vendor only @mariozechner or
-		// @earendil-works peer deps.
-		const importerDir = path.dirname(args.importer);
-		try {
-			return toLegacyPiResolveResult(Bun.resolveSync(remappedSpecifier, importerDir));
-		} catch {
-			try {
-				return toLegacyPiResolveResult(Bun.resolveSync(args.path, importerDir));
-			} catch {
-				return undefined;
-			}
-		}
+	// Host package internals already resolve canonical dependencies from the
+	// host tree. Let Bun handle those normally so source compat shims can import
+	// the real canonical package without routing back into themselves.
+	if (args.path.startsWith(`${CANONICAL_PI_SCOPE}/`) && isHostPiImporter(args.importer)) {
+		return undefined;
 	}
+
+	// Bundled virtual modules and source shims are exact, prevalidated targets.
+	const override = legacyPiPackageRootOverrides[remappedSpecifier];
+	if (override) {
+		return toLegacyPiResolveResult(override);
+	}
+
+	const conditions =
+		args.kind === "require-call" || args.kind === "require-resolve"
+			? SUPPORTED_PACKAGE_REQUIRE_CONDITIONS
+			: SUPPORTED_PACKAGE_IMPORT_CONDITIONS;
+	const resolved = resolveMappedPiSpecifier(remappedSpecifier, args.importer, conditions);
+	return resolved ? toLegacyPiResolveResult(resolved) : undefined;
 }
 
 function resolveTypeBoxSpecifier(): LegacyPiResolveResult | undefined {
@@ -2687,6 +2878,9 @@ export function installLegacyPiSpecifierShim(): void {
 	if (isLegacyPiSpecifierShimInstalled) {
 		return;
 	}
+	// Capture host package roots before registering the resolver. Bun 1.3.x
+	// re-enters runtime hooks when resolution is attempted from onResolve.
+	ensureHostPiPackageLocations();
 	isLegacyPiSpecifierShimInstalled = true;
 
 	Bun.plugin({
@@ -2694,6 +2888,9 @@ export function installLegacyPiSpecifierShim(): void {
 		setup(build) {
 			build.onResolve({ filter: LEGACY_PI_SPECIFIER_FILTER, namespace: "file" }, resolveLegacyPiSpecifier);
 			build.onResolve({ filter: TYPEBOX_SPECIFIER_FILTER, namespace: "file" }, resolveTypeBoxSpecifier);
+			build.onLoad({ filter: /.*/, namespace: FILESYSTEM_HOST_NAMESPACE }, args =>
+				projectFilesystemHostModule(args.path),
+			);
 			build.onResolve({ filter: /^omp-legacy-pi-bundled:.+$/, namespace: "file" }, args =>
 				resolveBundledVirtualSpecifier(args.path),
 			);
@@ -2736,7 +2933,7 @@ export function installLegacyPiSpecifierShim(): void {
 	});
 }
 
-/** Test seam: clears the memoized canonical specifier resolutions. */
+/** Test seam: clears extension graph and package resolution caches. */
 export function __resetLegacyPiResolutionCache(): void {
 	clearLegacyPiResolutionCaches();
 }

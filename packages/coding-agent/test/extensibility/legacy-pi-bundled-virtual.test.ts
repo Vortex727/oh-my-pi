@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import * as url from "node:url";
 import { ptree, TempDir } from "@oh-my-pi/pi-utils";
 
 describe("bundled extension modules", () => {
@@ -83,6 +84,103 @@ console.log(JSON.stringify({
 			liveIdentity: true,
 			uiNotifications: [true, true],
 			formatted: "value=42",
+		});
+	});
+
+	it("rejects unresolved aliases, recovers, and shares canonical host modules with legacy aliases", async () => {
+		using dir = TempDir.createSync("omp-legacy-pi-resolve-");
+		const unresolvedEntry = dir.join("unresolved.ts");
+		const recoveredEntry = dir.join("recovered", "entry.ts");
+		const recoveredPackageManifest = dir.join("recovered", "node_modules", "@oh-my-pi", "pi-tui", "package.json");
+		const recoveredPackageModule = dir.join(
+			"recovered",
+			"node_modules",
+			"@oh-my-pi",
+			"pi-tui",
+			"guard-release-probe.ts",
+		);
+		const recoverySpecifier = "@mariozechner/pi-tui/guard-release-probe.js";
+		const canonicalOverlaysModule = import.meta.resolve("../../../tui/src/overlays/model-hub.ts");
+		await Bun.write(unresolvedEntry, `export { marker } from ${JSON.stringify(recoverySpecifier)};`);
+		await Bun.write(recoveredEntry, `export { marker } from ${JSON.stringify(recoverySpecifier)};`);
+		await Bun.write(
+			recoveredPackageManifest,
+			JSON.stringify({
+				name: "@oh-my-pi/pi-tui",
+				type: "module",
+				exports: {
+					"./guard-release-probe.js": "./guard-release-probe.ts",
+				},
+			}),
+		);
+		await Bun.write(recoveredPackageModule, 'export const marker = "released";');
+
+		const compatPath = import.meta.resolve("../../src/extensibility/plugins/legacy-pi-compat.ts");
+		const env = { ...Bun.env };
+		delete env.PI_BUNDLED;
+		const result = await ptree.exec(
+			[
+				process.execPath,
+				"-e",
+				`
+import { createRequire } from "node:module";
+import * as hostModelHub from ${JSON.stringify(canonicalOverlaysModule)};
+import { installLegacyPiSpecifierShim } from ${JSON.stringify(compatPath)};
+installLegacyPiSpecifierShim();
+
+let unresolvedRejected = false;
+let recoveredOk = false;
+let legacyType = "error";
+let legacySharesCanonical = false;
+let canonicalSharesHost = false;
+let canonicalType = "missing";
+try {
+	await import(${JSON.stringify(url.pathToFileURL(unresolvedEntry).href)});
+} catch {
+	unresolvedRejected = true;
+}
+
+try {
+	const recovered = await import(${JSON.stringify(url.pathToFileURL(recoveredEntry).href)});
+	recoveredOk = recovered.marker === "released";
+} catch {}
+
+const fixtureRequire = createRequire(${JSON.stringify(url.pathToFileURL(recoveredEntry).href)});
+try {
+	const canonical = fixtureRequire("@oh-my-pi/pi-tui/overlays/model-hub.js");
+	canonicalType = typeof canonical.ModelHubComponent;
+	canonicalSharesHost = canonical.ModelHubComponent === hostModelHub.ModelHubComponent;
+	try {
+		const legacy = fixtureRequire("@mariozechner/pi-tui/overlays/model-hub.js");
+		legacyType = typeof legacy.ModelHubComponent;
+		legacySharesCanonical = legacy.ModelHubComponent === canonical.ModelHubComponent;
+	} catch {}
+} catch {}
+console.log(JSON.stringify({
+	unresolvedRejected,
+	recoveredOk,
+	canonicalType,
+	legacyType,
+	legacySharesCanonical,
+	canonicalSharesHost,
+}));
+`,
+			],
+			{
+				env: { ...env, PI_TEST_RUNTIME: "1", PI_CODING_AGENT_DIR: dir.join("agent") },
+				timeout: 15_000,
+				allowNonZero: true,
+			},
+		);
+
+		expect(result.exitCode, result.stderr).toBe(0);
+		expect(JSON.parse(result.stdout)).toEqual({
+			unresolvedRejected: true,
+			recoveredOk: true,
+			canonicalType: "function",
+			legacyType: "function",
+			canonicalSharesHost: true,
+			legacySharesCanonical: true,
 		});
 	});
 });

@@ -84,6 +84,10 @@ export interface SelectListLayoutOptions {
 	minPrimaryColumnWidth?: number;
 	maxPrimaryColumnWidth?: number;
 	truncatePrimary?: (context: SelectListTruncatePrimaryContext) => string;
+	/** Render icons before labels (default) or after them. */
+	iconPosition?: "before" | "after";
+	/** Visible-cell gap between an icon and its label. Defaults to one. */
+	iconGap?: number;
 	/** Enable type-to-filter search when the item count exceeds maxVisible. Defaults to true. */
 	overflowSearch?: boolean;
 	/** Search activation policy. `overflowSearch` remains authoritative when this is omitted. */
@@ -121,8 +125,10 @@ type SelectItemLayout =
 	| {
 			kind: "description";
 			prefix: string;
-			iconCell: string;
+			leadingIconCell: string;
+			trailingIconCell: string;
 			truncatedValue: string;
+			valuePadding: string;
 			spacing: string;
 			descriptionSingleLine: string;
 			descriptionStart: number;
@@ -131,8 +137,10 @@ type SelectItemLayout =
 	| {
 			kind: "primary";
 			prefix: string;
-			iconCell: string;
+			leadingIconCell: string;
+			trailingIconCell: string;
 			truncatedValue: string;
+			valuePadding: string;
 			spacing: "";
 	  };
 
@@ -386,9 +394,15 @@ export class SelectList implements Component, MouseRoutable {
 		iconColumnWidth: number,
 	): string[] {
 		const layout = this.#computeItemLayout(item, isSelected, width, primaryColumnWidth, iconColumnWidth);
-		const { prefix, truncatedValue, spacing } = layout;
-		const iconCell =
-			layout.iconCell && !isSelected && this.theme.icon ? this.theme.icon(layout.iconCell) : layout.iconCell;
+		const { prefix, truncatedValue, valuePadding, spacing } = layout;
+		const leadingIconCell =
+			layout.leadingIconCell && !isSelected && this.theme.icon
+				? this.theme.icon(layout.leadingIconCell)
+				: layout.leadingIconCell;
+		const trailingIconCell =
+			layout.trailingIconCell && !isSelected && this.theme.icon
+				? this.theme.icon(layout.trailingIconCell)
+				: layout.trailingIconCell;
 
 		if (layout.kind === "description") {
 			const { descriptionSingleLine, descriptionStart, remainingWidth } = layout;
@@ -398,13 +412,24 @@ export class SelectList implements Component, MouseRoutable {
 				const indent = padding(descriptionStart);
 				const first = wrapped[0] ?? "";
 				if (isSelected) {
-					const rows = [this.theme.selectedText(`${prefix}${iconCell}${truncatedValue}${spacing}${first}`)];
+					const rows = [
+						this.theme.selectedText(
+							`${prefix}${leadingIconCell}${truncatedValue}${valuePadding}${trailingIconCell}${spacing}${first}`,
+						),
+					];
 					for (let i = 1; i < wrapped.length; i++) {
 						rows.push(this.theme.selectedText(`${indent}${wrapped[i]}`));
 					}
 					return rows;
 				}
-				const rows = [prefix + iconCell + truncatedValue + this.theme.description(spacing + first)];
+				const rows = [
+					prefix +
+						leadingIconCell +
+						truncatedValue +
+						valuePadding +
+						trailingIconCell +
+						this.theme.description(spacing + first),
+				];
 				for (let i = 1; i < wrapped.length; i++) {
 					rows.push(this.theme.description(`${indent}${wrapped[i]}`));
 				}
@@ -413,15 +438,28 @@ export class SelectList implements Component, MouseRoutable {
 
 			const truncatedDesc = truncateToWidth(descriptionSingleLine, remainingWidth, Ellipsis.Omit);
 			if (isSelected) {
-				return [this.theme.selectedText(`${prefix}${iconCell}${truncatedValue}${spacing}${truncatedDesc}`)];
+				return [
+					this.theme.selectedText(
+						`${prefix}${leadingIconCell}${truncatedValue}${valuePadding}${trailingIconCell}${spacing}${truncatedDesc}`,
+					),
+				];
 			}
-			return [prefix + iconCell + truncatedValue + this.theme.description(spacing + truncatedDesc)];
+			return [
+				prefix +
+					leadingIconCell +
+					truncatedValue +
+					valuePadding +
+					trailingIconCell +
+					this.theme.description(spacing + truncatedDesc),
+			];
 		}
 
 		if (isSelected) {
-			return [this.theme.selectedText(`${prefix}${iconCell}${truncatedValue}`)];
+			return [
+				this.theme.selectedText(`${prefix}${leadingIconCell}${truncatedValue}${valuePadding}${trailingIconCell}`),
+			];
 		}
-		return [prefix + iconCell + truncatedValue];
+		return [prefix + leadingIconCell + truncatedValue + valuePadding + trailingIconCell];
 	}
 
 	#computeItemRowCount(item: SelectItem, width: number, primaryColumnWidth: number, iconColumnWidth: number): number {
@@ -451,28 +489,50 @@ export class SelectList implements Component, MouseRoutable {
 	): SelectItemLayout {
 		const cursor = this.theme.symbols?.cursor ?? DEFAULT_CURSOR_SYMBOL;
 		const prefix = isSelected ? `${cursor} ` : padding(visibleWidth(cursor) + 1);
-		// Icon column: every row reserves the same width so labels stay aligned
-		// whether or not an individual item carries an icon.
+		// Icon column: every row reserves the same width so adjacent content
+		// stays aligned whether or not an individual item carries an icon.
 		const iconWidth = item.icon ? visibleWidth(item.icon) : 0;
-		const iconCell = iconColumnWidth > 0 ? (item.icon ?? "") + padding(iconColumnWidth - iconWidth + 1) : "";
-		const prefixWidth = visibleWidth(prefix) + (iconColumnWidth > 0 ? iconColumnWidth + 1 : 0);
+		const iconGap = Math.max(0, Math.trunc(this.layout.iconGap ?? 1));
+		const iconSlot = iconColumnWidth > 0 ? (item.icon ?? "") + padding(iconColumnWidth - iconWidth) : "";
+		const iconPosition = this.layout.iconPosition ?? "before";
+		const prefixCellWidth = visibleWidth(prefix);
+		const leadingIconCell = iconPosition === "before" && iconColumnWidth > 0 ? iconSlot + padding(iconGap) : "";
+		const leadingIconWidth = iconPosition === "before" && iconColumnWidth > 0 ? iconColumnWidth + iconGap : 0;
+		const requestedTrailingIconWidth =
+			iconPosition === "after" && iconColumnWidth > 0 ? iconColumnWidth + iconGap : 0;
+		const showTrailingIconColumn =
+			requestedTrailingIconWidth > 0 && width >= prefixCellWidth + requestedTrailingIconWidth + 2;
+		const trailingIconCell = showTrailingIconColumn ? padding(iconGap) + iconSlot : "";
+		const trailingIconWidth = showTrailingIconColumn ? requestedTrailingIconWidth : 0;
+		const prefixWidth = prefixCellWidth + leadingIconWidth;
 		const descriptionSingleLine = this.#sanitizedDescription(item);
 
 		if (descriptionSingleLine && width > 40) {
-			const effectivePrimaryColumnWidth = Math.max(1, Math.min(primaryColumnWidth, width - prefixWidth - 4));
+			const effectivePrimaryColumnWidth = Math.max(
+				1,
+				Math.min(primaryColumnWidth, width - prefixWidth - trailingIconWidth - 4),
+			);
 			const maxPrimaryWidth = Math.max(1, effectivePrimaryColumnWidth - PRIMARY_COLUMN_GAP);
 			const truncatedValue = this.#truncatePrimary(item, isSelected, maxPrimaryWidth, effectivePrimaryColumnWidth);
 			const truncatedValueWidth = visibleWidth(truncatedValue);
-			const spacing = padding(Math.max(1, effectivePrimaryColumnWidth - truncatedValueWidth));
-			const descriptionStart = prefixWidth + truncatedValueWidth + spacing.length;
+			const valuePadding =
+				iconPosition === "after" ? padding(Math.max(0, maxPrimaryWidth - truncatedValueWidth)) : "";
+			const spacing =
+				iconPosition === "after"
+					? padding(PRIMARY_COLUMN_GAP)
+					: padding(Math.max(1, effectivePrimaryColumnWidth - truncatedValueWidth));
+			const descriptionStart =
+				prefixWidth + truncatedValueWidth + valuePadding.length + trailingIconWidth + spacing.length;
 			const remainingWidth = width - descriptionStart - 2; // -2 for safety
 
 			if (remainingWidth > MIN_DESCRIPTION_WIDTH) {
 				return {
 					kind: "description",
 					prefix,
-					iconCell,
+					leadingIconCell,
+					trailingIconCell,
 					truncatedValue,
+					valuePadding,
 					spacing,
 					descriptionSingleLine,
 					descriptionStart,
@@ -480,14 +540,21 @@ export class SelectList implements Component, MouseRoutable {
 				};
 			}
 		}
-
-		const fallbackMax = width - prefixWidth - 2;
-		const truncatedValue = this.#truncatePrimary(item, isSelected, fallbackMax, fallbackMax);
+		const fallbackMax = width - prefixWidth - trailingIconWidth - 2;
+		const allocatedPrimaryWidth =
+			iconPosition === "after"
+				? Math.min(Math.max(0, primaryColumnWidth - PRIMARY_COLUMN_GAP), Math.max(0, fallbackMax))
+				: fallbackMax;
+		const truncatedValue = this.#truncatePrimary(item, isSelected, allocatedPrimaryWidth, allocatedPrimaryWidth);
+		const valuePadding =
+			iconPosition === "after" ? padding(Math.max(0, allocatedPrimaryWidth - visibleWidth(truncatedValue))) : "";
 		return {
 			kind: "primary",
 			prefix,
-			iconCell,
+			leadingIconCell,
+			trailingIconCell,
 			truncatedValue,
+			valuePadding,
 			spacing: "",
 		};
 	}

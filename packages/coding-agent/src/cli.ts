@@ -29,7 +29,7 @@ import {
 } from "@oh-my-pi/pi-utils/dirs";
 
 import { declareWorkerHostEntry, installWorkerInbox, isWorkerHostSelector } from "@oh-my-pi/pi-utils/worker-host";
-import { extractProfileFlags } from "./cli/profile-bootstrap";
+import { captureProfileLaunchEnvironment, extractProfileFlags } from "./cli/profile-bootstrap";
 import {
 	BLOB_BROKER_WORKER_ARG,
 	COMPUTER_WORKER_ARG,
@@ -144,6 +144,7 @@ async function runSmokeTest(): Promise<void> {
 	const { smokeTestLspMux } = await import("./lsp/mux/daemon");
 	const { smokeTestBlobBroker } = await import("./blob-broker/daemon");
 	const { smokeTestTerminalOutputWorker } = await import("./launch/terminal-output-worker-client");
+	const { smokeTestProfileInspectWorker } = await import("./profiles/client");
 	await smokeTestSyncWorker();
 	await smokeTestStatsActivityWorker();
 
@@ -169,6 +170,7 @@ async function runSmokeTest(): Promise<void> {
 	await smokeTestDaemonBroker();
 	await smokeTestLspMux();
 	await smokeTestBlobBroker();
+	await smokeTestProfileInspectWorker();
 	await smokeTestTerminalOutputWorker();
 	process.stdout.write("smoke-test: ok\n");
 }
@@ -181,6 +183,9 @@ const JS_EVAL_PROCESS_ARG = "__omp_worker_js_eval_process";
 const STT_WORKER_ARG = "__omp_worker_stt";
 const TTS_WORKER_ARG = "__omp_worker_tts";
 const MNEMOPI_EMBED_WORKER_ARG = "__omp_worker_mnemopi_embed";
+// Keep the selector literal bootstrap-local: profiles/client imports env.ts,
+// which must not run before runCli applies the selected profile.
+const PROFILE_INSPECT_WORKER_ARG = "__omp_worker_profile_inspect";
 
 async function runWorkerEntrypoint(arg: string | undefined): Promise<boolean> {
 	if (arg === TINY_WORKER_ARG) {
@@ -290,6 +295,11 @@ async function runWorkerEntrypoint(arg: string | undefined): Promise<boolean> {
 	if (arg === BLOB_BROKER_WORKER_ARG) {
 		const { startBlobBrokerFromEnvironment } = await import("./blob-broker/server");
 		await startBlobBrokerFromEnvironment();
+		return true;
+	}
+	if (arg === PROFILE_INSPECT_WORKER_ARG) {
+		const { runProfileInspectWorker } = await import("./profiles/inspect-worker");
+		await runProfileInspectWorker();
 		return true;
 	}
 	return false;
@@ -463,6 +473,7 @@ async function runTinyWorker(): Promise<void> {
 
 /** Run the CLI with the given argv (no `process.argv` prefix). */
 export async function runCli(argv: string[]): Promise<void> {
+	if (isProcessEntry) captureProfileLaunchEnvironment(argv);
 	let resolvedArgv = argv;
 	try {
 		const extracted = extractProfileFlags(resolvedArgv);

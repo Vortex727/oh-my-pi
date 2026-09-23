@@ -1171,6 +1171,41 @@ function resolveDefaultRankingStrategy(provider: Provider): CredentialRankingStr
 	return DEFAULT_RANKING_STRATEGIES.get(provider);
 }
 
+/**
+ * Return the limits that the built-in provider routing considers applicable to
+ * one model. Explicit provider and model scopes are always conjunctive with a
+ * strategy's tier/meter match; providers without a strategy expose only
+ * unambiguously shared or exact-model limits.
+ */
+export function scopeUsageLimitsForModel(
+	provider: Provider,
+	report: UsageReport,
+	context: CredentialRankingContext,
+): UsageLimit[] {
+	if (report.provider !== provider) return [];
+	const modelId = context.modelId;
+	const strategy = resolveDefaultRankingStrategy(provider);
+	const scoped =
+		strategy?.scopeLimits?.(report, context) ??
+		report.limits.filter(limit => {
+			const scope = limit.scope;
+			if (scope.tier !== undefined) return false;
+			if (scope.modelId !== undefined) {
+				return modelId !== undefined && scope.modelId.toLowerCase() === modelId.toLowerCase();
+			}
+			return scope.shared === true;
+		});
+	return scoped.filter(limit => {
+		if (limit.scope.provider !== provider) return false;
+		const scopedModelId = limit.scope.modelId;
+		if (scopedModelId !== undefined) {
+			return modelId !== undefined && scopedModelId.toLowerCase() === modelId.toLowerCase();
+		}
+		if (modelId === undefined && limit.scope.tier !== undefined) return false;
+		return true;
+	});
+}
+
 function parseUsageCacheEntry<T>(raw: string): UsageCacheEntry<T> | undefined {
 	try {
 		const parsed = JSON.parse(raw) as { value?: T; expiresAt?: unknown };
@@ -4478,6 +4513,8 @@ export class AuthStorage {
 		/** Caller's cancel signal; only rejects this caller, never the shared upstream fetch. */
 		signal?: AbortSignal;
 	}): Promise<UsageReport[] | null> {
+		// Reject pre-aborted callers before binding an override or collecting local config.
+		if (options?.signal?.aborted) throw new AIError.AbortError("usage fetch aborted");
 		// Caller override > store-level hook > local per-credential fan-out.
 		// `RemoteAuthCredentialStore` implements the store hook so a gateway
 		// backed by a broker automatically routes usage to the broker without
@@ -4507,7 +4544,7 @@ export class AuthStorage {
 		}
 		if (!this.#usageProviderResolver && this.#runtimeUsageProviderOverrides.size === 0) return null;
 
-		const requests = await this.#collectUsageRequests(options);
+		const requests = await raceUsageWithSignal(this.#collectUsageRequests(options), options?.signal);
 		if (requests.length === 0) return [];
 
 		this.#usageLogger?.debug("Usage fetch requested", {
@@ -4523,7 +4560,7 @@ export class AuthStorage {
 		const cacheKey = `${this.#buildUsageReportsCacheKey(requests)}\0${this.#usageCacheEpoch}`;
 
 		const inFlight = this.#usageReportsInFlight.get(cacheKey);
-		if (inFlight) return inFlight;
+		if (inFlight) return raceUsageWithSignal(inFlight, options?.signal);
 
 		const promise = (async () => {
 			for (const request of requests) {
@@ -4564,7 +4601,7 @@ export class AuthStorage {
 		});
 
 		this.#usageReportsInFlight.set(cacheKey, promise);
-		return promise;
+		return raceUsageWithSignal(promise, options?.signal);
 	}
 
 	/**

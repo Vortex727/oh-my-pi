@@ -62,6 +62,7 @@ import {
 	type GroupPrefix,
 	type GroupTypeMap,
 	getDefault,
+	migrateLegacyFindEnabled,
 	SETTINGS_SCHEMA,
 	type SettingPath,
 	type SettingValue,
@@ -577,9 +578,10 @@ export class Settings {
 	 * temporarily replaced them via `#updateRuntimeModelRoleOverride`. Restored
 	 * on `reloadForCwd` / `cloneForCwd` so destination projects never inherit the
 	 * source-project value. Maps role → original override value (`undefined`
-	 * when the role had no runtime override).
+	 * when the role had no runtime override); `null` preserves an explicit
+	 * runtime tombstone.
 	 */
-	#savedRuntimeModelRoleOverrides = new Map<string, string | undefined>();
+	#savedRuntimeModelRoleOverrides = new Map<string, string | null | undefined>();
 
 	/** Legacy `lastChangelogVersion` captured from config.yml during migration (now a marker file). */
 	#legacyLastChangelogVersion?: string;
@@ -594,6 +596,8 @@ export class Settings {
 
 	/** Whether to persist changes */
 	#persist: boolean;
+	/** Whether this instance must surface parse/read failures without mutating config files. */
+	#readOnly: boolean;
 
 	private constructor(options: SettingsOptions = {}) {
 		this.#cwd = path.normalize(options.cwd ?? getProjectDir());
@@ -603,6 +607,7 @@ export class Settings {
 		if (options.configFiles) configFiles.push(...options.configFiles);
 		this.#configFiles = configFiles.map(file => path.resolve(this.#cwd, expandTilde(file)));
 		this.#persist = !options.inMemory && options.readOnly !== true;
+		this.#readOnly = options.readOnly === true;
 		liveSettingsInstances.add(new WeakRef(this));
 
 		if (options.overrides) {
@@ -626,7 +631,7 @@ export class Settings {
 		if (globalInstancePromise) return globalInstancePromise;
 
 		const instance = new Settings(options);
-		const promise = instance.#load();
+		const promise = options.readOnly ? instance.#loadReadOnly() : instance.#load();
 		globalInstancePromise = promise;
 
 		return promise.then(
@@ -726,6 +731,13 @@ export class Settings {
 		const segments = path.split(".");
 		this.#captureGlobalMutation(path, this.#modifiedPathMutations, getByPath(this.#global, segments));
 		setByPath(this.#global, segments, value);
+		// Explicit config overlays are immutable launch inputs. Mirror only an
+		// overlay-shadowed edit into the existing runtime layer so it takes effect
+		// now while the ordinary global layer remains its persistence target.
+		if (getByPath(this.#configOverlay, segments) !== undefined) {
+			if (path === "modelRoles") this.#savedRuntimeModelRoleOverrides.clear();
+			setByPath(this.#overrides, segments, value);
+		}
 		this.#persistedMutationGeneration++;
 		this.#modified.add(path);
 		this.#rebuildMerged();
@@ -1172,18 +1184,18 @@ export class Settings {
 	 * capture invalidation independently of the whole-map replacement
 	 * semantics that `override("modelRoles", …)` carries.
 	 */
-	#setRuntimeModelRoleOverrides(next: Record<string, string>): void {
+	#setRuntimeModelRoleOverrides(next: RawSettings): void {
 		const prev = this.get("modelRoles");
 		setByPath(this.#overrides, ["modelRoles"], next);
 		this.#rebuildMerged();
 		this.#fireEffectiveSettingChanged("modelRoles", this.get("modelRoles"), prev);
 	}
 
-	#updateRuntimeModelRoleOverride(role: ModelRole | string, modelId: string | undefined): void {
+	#updateRuntimeModelRoleOverride(role: ModelRole | string, modelId: string | null | undefined, force = false): void {
 		const runtimeOverrides = getByPath(this.#overrides, ["modelRoles"]);
-		if (!isRecord(runtimeOverrides) || !Object.hasOwn(runtimeOverrides, role)) return;
+		if (!force && (!isRecord(runtimeOverrides) || !Object.hasOwn(runtimeOverrides, role))) return;
 
-		const nextRuntimeOverride = this.#modelRolesFromLayer(this.#overrides);
+		const nextRuntimeOverride: RawSettings = isRecord(runtimeOverrides) ? { ...runtimeOverrides } : {};
 		if (modelId === undefined) {
 			delete nextRuntimeOverride[role];
 		} else {
@@ -1196,13 +1208,21 @@ export class Settings {
 	 * Capture the original process-wide override for `role` the first time a
 	 * project edit temporarily replaces it, so the original can be restored on
 	 * cwd changes. Subsequent edits in the same cwd must not overwrite the
-	 * first captured value.
+	 * first captured value. `captureMissing` records an absent runtime slot when
+	 * a project edit must create one to outrank a config overlay.
 	 */
-	#captureRuntimeModelRoleOverride(role: ModelRole | string): void {
+	#captureRuntimeModelRoleOverride(role: ModelRole | string, captureMissing = false): void {
 		if (this.#savedRuntimeModelRoleOverrides.has(role)) return;
 		const runtimeOverrides = getByPath(this.#overrides, ["modelRoles"]);
-		if (!isRecord(runtimeOverrides) || !Object.hasOwn(runtimeOverrides, role)) return;
-		this.#savedRuntimeModelRoleOverrides.set(role, this.#modelRolesFromLayer(this.#overrides)[role]);
+		if (!isRecord(runtimeOverrides) || !Object.hasOwn(runtimeOverrides, role)) {
+			if (captureMissing) this.#savedRuntimeModelRoleOverrides.set(role, undefined);
+			return;
+		}
+		const originalValue = runtimeOverrides[role];
+		this.#savedRuntimeModelRoleOverrides.set(
+			role,
+			typeof originalValue === "string" || originalValue === null ? originalValue : undefined,
+		);
 	}
 
 	/**
@@ -1303,7 +1323,8 @@ export class Settings {
 			return;
 		}
 		this.#savedRuntimeModelRoleOverrides.delete(role);
-		this.#updateRuntimeModelRoleOverride(role, modelId);
+		const overlayOwnsRole = this.#modelRoleLayerOwns(this.#configOverlay, role);
+		this.#updateRuntimeModelRoleOverride(role, modelId ?? (overlayOwnsRole ? null : undefined), overlayOwnsRole);
 	}
 
 	/**
@@ -1323,16 +1344,18 @@ export class Settings {
 	 */
 	setProjectModelRole(role: ModelRole | string, modelId: string): void {
 		this.#setProjectModelRoleValue(role, modelId);
-		this.#captureRuntimeModelRoleOverride(role);
-		this.#updateRuntimeModelRoleOverride(role, modelId);
+		const overlayOwnsRole = this.#modelRoleLayerOwns(this.#configOverlay, role);
+		this.#captureRuntimeModelRoleOverride(role, overlayOwnsRole);
+		this.#updateRuntimeModelRoleOverride(role, modelId, overlayOwnsRole);
 	}
 	/**
 	 * Clear a model role from the current project's settings layer.
 	 */
 	clearProjectModelRole(role: ModelRole | string): void {
 		this.#setProjectModelRoleValue(role, null);
-		this.#captureRuntimeModelRoleOverride(role);
-		this.#updateRuntimeModelRoleOverride(role, undefined);
+		const overlayOwnsRole = this.#modelRoleLayerOwns(this.#configOverlay, role);
+		this.#captureRuntimeModelRoleOverride(role, overlayOwnsRole);
+		this.#updateRuntimeModelRoleOverride(role, overlayOwnsRole ? null : undefined, overlayOwnsRole);
 	}
 
 	/**
@@ -1405,16 +1428,19 @@ export class Settings {
 		return normalized;
 	}
 
-	/*
-	 * Override model roles (helper for modelRoles record).
+	/**
+	 * Overlay model roles on the runtime layer without persisting them.
+	 *
+	 * A string replaces that role, `null` is an explicit tombstone that masks
+	 * lower settings layers, and omitted roles retain their prior runtime value.
 	 */
-	overrideModelRoles(roles: ReadOnlyDict<string>): void {
-		const next = this.#modelRolesFromLayer(this.#overrides);
+	overrideModelRoles(roles: Readonly<Record<string, string | null | undefined>>): void {
+		const runtimeRoles = getByPath(this.#overrides, ["modelRoles"]);
+		const next: RawSettings = isRecord(runtimeRoles) ? { ...runtimeRoles } : {};
 		for (const [role, modelId] of Object.entries(roles)) {
-			if (modelId) {
-				next[role] = modelId;
-				this.#savedRuntimeModelRoleOverrides.delete(role);
-			}
+			if (modelId === undefined) continue;
+			next[role] = modelId;
+			this.#savedRuntimeModelRoleOverrides.delete(role);
 		}
 		this.#setRuntimeModelRoleOverrides(next);
 	}
@@ -1478,17 +1504,22 @@ export class Settings {
 
 	async #loadReadOnly(): Promise<Settings> {
 		const [globalResult, projectResult] = await Promise.allSettled([
-			this.#loadExistingMainYaml(),
-			this.#loadProjectSettings(),
+			this.#readExistingMainYaml(false),
+			this.#readProjectSettings(false),
 		]);
 		if (globalResult.status === "rejected") throw globalResult.reason;
 		if (projectResult.status === "rejected") throw projectResult.reason;
-		if (globalResult.value) {
-			this.#global = globalResult.value;
+		if (globalResult.value.settings) {
+			this.#global = globalResult.value.settings;
 		}
+		this.#configPath = globalResult.value.configPath;
 
-		this.#project = projectResult.value;
-		this.#configOverlay = await this.#loadConfigOverlays();
+		this.#project = projectResult.value.settings;
+		this.#projectFileSettings = projectResult.value.fileSettings;
+		this.#projectShellPathSource = projectResult.value.shellPathSource;
+		const overlay = await this.#readConfigOverlays(false);
+		this.#configOverlay = overlay.settings;
+		this.#overlayShellPathSource = overlay.shellPathSource;
 		this.#rebuildMerged();
 		return this;
 	}
@@ -1915,6 +1946,9 @@ export class Settings {
 			// providers, which `LoadResult.warnings` does not carry.
 			const cwdRoot = discoveryCwd.endsWith(path.sep) ? discoveryCwd : discoveryCwd + path.sep;
 			const projectWarnings = (result.warnings ?? []).filter(warning => warning.includes(cwdRoot));
+			if (this.#readOnly && projectWarnings.length > 0) {
+				throw new Error("Settings config is invalid: project settings discovery failed");
+			}
 			for (const warning of projectWarnings) {
 				if (this.#projectSettingsWarningsSeen.has(warning)) continue;
 				logger.warn(`Settings: ${warning}`);
@@ -1926,7 +1960,8 @@ export class Settings {
 					if (Object.hasOwn(item.data, "shellPath")) shellPathSource = item.path;
 				}
 			}
-		} catch {
+		} catch (error) {
+			if (this.#readOnly) throw error;
 			shellPathSource = undefined;
 			// Capability discovery is best-effort; the native project config below
 			// remains authoritative for its model-role layer and must not be hidden.
@@ -2331,14 +2366,17 @@ export class Settings {
 
 		// find.enabled: boolean -> enum (auto | on | off). Preserve an explicit
 		// choice; unset installs get `auto`, which enables `find` only when the
-		// judge role resolves to a native System One model.
+		// judge role resolves to a native System One model. Nested configuration
+		// wins over a quoted-dotted key, matching other settings migrations.
 		const findObj = isRecord(raw.find) ? raw.find : undefined;
-		if (findObj && typeof findObj.enabled === "boolean") {
-			findObj.enabled = findObj.enabled ? "on" : "off";
+		if (findObj && Object.hasOwn(findObj, "enabled")) {
+			findObj.enabled = migrateLegacyFindEnabled(findObj.enabled);
+		} else if (Object.hasOwn(raw, "find.enabled")) {
+			const target = findObj ?? {};
+			target.enabled = migrateLegacyFindEnabled(raw["find.enabled"]);
+			raw.find = target;
 		}
-		if (typeof raw["find.enabled"] === "boolean") {
-			raw["find.enabled"] = raw["find.enabled"] ? "on" : "off";
-		}
+		delete raw["find.enabled"];
 
 		// statusLine: rename "plan_mode" segment to "mode"
 		const statusLineObj = raw.statusLine as Record<string, unknown> | undefined;

@@ -5,6 +5,13 @@
 ### Fixed
 
 - Fixed Claude Opus 5.5 ignoring a mid-session switch to high effort when the session started without an explicit effort; the change is now sent as a cache-preserving per-message effort control ([#12909](https://github.com/can1357/oh-my-pi/pull/12909) by [@h4vc](https://github.com/h4vc)).
+### Added
+
+- Added `scopeUsageLimitsForModel` for displaying applicable model quota using provider ranking rules without changing credential selection.
+
+### Fixed
+
+- Usage report collection now cancels local callers promptly without cancelling shared fetches needed by other callers.
 
 ## [18.2.9] - 2026-09-22
 

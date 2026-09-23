@@ -48,9 +48,11 @@ import {
 	formatDuration,
 	formatNumber,
 	getProjectDir,
+	getActiveProfile,
 	hsvToRgb,
 	isEnoent,
 	logger,
+	normalizeProfileName,
 	postmortem,
 	prompt,
 	sanitizeText,
@@ -59,6 +61,7 @@ import {
 } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { reset as resetCapabilities } from "../capability";
+import { AsyncJobManager } from "../async/job-manager";
 import { restartArgv } from "../cli/flag-tables";
 import type { CollabGuestLink } from "../collab/guest";
 import { CollabController } from "../collab/controller";
@@ -112,7 +115,16 @@ import guidedGoalInterviewPrompt from "../prompts/goals/guided-goal-interview.md
 import planFilenamePrompt from "../prompts/system/plan-filename.md" with { type: "text" };
 import planModeApprovedPrompt from "../prompts/system/plan-mode-approved.md" with { type: "text" };
 import planModeCompactInstructionsPrompt from "../prompts/system/plan-mode-compact-instructions.md" with { type: "text" };
+import { hasProfileLaunchContext, inspectProfile, listProfiles } from "../profiles/client";
+import {
+	cancelSupervisedProfileSwitch,
+	isSupervisedProfileSwitchChild,
+	requestSupervisedProfileSwitch,
+	superviseProfileSwitch,
+} from "../profiles/launch";
+import { normalizeSetupName } from "../profiles/setups";
 import type { AgentHubRegistry } from "@oh-my-pi/pi-tui/overlays/agent-hub-types";
+import type { SettingsNavigationTab } from "@oh-my-pi/pi-tui/overlays/settings-selector";
 import { formatCost } from "@oh-my-pi/pi-tui/overlays/agent-hub-renderer";
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import {
@@ -1036,6 +1048,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#autocompleteProviderFactories: AutocompleteProviderFactory[] = [];
 	#cleanupUnsubscribe?: () => void;
 	#signalTeardown?: SessionTeardown;
+	#supervisorDisconnectUnsubscribe?: () => void;
 	readonly #version: string;
 	readonly #startupChangelog: StartupChangelogSelection | undefined;
 	/** Header components below the config warnings + welcome, retained so a live config-warning change can rebuild the header (#10048). */
@@ -1483,6 +1496,13 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.session.setTitleGenerationStart?.(() => this.#inputController.notifyTitleGenerationStart());
 		this.session.setPromptDropped?.(prompt => this.#restoreDroppedPrompt(prompt));
 		this.#observerRegistry = new SessionObserverRegistry();
+		if (isSupervisedProfileSwitchChild()) {
+			const onDisconnect = (): void => {
+				void this.shutdown().finally(() => postmortem.exitProcess(129));
+			};
+			process.once("disconnect", onDisconnect);
+			this.#supervisorDisconnectUnsubscribe = () => process.off("disconnect", onDisconnect);
+		}
 	}
 
 	#handleJudgmentBatchProgress(progress: JudgmentBatchProgress): void {
@@ -1592,6 +1612,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			beginDispose: () => this.session.beginDispose(),
 			saveDraft: text => this.sessionManager.saveDraft(text),
 			disposeSession: async reason => {
+				this.#selectorController.closeSettingsSelector();
 				await this.#btwController.dispose();
 				await this.session.dispose({
 					mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS,
@@ -5751,6 +5772,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (this.#cleanupUnsubscribe) {
 			this.#cleanupUnsubscribe();
 		}
+		this.#supervisorDisconnectUnsubscribe?.();
+		this.#supervisorDisconnectUnsubscribe = undefined;
 		// Clear the process-global consent handler so it doesn't outlive this
 		// InteractiveMode instance (e.g. test harnesses, headless re-init).
 		setAutoQaConsentHandler(null, null);
@@ -5760,6 +5783,122 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#ownsStartedUi = false;
 		}
 		this.isInitialized = false;
+	}
+
+	getProfileSwitchBlockReason(): string | undefined {
+		if (!hasProfileLaunchContext()) return "Profile inspection and switching require the OMP CLI";
+		if (this.session.isStreaming) return "Wait for the active response to finish before switching profiles";
+		const jobs = AsyncJobManager.instance();
+		if (jobs?.getRunningJobs().length) return "Wait for background jobs to finish before switching profiles";
+		if (jobs?.hasPendingDeliveries()) return "Deliver pending background results before switching profiles";
+		const runningAgent = AgentRegistry.global()
+			.list()
+			.some(ref => ref.kind !== "main" && ref.kind !== "advisor" && ref.status === "running");
+		if (runningAgent) return "Wait for running subagents to finish before switching profiles";
+		return undefined;
+	}
+
+	async requestProfileSwitch(profile: string, setup?: string): Promise<void> {
+		let target: string;
+		let savedSetup: string | undefined;
+		try {
+			target = normalizeProfileName(profile) ?? "default";
+			if (setup !== undefined) savedSetup = normalizeSetupName(setup);
+		} catch {
+			this.showError(setup === undefined ? "Invalid profile name" : "Invalid saved setup name");
+			return;
+		}
+		const active = getActiveProfile() ?? "default";
+		if (target === active && savedSetup === undefined) return;
+		const profiles = await listProfiles();
+		if (!profiles.some(candidate => candidate.name === target)) {
+			this.showError(`Profile ${target} is no longer available`);
+			return;
+		}
+		const blocked = this.getProfileSwitchBlockReason();
+		if (blocked) {
+			this.showError(blocked);
+			return;
+		}
+		const confirmed = await this.showHookConfirm(
+			savedSetup ? `Load setup ${savedSetup}?` : `Switch to ${target}?`,
+			savedSetup
+				? "This saves the current session and starts a fresh session using the current accounts. Current session-only overrides are not carried."
+				: "This saves the current session and starts a fresh session. Current session-only overrides are not carried.",
+		);
+		if (!confirmed) return;
+
+		const cwd = this.sessionManager.getCwd();
+		this.showStatus(savedSetup ? `Checking setup ${savedSetup}…` : `Checking profile ${target}…`);
+		try {
+			const request = savedSetup ? { cwd, usage: false, setup: savedSetup } : { cwd, usage: false };
+			await inspectProfile(target, request, new AbortController().signal);
+		} catch {
+			this.showError(
+				savedSetup
+					? `Could not load setup ${savedSetup}. The current session is unchanged.`
+					: `Could not inspect profile ${target}. The current session is unchanged.`,
+			);
+			return;
+		}
+		const stillDiscovered = await listProfiles();
+		if (!stillDiscovered.some(candidate => candidate.name === target)) {
+			this.showError(`Profile ${target} is no longer available`);
+			return;
+		}
+		const beforeCommit = this.getProfileSwitchBlockReason();
+		if (beforeCommit) {
+			this.showError(beforeCommit);
+			return;
+		}
+		try {
+			await Promise.all([this.settings.flush(), this.sessionManager.flush()]);
+		} catch {
+			this.showError("Could not save pending settings or session data. The current session is unchanged.");
+			return;
+		}
+
+		const supervised = isSupervisedProfileSwitchChild();
+		if (supervised) {
+			try {
+				await requestSupervisedProfileSwitch(target, cwd, savedSetup);
+			} catch (error) {
+				this.showError(error instanceof Error ? error.message : "Profile switch supervisor is unavailable");
+				return;
+			}
+		}
+		const finalBlock = this.getProfileSwitchBlockReason();
+		if (finalBlock) {
+			if (supervised) cancelSupervisedProfileSwitch();
+			this.showError(finalBlock);
+			return;
+		}
+
+		this.#isShuttingDown = true;
+		try {
+			await this.#teardown();
+		} catch (error) {
+			if (supervised) cancelSupervisedProfileSwitch();
+			this.#handleTeardownError("switch profiles", error);
+			return;
+		}
+		const sessionId = this.#resumableSessionId();
+		if (sessionId) {
+			process.stderr.write(`\n${chalk.dim(`Resume this session with ${resumeCommand(sessionId)}`)}\n`);
+		}
+		if (supervised) {
+			await postmortem.quit(0);
+			return;
+		}
+		try {
+			const exitCode = await superviseProfileSwitch(target, cwd, savedSetup);
+			await postmortem.quit(exitCode);
+		} catch {
+			process.stderr.write(
+				`${chalk.red("Profile switch launch failed. The saved session can still be resumed.")}\n`,
+			);
+			await postmortem.quit(1);
+		}
 	}
 
 	async shutdown(): Promise<void> {
@@ -5784,7 +5923,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		try {
 			await this.#teardown();
 		} catch (error) {
-			this.#handleTeardownError("close", error);
+			this.#handleTeardownError("close session", error);
 			return;
 		}
 
@@ -5799,7 +5938,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		await postmortem.quit(0);
 	}
 
-	#handleTeardownError(action: "close" | "restart", error: unknown): void {
+	#handleTeardownError(action: "close session" | "restart session" | "switch profiles", error: unknown): void {
 		this.#isShuttingDown = false;
 		const detail = error instanceof Error ? error.message : String(error);
 		// Arm the escape hatch only once dispose() has begun: its promise is
@@ -5809,8 +5948,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#teardownFailed = this.session.isDisposed;
 		this.showError(
 			this.#teardownFailed
-				? `Could not ${action} session: ${detail}\nPress Ctrl+C again to exit without saving the session log.`
-				: `Could not ${action} session: ${detail}`,
+				? `Could not ${action}: ${detail}\nPress Ctrl+C again to exit without saving the session log.`
+				: `Could not ${action}: ${detail}`,
 		);
 	}
 
@@ -5831,7 +5970,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		try {
 			await this.#teardown();
 		} catch (error) {
-			this.#handleTeardownError("restart", error);
+			this.#handleTeardownError("restart session", error);
 			return;
 		}
 
@@ -6798,8 +6937,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	// Selector handling
-	showSettingsSelector(): void {
-		this.#selectorController.showSettingsSelector();
+	showSettingsSelector(initialTab?: SettingsNavigationTab): Promise<void> {
+		return this.#selectorController.showSettingsSelector(initialTab);
 	}
 
 	showUsageDashboard(reports: UsageReport[]): void {
@@ -6821,6 +6960,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	showAgentsDashboard(): void {
 		void this.#selectorController.showAgentsDashboard();
 	}
+
 	showGitUi(revision?: string): void {
 		void this.#selectorController.showGitTui(revision);
 	}
@@ -6878,8 +7018,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		await runProviderSetupWizard(this);
 	}
 
-	showHookConfirm(title: string, message: string): Promise<boolean> {
-		return this.#extensionUiController.showHookConfirm(title, message);
+	showHookConfirm(title: string, message: string, dialogOptions?: ExtensionUIDialogOptions): Promise<boolean> {
+		return this.#extensionUiController.showHookConfirm(title, message, dialogOptions);
 	}
 
 	// Input handling
@@ -7160,8 +7300,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#extensionUiController.hideHookSelector();
 	}
 
-	showHookInput(title: string, placeholder?: string): Promise<string | undefined> {
-		return this.#extensionUiController.showHookInput(title, placeholder);
+	showHookInput(
+		title: string,
+		placeholder?: string,
+		dialogOptions?: ExtensionUIDialogOptions,
+	): Promise<string | undefined> {
+		return this.#extensionUiController.showHookInput(title, placeholder, dialogOptions);
 	}
 
 	hideHookInput(): void {

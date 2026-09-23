@@ -147,6 +147,74 @@ describe("Settings", () => {
 		});
 	});
 
+	describe("config overlay edits", () => {
+		it("keeps an explicit setting edit effective while persisting only to the main config", async () => {
+			const overlayPath = tempDir.join("saved-setup.yml");
+			await Bun.write(overlayPath, YAML.stringify({ compaction: { idleEnabled: true } }, null, 2));
+			const settings = await Settings.init({ cwd: projectDir, agentDir, configFiles: [overlayPath] });
+			expect(settings.get("compaction.idleEnabled")).toBe(true);
+
+			settings.set("compaction.idleEnabled", false);
+			expect(settings.get("compaction.idleEnabled")).toBe(false);
+			await settings.flush();
+
+			expect(await readSettings()).toEqual({ compaction: { idleEnabled: false } });
+			expect(YAML.parse(await Bun.file(overlayPath).text())).toEqual({ compaction: { idleEnabled: true } });
+
+			await settings.reloadFromDisk();
+			expect(settings.get("compaction.idleEnabled")).toBe(false);
+			const cloned = await settings.cloneForCwd(tempDir.join("other-project"));
+			expect(cloned.get("compaction.idleEnabled")).toBe(false);
+		});
+
+		it("keeps an explicit global model-role edit above the overlay without rewriting it", async () => {
+			const overlayPath = tempDir.join("saved-setup.yml");
+			await Bun.write(overlayPath, YAML.stringify({ modelRoles: { smol: "anthropic/overlay-smol" } }, null, 2));
+			const settings = await Settings.init({ cwd: projectDir, agentDir, configFiles: [overlayPath] });
+			expect(settings.getModelRole("smol")).toBe("anthropic/overlay-smol");
+
+			settings.setModelRole("smol", "openai/edited-smol");
+			expect(settings.getModelRole("smol")).toBe("openai/edited-smol");
+			await settings.flush();
+
+			expect((await readSettings()).modelRoles).toEqual({ smol: "openai/edited-smol" });
+			expect(YAML.parse(await Bun.file(overlayPath).text())).toEqual({
+				modelRoles: { smol: "anthropic/overlay-smol" },
+			});
+
+			await settings.reloadFromDisk();
+			expect(settings.getModelRole("smol")).toBe("openai/edited-smol");
+			const cloned = await settings.cloneForCwd(tempDir.join("other-model-project"));
+			expect(cloned.getModelRole("smol")).toBe("openai/edited-smol");
+		});
+
+		it("keeps an explicit global model-role clear above the overlay without rewriting it", async () => {
+			await writeSettings({ modelRoles: { smol: "anthropic/global-smol" } });
+			const overlayPath = tempDir.join("saved-setup.yml");
+			await Bun.write(overlayPath, YAML.stringify({ modelRoles: { smol: "anthropic/overlay-smol" } }, null, 2));
+			const settings = await Settings.init({ cwd: projectDir, agentDir, configFiles: [overlayPath] });
+
+			settings.setModelRole("smol", undefined);
+			expect(settings.getModelRole("smol")).toBeUndefined();
+			await settings.flush();
+
+			expect((await readSettings()).modelRoles).toEqual({});
+			expect(YAML.parse(await Bun.file(overlayPath).text())).toEqual({
+				modelRoles: { smol: "anthropic/overlay-smol" },
+			});
+			await settings.reloadFromDisk();
+			expect(settings.getModelRole("smol")).toBeUndefined();
+		});
+
+		it("does not let an ordinary persisted edit defeat a runtime override without an overlay", () => {
+			const settings = Settings.isolated({ "compaction.idleEnabled": true });
+
+			settings.set("compaction.idleEnabled", false);
+
+			expect(settings.get("compaction.idleEnabled")).toBe(true);
+		});
+	});
+
 	describe("main config file selection", () => {
 		it("loads and updates an existing config.yaml without creating config.yml", async () => {
 			const yamlConfigPath = path.join(agentDir, "config.yaml");
@@ -1566,6 +1634,21 @@ describe("Settings", () => {
 	});
 
 	describe("model role overrides", () => {
+		it("skips undefined role overrides while preserving null tombstones", () => {
+			const settings = Settings.isolated();
+
+			settings.overrideModelRoles({
+				slow: "anthropic/claude-opus-4-6",
+				smol: undefined,
+				plan: null,
+			});
+
+			expect(settings.getModelRoleProvenance("slow")).toBe("runtime");
+			expect(settings.getModelRoleProvenance("smol")).toBe("default");
+			expect(settings.getModelRoleProvenance("plan")).toBe("runtime");
+			expect(settings.getModelRole("plan")).toBeUndefined();
+		});
+
 		it("does not persist temporary default model overrides when another role is saved", async () => {
 			await writeSettings({
 				modelRoles: { default: "anthropic/claude-sonnet-4-5" },
@@ -2393,6 +2476,22 @@ describe("Settings", () => {
 
 			expect(settings.get("find.enabled")).toBe("on");
 			expect(settings.get("glob.enabled")).toBe(false);
+		});
+
+		it("migrates a quoted-dotted boolean find.enabled to its explicit mode", async () => {
+			await Bun.write(getConfigPath(), '"find.enabled": false\n');
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(settings.get("find.enabled")).toBe("off");
+		});
+
+		it("keeps nested find.enabled precedence over a quoted-dotted value", async () => {
+			await writeSettings({ find: { enabled: "auto" }, "find.enabled": true });
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(settings.get("find.enabled")).toBe("auto");
 		});
 
 		it("migrates nested dev.autoqa.consent and todo.reminders.max without configuring parents", async () => {

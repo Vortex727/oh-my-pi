@@ -33,6 +33,7 @@
  * them also activates (`omp --print --profile work`).
  */
 
+import * as path from "node:path";
 import { isSubcommand, LAUNCH_FLAG_COMMANDS } from "../cli-commands";
 import {
 	EXTENSION_SHADOWABLE_STRING_FLAGS,
@@ -42,6 +43,87 @@ import {
 	PROFILE_BOOTSTRAP_BOUNDARY_ARG,
 	STRING_VALUE_FLAGS,
 } from "./flag-tables";
+
+export const PROFILE_SWITCH_SUPERVISED_ENV = "OMP_PROFILE_SWITCH_SUPERVISED";
+export const PROFILE_LAUNCH_CONFIG_FILES_ENV = "OMP_PROFILE_LAUNCH_CONFIG_FILES";
+
+let profileLaunchEnvironment: Record<string, string | undefined> | undefined;
+let profileLaunchConfigFiles: string[] | undefined;
+
+function readLaunchConfigState(argv: readonly string[]): { baseCwd: string; configFiles: string[] } {
+	const configFiles: string[] = [];
+	let launchCwd: string | undefined;
+	for (let index = 0; index < argv.length; index++) {
+		const token = argv[index];
+		if (token === "--") break;
+
+		const equalsIndex = token.startsWith("--") ? token.indexOf("=") : -1;
+		if (equalsIndex !== -1) {
+			const flag = token.slice(0, equalsIndex);
+			const value = token.slice(equalsIndex + 1);
+			if (flag === "--cwd") launchCwd = value;
+			if (flag === "--config") configFiles.push(value);
+			continue;
+		}
+
+		if (token === "--profile" || token === "--alias") {
+			index++;
+			continue;
+		}
+		if (!STRING_VALUE_FLAGS.has(token) || index + 1 >= argv.length) continue;
+		const value = argv[++index];
+		if (token === "--cwd") launchCwd = value;
+		if (token === "--config") configFiles.push(value);
+	}
+
+	const baseCwd = launchCwd === undefined ? process.cwd() : path.resolve(process.cwd(), launchCwd);
+	return { baseCwd, configFiles };
+}
+
+/**
+ * Capture the process environment and explicit config overlays before profile
+ * bootstrap mutates selectors or loads the selected profile's dotenv file.
+ */
+export function captureProfileLaunchEnvironment(argv: readonly string[] = process.argv.slice(2)): void {
+	if (profileLaunchEnvironment) return;
+	profileLaunchEnvironment = { ...process.env };
+	const state = readLaunchConfigState(argv);
+	const environmentConfigFiles = profileLaunchEnvironment.PI_CONFIG_FILES?.split(path.delimiter).filter(Boolean) ?? [];
+	if (environmentConfigFiles.length > 0) {
+		profileLaunchEnvironment.PI_CONFIG_FILES = environmentConfigFiles
+			.map(file => (file.startsWith("~") || path.isAbsolute(file) ? file : path.resolve(state.baseCwd, file)))
+			.join(path.delimiter);
+	}
+
+	let inheritedLaunchConfigFiles: string[] | undefined;
+	const serialized = process.env[PROFILE_LAUNCH_CONFIG_FILES_ENV];
+	if (serialized !== undefined) {
+		try {
+			const parsed: unknown = JSON.parse(serialized);
+			if (Array.isArray(parsed) && parsed.every(file => typeof file === "string")) {
+				inheritedLaunchConfigFiles = parsed;
+			}
+		} catch {}
+	}
+	const inheritedBySupervisedChild =
+		process.env[PROFILE_SWITCH_SUPERVISED_ENV] === "1" &&
+		process.connected === true &&
+		typeof process.send === "function";
+	const launchConfigFiles = inheritedLaunchConfigFiles ?? (inheritedBySupervisedChild ? [] : state.configFiles);
+	profileLaunchConfigFiles = launchConfigFiles.map(file =>
+		file.startsWith("~") || path.isAbsolute(file) ? file : path.resolve(state.baseCwd, file),
+	);
+}
+
+/** Original CLI launch environment, or undefined when running through an SDK host. */
+export function getProfileLaunchEnvironment(): Record<string, string | undefined> | undefined {
+	return profileLaunchEnvironment;
+}
+
+/** Explicit launch-time config overlays, resolved independently of later cwd switches. */
+export function getProfileLaunchConfigFiles(): readonly string[] {
+	return profileLaunchConfigFiles ?? [];
+}
 
 function needsBoundaryAfterGlobalStrip(stripped: readonly string[]): boolean {
 	const previous = stripped[stripped.length - 1];

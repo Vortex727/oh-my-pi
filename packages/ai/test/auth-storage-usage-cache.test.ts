@@ -342,6 +342,138 @@ describe("AuthStorage usage cache: last-good failure fallback", () => {
 	});
 });
 
+describe("AuthStorage usage fetch cancellation", () => {
+	it("cancels callers on both aggregate paths without cancelling their peer's shared local fetch", async () => {
+		const started = Promise.withResolvers<void>();
+		const allCallersReady = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<UsageReport | null>();
+		const expected = makeReport("a@example.com");
+		let calls = 0;
+		let requested = 0;
+		const usageProvider: UsageProvider = {
+			id: "anthropic",
+			fetchUsage() {
+				calls += 1;
+				started.resolve();
+				return release.promise;
+			},
+		};
+		const storage = new AuthStorage(makeStore([oauthRow(1, "a@example.com")]), {
+			usageProviderResolver: provider => (provider === "anthropic" ? usageProvider : undefined),
+			usageLogger: {
+				debug(message) {
+					if (message !== "Usage fetch requested") return;
+					requested += 1;
+					if (requested === 3) allCallersReady.resolve();
+				},
+				warn() {},
+			},
+		});
+		await storage.reload();
+		try {
+			const ownerController = new AbortController();
+			const owner = storage.fetchUsageReports({ signal: ownerController.signal });
+			await started.promise;
+			const sharedController = new AbortController();
+			const shared = storage.fetchUsageReports({ signal: sharedController.signal });
+			const peer = storage.fetchUsageReports();
+			await allCallersReady.promise;
+
+			const ownerRejection = owner.catch((error: unknown) => error);
+			const sharedRejection = shared.catch((error: unknown) => error);
+			ownerController.abort();
+			sharedController.abort();
+			const [ownerError, sharedError] = await Promise.all([ownerRejection, sharedRejection]);
+			expect(ownerError).toHaveProperty("message", "usage fetch aborted");
+			expect(sharedError).toHaveProperty("message", "usage fetch aborted");
+			expect(calls).toBe(1);
+
+			release.resolve(expected);
+			expect(await peer).toEqual([expected]);
+			expect(calls).toBe(1);
+		} finally {
+			storage.close();
+		}
+	});
+
+	it("rejects while local request collection is blocked", async () => {
+		const configStarted = Promise.withResolvers<void>();
+		const configRelease = Promise.withResolvers<string | undefined>();
+		const configFinished = Promise.withResolvers<void>();
+		let fetchCalls = 0;
+		const storage = new AuthStorage(makeStore([]), {
+			usageProviderResolver: () => undefined,
+			async configValueResolver() {
+				configStarted.resolve();
+				const value = await configRelease.promise;
+				configFinished.resolve();
+				return value;
+			},
+		});
+		storage.setRuntimeUsageProvider(
+			"anthropic",
+			{
+				id: "anthropic",
+				async fetchUsage() {
+					fetchCalls += 1;
+					return makeReport("a@example.com");
+				},
+			},
+			"USAGE_API_KEY",
+		);
+		try {
+			const controller = new AbortController();
+			const reports = storage.fetchUsageReports({ signal: controller.signal });
+			await configStarted.promise;
+
+			controller.abort();
+			await expect(reports).rejects.toThrow("usage fetch aborted");
+			expect(fetchCalls).toBe(0);
+
+			configRelease.resolve("resolved-key");
+			await configFinished.promise;
+			await Promise.resolve();
+			expect(fetchCalls).toBe(0);
+		} finally {
+			configRelease.resolve(undefined);
+			storage.close();
+		}
+	});
+
+	it("does not collect requests for an already-aborted caller", async () => {
+		let configCalls = 0;
+		let fetchCalls = 0;
+		const storage = new AuthStorage(makeStore([]), {
+			usageProviderResolver: () => undefined,
+			async configValueResolver() {
+				configCalls += 1;
+				return "resolved-key";
+			},
+		});
+		storage.setRuntimeUsageProvider(
+			"anthropic",
+			{
+				id: "anthropic",
+				async fetchUsage() {
+					fetchCalls += 1;
+					return makeReport("a@example.com");
+				},
+			},
+			"USAGE_API_KEY",
+		);
+		try {
+			const controller = new AbortController();
+			controller.abort();
+
+			await expect(storage.fetchUsageReports({ signal: controller.signal })).rejects.toThrow("usage fetch aborted");
+			expect(configCalls).toBe(0);
+			expect(fetchCalls).toBe(0);
+		} finally {
+			storage.close();
+		}
+	});
+});
+
 describe("AuthStorage usage cache: explicit invalidation", () => {
 	it("clears cached API-key reports before the next usage read", async () => {
 		const store = makeStore([

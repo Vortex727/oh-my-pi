@@ -1,10 +1,12 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
+import { Database } from "bun:sqlite";
 import { stripVTControlCharacters } from "node:util";
-import type { UsageReport } from "@oh-my-pi/pi-ai";
+import { AuthStorage, SqliteAuthCredentialStore, type UsageReport } from "@oh-my-pi/pi-ai";
 import {
 	buildRedactionMap,
 	collectUnreportedAccounts,
 	computeProviderWindowStats,
+	collectUsageSnapshot,
 	formatUsageBreakdown,
 	formatUsageHistory,
 	type UsageAccountIdentity,
@@ -25,6 +27,7 @@ function makeLimit(opts: {
 	provider?: string;
 	notes?: string[];
 	sharedGroup?: string;
+	resetsAt?: number;
 }): UsageReport["limits"][number] {
 	return {
 		id: opts.id,
@@ -38,7 +41,12 @@ function makeLimit(opts: {
 		},
 		window:
 			opts.durationMs !== undefined
-				? { id: opts.windowId ?? opts.id, label: opts.windowId ?? opts.id, durationMs: opts.durationMs }
+				? {
+						id: opts.windowId ?? opts.id,
+						label: opts.windowId ?? opts.id,
+						durationMs: opts.durationMs,
+						resetsAt: opts.resetsAt,
+					}
 				: undefined,
 		amount: { unit: "percent", usedFraction: opts.usedFraction },
 		...(opts.notes ? { notes: opts.notes } : {}),
@@ -104,6 +112,61 @@ describe("computeProviderWindowStats", () => {
 		expect(sevenDay.window).toBe("7d");
 		expect(sevenDay.usedAccounts).toBeCloseTo(0.6); // 0.4 (opus binds) + 0.2
 		expect(sevenDay.remainingAccounts).toBeCloseTo(1.4);
+	});
+
+	it("does not let one account's overage consume another account's remaining quota", () => {
+		const stats = computeProviderWindowStats([
+			makeReport("anthropic", "over@example.test", [
+				makeLimit({ id: "5h", usedFraction: 1.5, durationMs: FIVE_HOURS, windowId: "5h" }),
+			]),
+			makeReport("anthropic", "available@example.test", [
+				makeLimit({ id: "5h", usedFraction: 0.5, durationMs: FIVE_HOURS, windowId: "5h" }),
+			]),
+		]);
+
+		expect(stats).toEqual([
+			expect.objectContaining({
+				accounts: 2,
+				usedAccounts: 2,
+				remainingAccounts: 0.5,
+			}),
+		]);
+	});
+
+	it("separates normalized shared allowances and counts their routing copies once", () => {
+		const report = makeReport("google-antigravity", "account@example.test", [
+			makeLimit({
+				id: "google-antigravity:google:default:gemini-5h",
+				label: "Gemini",
+				provider: "google-antigravity",
+				usedFraction: 1,
+				durationMs: FIVE_HOURS,
+				windowId: "5h",
+			}),
+			makeLimit({
+				id: "google-antigravity:anthropic:default:3p-5h",
+				label: "Claude & GPT (shared)",
+				provider: "google-antigravity",
+				usedFraction: 0.25,
+				durationMs: FIVE_HOURS,
+				windowId: "5h",
+				sharedGroup: "3p-5h:5h",
+			}),
+			makeLimit({
+				id: "google-antigravity:openai:default:3p-5h",
+				label: "Claude & GPT (shared)",
+				provider: "google-antigravity",
+				usedFraction: 0.25,
+				durationMs: FIVE_HOURS,
+				windowId: "5h",
+				sharedGroup: "3p-5h:5h",
+			}),
+		]);
+
+		expect(computeProviderWindowStats([report])).toEqual([
+			expect.objectContaining({ meter: "Claude & GPT (shared)", usedAccounts: 0.25, remainingAccounts: 0.75 }),
+			expect.objectContaining({ meter: "Gemini", usedAccounts: 1, remainingAccounts: 0 }),
+		]);
 	});
 
 	it("reports Spark-only capacity instead of dropping the meter", () => {
@@ -193,6 +256,60 @@ describe("computeProviderWindowStats", () => {
 			]),
 		];
 		expect(computeProviderWindowStats(reports)).toHaveLength(0);
+	});
+});
+
+describe("collectUsageSnapshot", () => {
+	it("distinguishes unavailable collection from a successful empty report set", async () => {
+		const unavailable = new AuthStorage(new SqliteAuthCredentialStore(new Database(":memory:")), {
+			fetchUsageReports: async () => null,
+		});
+		try {
+			await unavailable.reload();
+			await expect(collectUsageSnapshot(unavailable)).rejects.toThrow("Usage reports unavailable");
+		} finally {
+			unavailable.close();
+		}
+
+		const empty = new AuthStorage(new SqliteAuthCredentialStore(new Database(":memory:")), {
+			fetchUsageReports: async () => [],
+		});
+		try {
+			await empty.reload();
+			const collection = await collectUsageSnapshot(empty);
+			expect(collection.snapshot.reports).toEqual([]);
+			expect(collection.accounts).toEqual([]);
+		} finally {
+			empty.close();
+		}
+	});
+
+	it("aborts the caller while credential revalidation continues independently", async () => {
+		const storage = new AuthStorage(new SqliteAuthCredentialStore(new Database(":memory:")), {
+			fetchUsageReports: async () => [],
+		});
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const finished = Promise.withResolvers<void>();
+		await storage.reload();
+		const revalidate = spyOn(storage, "revalidateCredentials").mockImplementation(async () => {
+			started.resolve();
+			await release.promise;
+			finished.resolve();
+		});
+		try {
+			const controller = new AbortController();
+			const collection = collectUsageSnapshot(storage, { signal: controller.signal });
+			await started.promise;
+			controller.abort();
+			await expect(collection).rejects.toMatchObject({ name: "AbortError" });
+			expect(revalidate).toHaveBeenCalledTimes(1);
+		} finally {
+			release.resolve();
+			await finished.promise;
+			revalidate.mockRestore();
+			storage.close();
+		}
 	});
 });
 
@@ -341,47 +458,6 @@ describe("formatUsageBreakdown", () => {
 		expect(text).toContain("Cerebras");
 		expect(text).toContain("API key — no usage data");
 		expect(text).toContain("capacity: 5h → 1.34/2 accounts used (0.66× quota left)");
-	});
-
-	it("renders marked Antigravity shared quotas once per account", () => {
-		const antigravity = makeReport("google-antigravity", "user@example.test", [
-			makeLimit({
-				id: "google-antigravity:google:default:gemini-5h",
-				label: "Gemini",
-				provider: "google-antigravity",
-				usedFraction: 0.25,
-				durationMs: FIVE_HOURS,
-				windowId: "5h",
-			}),
-			makeLimit({
-				id: "google-antigravity:google:default:gemini-weekly",
-				label: "Gemini",
-				provider: "google-antigravity",
-				usedFraction: 0.25,
-				durationMs: SEVEN_DAYS,
-				windowId: "weekly",
-			}),
-			...(["5h", "weekly"] as const).flatMap((windowId, index) =>
-				(["anthropic", "openai"] as const).map(counter =>
-					makeLimit({
-						id: `google-antigravity:${counter}:default:3p-${windowId}`,
-						label: "Claude & GPT (shared)",
-						provider: "google-antigravity",
-						usedFraction: 0.25,
-						durationMs: index === 0 ? FIVE_HOURS : SEVEN_DAYS,
-						windowId,
-						sharedGroup: `3p-${windowId}`,
-					}),
-				),
-			),
-		]);
-
-		const text = stripVTControlCharacters(formatUsageBreakdown([antigravity], [], Date.now()));
-
-		expect(text.match(/Claude & GPT \(shared\)/g)).toHaveLength(2);
-		expect(text.match(/Gemini/g)).toHaveLength(2);
-		expect(text).not.toContain("Usage (Anthropic)");
-		expect(text).not.toContain("Usage (OpenAI)");
 	});
 
 	it("keeps near-exhausted capacity fractional instead of rounding it to an exact need", () => {

@@ -6047,6 +6047,11 @@ export const SETTINGS_SCHEMA = {
 	"thinkingBudgets.max": { type: "number", default: 32768 },
 } as const;
 
+/** Preserve the explicit mode chosen by the legacy boolean Find setting. */
+export function migrateLegacyFindEnabled(value: unknown): unknown {
+	return typeof value === "boolean" ? (value ? "on" : "off") : value;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Type Inference
 // ═══════════════════════════════════════════════════════════════════════════

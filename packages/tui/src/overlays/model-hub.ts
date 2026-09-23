@@ -126,7 +126,7 @@ export interface ModelHubCallbacks {
 		scope?: ModelRoleSelectionScope,
 	) => void | boolean | Promise<void | boolean>;
 	/** Clear a configured role back to auto-selection. */
-	onUnassign: (role: string, scope?: ModelRoleSelectionScope) => void;
+	onUnassign: (role: string, scope?: ModelRoleSelectionScope) => void | boolean | Promise<void | boolean>;
 	/** Persist a `retry.fallbackChains` entry — keyed by a role, `provider/model-id`, or `provider/*`; an empty chain clears the key. */
 	onFallbackChainChange?: (role: string, chain: string[]) => void;
 	/** Locked provider activation: forward to the /login flow. */
@@ -139,6 +139,8 @@ export interface ModelHubCallbacks {
 export interface ModelHubOptions {
 	/** Preselect this provider's sidebar entry (e.g. when reopening after /login). */
 	initialProviderId?: string;
+	/** Open a focused single-role editor instead of the full role-management surface. */
+	initialAssignRole?: string;
 }
 
 interface SidebarEntry extends HubSidebarEntry<"recent" | "roles" | "all" | "separator" | "provider"> {
@@ -255,6 +257,8 @@ export class ModelHubComponent implements Component {
 	#assigning: AssignTarget | null = null;
 	#strip: StripState | null = null;
 	#assignmentPending = false;
+	/** Focused role editor target; unsupported fallback/cycle/custom-role controls stay out of this mode. */
+	#initialAssignRole: string | undefined;
 	#disposed = false;
 	/** Per-provider fuzzy match counts while a query is active; null when not searching. */
 	#searchCounts: Map<string, number> | null = null;
@@ -305,6 +309,7 @@ export class ModelHubComponent implements Component {
 		this.#registry = registry;
 		this.#scopedModels = scopedModels;
 		this.#callbacks = callbacks;
+		this.#initialAssignRole = options.initialAssignRole?.trim() || undefined;
 
 		this.#browser = new ModelBrowser(settings, {
 			emptyText: () => this.#emptyStateMessage(),
@@ -319,7 +324,10 @@ export class ModelHubComponent implements Component {
 		this.#syncFromRegistryState();
 
 		const initialProvider = options.initialProviderId;
-		if (initialProvider && this.#entries.some(entry => entry.providerId === initialProvider)) {
+		if (this.#initialAssignRole) {
+			this.#setActiveEntry("roles");
+			this.#startAssign(this.#initialAssignRole);
+		} else if (initialProvider && this.#entries.some(entry => entry.providerId === initialProvider)) {
 			this.#setActiveEntry(`provider:${initialProvider}`);
 		} else {
 			this.#setActiveEntry("all");
@@ -635,7 +643,13 @@ export class ModelHubComponent implements Component {
 	}
 
 	#setCandidateItems(items: ReadonlyArray<ModelBrowserItem>): void {
-		this.#candidateItems = [...items];
+		const assigning = this.#assigning;
+		if (assigning?.kind === "role") {
+			const accepts = this.#settings.getRoleInfo(assigning.role).accepts;
+			this.#candidateItems = items.filter(item => accepts(item.model));
+		} else {
+			this.#candidateItems = [...items];
+		}
 		this.#applyModelKind();
 	}
 
@@ -675,6 +689,11 @@ export class ModelHubComponent implements Component {
 	 * and `provider/*` keys) as headed groups.
 	 */
 	#buildRolesRows(): void {
+		if (this.#initialAssignRole) {
+			this.#rolesRows = [{ kind: "role", role: this.#initialAssignRole }];
+			this.#roleIndex = 0;
+			return;
+		}
 		const rows: RolesRow[] = [];
 		const chains = this.#fallbackChains();
 		const appendRoles = (roles: ReadonlyArray<string>): void => {
@@ -960,10 +979,14 @@ export class ModelHubComponent implements Component {
 		const resolved = this.#roleForScope(role, scope);
 		return resolved.explicitThinkingLevel ? (resolved.thinkingLevel ?? ThinkingLevel.Inherit) : ThinkingLevel.Inherit;
 	}
-	#finishAssignment(result: void | boolean | Promise<void | boolean>, onSuccess: () => void): void {
+	#finishAssignment(
+		result: void | boolean | Promise<void | boolean>,
+		onSuccess: () => void,
+		onFailure: () => void = () => this.#tui.requestRender(),
+	): void {
 		if (!(result instanceof Promise)) {
 			if (result !== false) onSuccess();
-			else this.#tui.requestRender();
+			else onFailure();
 			return;
 		}
 		this.#assignmentPending = true;
@@ -973,11 +996,11 @@ export class ModelHubComponent implements Component {
 				this.#assignmentPending = false;
 				if (this.#disposed) return;
 				if (applied !== false) onSuccess();
-				else this.#tui.requestRender();
+				else onFailure();
 			},
 			() => {
 				this.#assignmentPending = false;
-				if (!this.#disposed) this.#tui.requestRender();
+				if (!this.#disposed) onFailure();
 			},
 		);
 	}
@@ -999,22 +1022,36 @@ export class ModelHubComponent implements Component {
 		const supported = this.#thinkingOptionsFor(item.model);
 		if (!supported.includes(level)) level = ThinkingLevel.Inherit;
 		const result = this.#callbacks.onAssign(item.model, role, level, item.selector, scope);
-		this.#finishAssignment(result, () => {
-			this.#refreshAfterMutation();
-			this.#openThinkingStrip(item, role, returnToRoles, scope, level);
-		});
+		this.#finishAssignment(
+			result,
+			() => {
+				this.#refreshAfterMutation();
+				this.#openThinkingStrip(item, role, returnToRoles, scope, level);
+			},
+			() => (this.#initialAssignRole ? this.#callbacks.onCancel() : this.#tui.requestRender()),
+		);
 	}
 
-	#unassignRole(role: string): void {
+	#unassignRole(role: string, selectedScope?: ModelRoleSelectionScope): void {
 		const assignment = this.#roles[role];
-		if (!assignment || assignment.autoSelected) return;
+		// A role-strip chip identifies a concrete persisted scope even when an
+		// overlay tombstone makes the effective assignment look automatic.
+		if (selectedScope === undefined && (!assignment || assignment.autoSelected)) return;
+		let result: void | boolean | Promise<void | boolean>;
 		if (this.#settings.modelRoleStorage === "project") {
-			const source = this.#settings.getModelRoleSource(role);
-			this.#callbacks.onUnassign(role, source === "default" ? undefined : source);
+			const source = selectedScope ?? this.#settings.getModelRoleSource(role);
+			result = this.#callbacks.onUnassign(role, source === "default" ? undefined : source);
 		} else {
-			this.#callbacks.onUnassign(role);
+			result = this.#callbacks.onUnassign(role);
 		}
-		this.#refreshAfterMutation();
+		this.#finishAssignment(
+			result,
+			() => {
+				this.#refreshAfterMutation();
+				if (this.#initialAssignRole) this.#callbacks.onCancel();
+			},
+			() => (this.#initialAssignRole ? this.#callbacks.onCancel() : this.#tui.requestRender()),
+		);
 	}
 
 	#thinkingOptionsFor(model: Model): ConfiguredThinkingLevel[] {
@@ -1268,14 +1305,7 @@ export class ModelHubComponent implements Component {
 				}
 				return;
 			case "unassign":
-				if (chip.role) {
-					if (this.#settings.modelRoleStorage === "project") {
-						this.#callbacks.onUnassign(chip.role, chip.scope);
-					} else {
-						this.#callbacks.onUnassign(chip.role);
-					}
-					this.#refreshAfterMutation();
-				}
+				if (chip.role) this.#unassignRole(chip.role, chip.scope);
 				this.#closeStrip();
 				return;
 			case "fallback":
@@ -1315,9 +1345,17 @@ export class ModelHubComponent implements Component {
 						strip.scope,
 					);
 					this.#closeStrip();
-					this.#finishAssignment(result, () => this.#refreshAfterMutation());
+					this.#finishAssignment(
+						result,
+						() => {
+							this.#refreshAfterMutation();
+							if (this.#initialAssignRole) this.#callbacks.onCancel();
+						},
+						() => (this.#initialAssignRole ? this.#callbacks.onCancel() : this.#tui.requestRender()),
+					);
 				} else {
 					this.#closeStrip();
+					if (this.#initialAssignRole) this.#callbacks.onCancel();
 				}
 				return;
 			}
@@ -1329,9 +1367,7 @@ export class ModelHubComponent implements Component {
 		this.#assigning = { kind: "role", role };
 		this.#focus = "scope";
 		this.#browser.setShowProvider(true);
-		this.#setCandidateItems(
-			this.#availableItems.filter(item => this.#settings.getRoleInfo(role).accepts(item.model)),
-		);
+		this.#setCandidateItems(this.#availableItems);
 		this.#browser.setQuery("");
 		const current = this.#roles[role];
 		if (current) {
@@ -1440,6 +1476,10 @@ export class ModelHubComponent implements Component {
 	}
 
 	#cancelAssign(): void {
+		if (this.#initialAssignRole) {
+			this.#callbacks.onCancel();
+			return;
+		}
 		this.#assigning = null;
 		this.#browser.setQuery("");
 		this.#setActiveEntry("roles");
@@ -1521,7 +1561,7 @@ export class ModelHubComponent implements Component {
 
 	handleInput(data: string): void {
 		if (this.#assignmentPending) {
-			if (matchesSelectCancel(data)) this.#callbacks.onCancel();
+			if (matchesSelectCancel(data) && !this.#initialAssignRole) this.#callbacks.onCancel();
 			return;
 		}
 		if (data.startsWith("\x1b[<")) {
@@ -1545,6 +1585,21 @@ export class ModelHubComponent implements Component {
 				return;
 			}
 			this.#callbacks.onCancel();
+			return;
+		}
+		if (this.#initialAssignRole && this.#assigning === null) {
+			this.#setActiveEntry("roles");
+			this.#focus = "list";
+			this.#handleRolesViewInput(data);
+			return;
+		}
+		if (
+			this.#initialAssignRole &&
+			this.#assigning?.kind === "role" &&
+			this.#browser.query.length === 0 &&
+			(matchesKey(data, "backspace") || matchesKey(data, "delete"))
+		) {
+			this.#unassignRole(this.#assigning.role);
 			return;
 		}
 
@@ -1647,6 +1702,9 @@ export class ModelHubComponent implements Component {
 		if (!strip) return;
 		if (matchesSelectCancel(data)) {
 			this.#closeStrip();
+			if (this.#initialAssignRole && (strip.kind === "thinking" || strip.kind === "scope")) {
+				this.#callbacks.onCancel();
+			}
 			return;
 		}
 		if (strip.kind === "roleName") {
@@ -1767,6 +1825,34 @@ export class ModelHubComponent implements Component {
 			else if (row?.kind === "chainKey") this.#setFallbackChain(row.role, []);
 			return;
 		}
+		if (this.#initialAssignRole) {
+			const printable = extractPrintableText(data);
+			if (printable === "x") {
+				if (role) this.#unassignRole(role);
+				return;
+			}
+			if (printable === "t") {
+				const assignment = role ? this.#roles[role] : undefined;
+				if (!role || !assignment) return;
+				const source =
+					this.#settings.modelRoleStorage === "project" ? this.#settings.getModelRoleSource(role) : "default";
+				const scope = source === "project" || source === "global" ? source : undefined;
+				const scopedModel = scope ? this.#roleForScope(role, scope).model : assignment.model;
+				if (!scopedModel) return;
+				this.#openThinkingStrip(
+					{
+						provider: scopedModel.provider,
+						id: scopedModel.id,
+						model: scopedModel,
+						selector: `${scopedModel.provider}/${scopedModel.id}`,
+					},
+					role,
+					true,
+					scope,
+				);
+			}
+			return;
+		}
 		// Reordering: [ / shift+↑ moves the row earlier, ] / shift+↓ later —
 		// cycle order on a role row, chain order on a fallback row.
 		if (matchesKey(data, "shift+up")) {
@@ -1851,6 +1937,7 @@ export class ModelHubComponent implements Component {
 			event.col,
 		);
 		const entry = this.#activeEntry();
+		if (this.#initialAssignRole && this.#assigning === null && overSidebar) return true;
 
 		// Footer strip chips (columns stay in frame coordinates).
 		if (footerColumn !== undefined && this.#strip) {
@@ -2050,7 +2137,13 @@ export class ModelHubComponent implements Component {
 				text = `Recently used models${scopedSuffix}`;
 				break;
 			case "roles":
-				text = "Model roles — f adds a retry fallback, cleared roles fall back to auto-selection";
+				if (this.#initialAssignRole) {
+					const info = this.#settings.getRoleInfo(this.#initialAssignRole);
+					const label = info.tag ?? info.name ?? this.#initialAssignRole;
+					text = `Editing ${label} — Enter picks a model, x clears to automatic`;
+				} else {
+					text = "Model roles — f adds a retry fallback, cleared roles fall back to auto-selection";
+				}
 				break;
 			case "provider":
 				if (entry.locked) {
@@ -2084,10 +2177,9 @@ export class ModelHubComponent implements Component {
 	}
 
 	#renderRolesView(width: number, rows: number): string[] {
-		const lines: string[] = [];
-		lines.push(this.#renderRoleTabs(width));
-		// First row's offset in bodyLine coordinates: the mouse router's
-		// `bodyLine` has already dropped the status row, leaving the tabs row.
+		const lines: string[] = [this.#initialAssignRole ? "" : this.#renderRoleTabs(width)];
+		// First row's offset in bodyLine coordinates: the mouse router has
+		// already dropped the status row, leaving the tabs row or focused-mode spacer.
 		this.#rolesRowStart = lines.length;
 
 		let tagWidth = 0;
@@ -2201,6 +2293,11 @@ export class ModelHubComponent implements Component {
 			lines.push(truncateToWidth(theme.fg("dim", `   ${parts.join("   ")}`), width));
 		}
 
+		if (this.#initialAssignRole) {
+			while (lines.length < rows) lines.push("");
+			return lines;
+		}
+
 		// Live preview of the quick-switch cycle, rendered with the exact
 		// segment track the ctrl+p status uses; the selected role's chip fills.
 		while (lines.length < rows - 1) lines.push("");
@@ -2243,7 +2340,7 @@ export class ModelHubComponent implements Component {
 		} else {
 			lines.push(truncateToWidth(theme.fg("muted", "  Add an API key for this provider in config."), width));
 		}
-		if (entry.oauth) {
+		if (entry.oauth && this.#callbacks.onLoginRequest) {
 			this.#lockedLoginLine = lines.length + 1; // +1 for the status row offset handled by caller
 			lines.push(truncateToWidth(theme.fg("accent", `  ${theme.nav.cursor} Log in with OAuth (Enter)`), width));
 		}
@@ -2279,7 +2376,9 @@ export class ModelHubComponent implements Component {
 				case "fallbackKey":
 					return "Enter pick the protected model · ↑/↓ providers · type to search · Alt+←/→ kind · Esc cancel";
 				default:
-					return "Enter assign · ↑/↓ providers · type to search · Alt+←/→ kind · Esc cancel";
+					return this.#initialAssignRole
+						? "Enter assign · ↑/↓ providers · type to search · Alt+←/→ kind · Delete clear · Esc back"
+						: "Enter assign roles · ↑/↓ providers · type to search · Alt+←/→ kind · Esc cancel";
 			}
 		}
 		const entry = this.#activeEntry();
@@ -2287,6 +2386,7 @@ export class ModelHubComponent implements Component {
 			if (this.#focus !== "list") {
 				return "↑/↓ providers · → roles · Alt+←/→ tabs · Esc close";
 			}
+			if (this.#initialAssignRole) return "Enter pick · x clear · t thinking · Esc back";
 			const row = this.#rolesRows[this.#roleIndex];
 			if (row?.kind === "fallback") {
 				// Advertise `t` only when the entry resolves: wildcards always
@@ -2305,7 +2405,9 @@ export class ModelHubComponent implements Component {
 			return "↑/↓ rows · Enter pick · f fallback · x clear · t thinking · c cycle · [/] reorder · n new";
 		}
 		if (entry.kind === "provider" && entry.locked) {
-			return entry.oauth ? "Enter log in · ↑/↓ providers · Esc close" : "↑/↓ providers · Esc close";
+			return entry.oauth && this.#callbacks.onLoginRequest
+				? "Enter log in · ↑/↓ providers · Esc close"
+				: "↑/↓ providers · Esc close";
 		}
 		const arrows = this.#focus === "scope" ? "↑/↓ providers · → models" : "↑/↓ models · ← providers";
 		const refresh = entry.kind === "provider" ? " · F5 refresh" : "";

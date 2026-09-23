@@ -1,4 +1,9 @@
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import * as url from "node:url";
 import { describe, expect, it } from "bun:test";
+import { removeWithRetries } from "@oh-my-pi/pi-utils";
 import { parseArgs } from "../src/cli/args";
 import { PROFILE_BOOTSTRAP_BOUNDARY_ARG } from "../src/cli/flag-tables";
 import { extractProfileFlags } from "../src/cli/profile-bootstrap";
@@ -286,5 +291,46 @@ describe("extractProfileFlags", () => {
 			profile: "work",
 			aliasName: undefined,
 		});
+	});
+});
+
+describe("profile launch environment", () => {
+	it("captures the original shell environment once before profile dotenv mutation", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-profile-launch-env-"));
+		try {
+			const moduleUrl = url.pathToFileURL(path.resolve(import.meta.dir, "../src/cli/profile-bootstrap.ts")).href;
+			const probe = path.join(root, "probe.ts");
+			await Bun.write(
+				probe,
+				[
+					`import { captureProfileLaunchEnvironment, getProfileLaunchEnvironment } from ${JSON.stringify(moduleUrl)};`,
+					"captureProfileLaunchEnvironment();",
+					'process.env.OMP_CAPTURE_ORIGINAL = "profile-dotenv";',
+					'process.env.OMP_CAPTURE_INSERTED = "profile-only";',
+					"captureProfileLaunchEnvironment();",
+					"const captured = getProfileLaunchEnvironment();",
+					"process.stdout.write(JSON.stringify({ original: captured?.OMP_CAPTURE_ORIGINAL, inserted: captured?.OMP_CAPTURE_INSERTED ?? null }));",
+				].join("\n"),
+			);
+			const env: Record<string, string | undefined> = {
+				...process.env,
+				OMP_CAPTURE_ORIGINAL: "original-shell",
+			};
+			delete env.OMP_CAPTURE_INSERTED;
+			const proc = Bun.spawn([process.execPath, probe], {
+				env,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [stdout, stderr, exitCode] = await Promise.all([
+				new Response(proc.stdout).text(),
+				new Response(proc.stderr).text(),
+				proc.exited,
+			]);
+			expect(exitCode, stderr).toBe(0);
+			expect(JSON.parse(stdout)).toEqual({ original: "original-shell", inserted: null });
+		} finally {
+			await removeWithRetries(root);
+		}
 	});
 });

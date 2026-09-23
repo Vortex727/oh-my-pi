@@ -37,6 +37,8 @@ export interface ProfileDashboardProfileState {
 	error?: string;
 	/** A failed refresh keeps snapshot as the last-good value and annotates it. */
 	refreshError?: string;
+	/** Current profile only: this session's account usage report, rendered for a width. */
+	usage?: (width: number) => string;
 }
 
 export interface ProfileDashboardCallbacks {
@@ -604,6 +606,7 @@ export class ProfileDashboard implements Component {
 			setup,
 			snapshot,
 			width: bodyWidth,
+			usage: state?.usage,
 		});
 		if (lines.length > bodyHeight && bodyWidth > 1) {
 			bodyWidth -= 1;
@@ -611,6 +614,7 @@ export class ProfileDashboard implements Component {
 				setup,
 				snapshot,
 				width: bodyWidth,
+				usage: state?.usage,
 			});
 		}
 

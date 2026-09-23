@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { stripVTControlCharacters } from "node:util";
-import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
+import { AuthStorage, SqliteAuthCredentialStore, type UsageReport } from "@oh-my-pi/pi-ai";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ProfileDashboard } from "@oh-my-pi/pi-coding-agent/modes/components/profile-dashboard";
@@ -22,6 +22,23 @@ import { YAML } from "bun";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
 
 const NEW_SESSION = "Start a new session";
+const HOUR = 3_600_000;
+
+function quotaReport(now: number): UsageReport {
+	return {
+		provider: "anthropic",
+		fetchedAt: now,
+		limits: [
+			{
+				id: "5h",
+				label: "5h",
+				scope: { provider: "anthropic", windowId: "5h", shared: true },
+				window: { id: "5h", label: "5h", durationMs: 5 * HOUR, resetsAt: now + 5 * HOUR },
+				amount: { unit: "percent", usedFraction: 0.18 },
+			},
+		],
+	};
+}
 /** A saved profile holding an entry a newer omp wrote and this version skips on load. */
 const FOCUS_WITH_FUTURE_ENTRY = [
 	"$setup:",
@@ -110,7 +127,7 @@ describe("ProfilesController", () => {
 		await tempDir.remove();
 	});
 
-	async function harness() {
+	async function harness(options: { fetchUsageReports?: () => Promise<UsageReport[] | null> } = {}) {
 		const settings = await Settings.loadIsolated({ cwd: projectDir, agentDir });
 		const modelRegistry = new ModelRegistry(authStorage, path.join(agentDir, "models.yml"), { settings });
 		const choice = Promise.withResolvers<string | undefined>();
@@ -135,6 +152,9 @@ describe("ProfilesController", () => {
 				getAvailableModels: () => [],
 				refreshBaseSystemPrompt: async () => refreshed.resolve(),
 				setModelTemporary: async () => {},
+				sessionId: "profiles-test",
+				fetchUsageReports: options.fetchUsageReports ?? (async () => null),
+				getUsageReportingModelSelectors: () => [],
 			},
 			sessionManager: { getCwd: () => projectDir },
 			ui: { requestRender: () => rendered.fire(), setFocus: () => {}, terminal: { rows: 40 } },
@@ -198,9 +218,9 @@ describe("ProfilesController", () => {
 			dashboard: () => dashboard!,
 			screen: () => stripVTControlCharacters(dashboard!.render(160, 40).join("\n")),
 			/**
-			 * Wait on real render requests until `predicate` holds. The predicate
-			 * must not render: a render that requests another render would spin
-			 * this loop on microtasks and starve the test timeout.
+			 * Wait on real render requests until `predicate` holds. If the awaited
+			 * change never happens this never settles, and Bun on Windows does not
+			 * time such a test out, so keep predicates specific.
 			 */
 			renderedUntil: async (predicate: () => boolean) => {
 				while (!predicate()) await rendered.next();
@@ -381,6 +401,20 @@ describe("ProfilesController", () => {
 		const stored = parseProfileText(await Bun.file(path.join(agentDir, "setups", "shared.yml")).text());
 		expect(stored.config).toEqual({ modelRoles: { smol: "nowhere/unknown-model" } });
 		expect(h.screen()).toContain("Imported profile shared");
+	});
+
+	it("shows this session's account usage under the current profile only", async () => {
+		const usage = Promise.withResolvers<UsageReport[] | null>();
+		const h = await harness({ fetchUsageReports: () => usage.promise });
+		expect(h.screen()).not.toContain("Anthropic");
+		usage.resolve([quotaReport(Date.now())]);
+		// The controller awaited this promise first, so the report is attached already.
+		await usage.promise;
+		expect(h.screen()).toContain("Anthropic");
+
+		h.dashboard().handleInput("\x1b[B");
+		await h.renderedUntil(() => h.screen().includes("Saved profile") && !h.screen().includes("Loading preview"));
+		expect(h.screen()).not.toContain("Anthropic");
 	});
 
 	it("returning to Profiles rediscovers added setups and drops missing ones", async () => {

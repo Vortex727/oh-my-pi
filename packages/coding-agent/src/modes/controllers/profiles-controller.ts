@@ -9,6 +9,7 @@ import type { SettingsSelectorComponent } from "@oh-my-pi/pi-tui/overlays/settin
 import { replaceTabs } from "@oh-my-pi/pi-tui/render/render-utils";
 import { getAvailableThemes, theme } from "@oh-my-pi/pi-tui/theme";
 import { oneLineLabel } from "@oh-my-pi/pi-tui/tools/task";
+import type { UsageReport } from "@oh-my-pi/pi-ai";
 import { logger, sanitizeText } from "@oh-my-pi/pi-utils";
 import { getModelMatchPreferences, resolveModelRoleValue } from "../../config/model-resolver";
 import { type RawSettings, Settings } from "../../config/settings";
@@ -47,6 +48,7 @@ import { createModelBrowserSource } from "../model-browser-source";
 import { resolveToCwd } from "../../tools/path-utils";
 import { copyToClipboard, readTextFromClipboard } from "../../utils/clipboard";
 import type { InteractiveModeContext } from "../types";
+import { renderUsageReports } from "./command-controller";
 import type { AgentsDashboardHostOptions, ModelHubHostOptions } from "./selector-controller";
 
 /** Selector-controller capabilities the Profiles tab reuses instead of duplicating. */
@@ -116,6 +118,8 @@ export class ProfilesController {
 	#busy = false;
 	#dialogs = new AbortController();
 	#closeChild: (() => void) | undefined;
+	/** This session's usage report bound to a width, once fetched for the current mount. */
+	#usage: ((width: number) => string) | undefined;
 
 	constructor(
 		private readonly ctx: InteractiveModeContext,
@@ -173,6 +177,7 @@ export class ProfilesController {
 		selector.setProfilesContent(dashboard);
 		this.ctx.ui.setFocus(selector);
 		this.ctx.ui.requestRender();
+		void this.#loadUsage(dashboard);
 		await this.#preview(dashboard.selectedSetup ?? CURRENT_SETUP);
 	}
 
@@ -189,6 +194,7 @@ export class ProfilesController {
 		this.#closeSettings = undefined;
 		this.#snapshots.clear();
 		this.#previews.clear();
+		this.#usage = undefined;
 		this.#busy = false;
 	}
 
@@ -235,7 +241,11 @@ export class ProfilesController {
 			snapshot => {
 				if (generation !== this.#generation || this.#dashboard !== dashboard) return;
 				this.#snapshots.set(key, snapshot);
-				dashboard.setSetupState(setup, { snapshot, loading: false });
+				dashboard.setSetupState(setup, {
+					snapshot,
+					loading: false,
+					usage: setup.kind === "current" ? this.#usage : undefined,
+				});
 			},
 			(error: unknown) => {
 				if (generation !== this.#generation || this.#dashboard !== dashboard) return;
@@ -250,6 +260,40 @@ export class ProfilesController {
 		return run.finally(() => {
 			if (this.#previews.get(key) === run) this.#previews.delete(key);
 		});
+	}
+
+	/**
+	 * Fetch this session's account usage once per mount, the same report `/usage`
+	 * shows, and attach it to the current profile's preview. A failure or an empty
+	 * report leaves the section out, as `/usage` does.
+	 */
+	async #loadUsage(dashboard: ProfileDashboard): Promise<void> {
+		const { session } = this.ctx;
+		let reports: UsageReport[] | null;
+		try {
+			reports = await session.fetchUsageReports(this.#dialogs.signal);
+		} catch (error) {
+			if (!this.#dialogs.signal.aborted) logger.warn("Failed to fetch usage for Profiles", { error: String(error) });
+			return;
+		}
+		if (this.#dashboard !== dashboard || !reports || reports.length === 0) return;
+		const provider = session.model?.provider;
+		const account = provider
+			? session.modelRegistry.authStorage.oauth.identity(provider, session.sessionId)
+			: undefined;
+		const selectors = session.getUsageReportingModelSelectors(reports);
+		const usage = (width: number): string =>
+			renderUsageReports(
+				reports,
+				theme,
+				Date.now(),
+				width,
+				id => (id === provider ? account : undefined),
+				selectors,
+			);
+		this.#usage = usage;
+		const snapshot = this.#snapshots.get(setupKey(CURRENT_SETUP));
+		if (snapshot) dashboard.setSetupState(CURRENT_SETUP, { snapshot, loading: false, usage });
 	}
 
 	async #buildSnapshot(setup: ProfileDashboardSetupRef): Promise<ProfileSnapshot> {

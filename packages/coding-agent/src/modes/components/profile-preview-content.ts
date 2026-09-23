@@ -450,6 +450,8 @@ export function buildProfilePreviewOverview(options: {
 	setup: ProfileDashboardSetupRef;
 	snapshot: ProfileSnapshot;
 	width: number;
+	/** This session's account usage report, rendered for a width; shown last. */
+	usage?: (width: number) => string;
 }): string[] {
 	const { setup, snapshot } = options;
 	const width = Math.max(1, options.width);
@@ -471,6 +473,7 @@ export function buildProfilePreviewOverview(options: {
 			...renderSettingsMemory(setup, snapshot, width),
 		);
 	}
+	if (options.usage) lines.push("", ...options.usage(width).split("\n"));
 
 	return wrapLines(lines, width);
 }

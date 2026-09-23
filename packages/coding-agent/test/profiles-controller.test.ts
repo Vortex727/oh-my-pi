@@ -121,6 +121,10 @@ describe("ProfilesController", () => {
 	afterEach(async () => {
 		authStorage.close();
 		AgentStorage.close();
+		// AgentStorage's one-off schema statements are finalized only by GC, and
+		// until then SQLite keeps agent.db open; Windows cannot delete an open file,
+		// so removal would retry for seconds and can outlast the test timeout.
+		Bun.gc(true);
 		vi.restoreAllMocks();
 		restoreSettingsTestState(state);
 		state = undefined;

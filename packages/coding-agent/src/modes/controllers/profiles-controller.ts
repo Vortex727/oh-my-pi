@@ -709,7 +709,10 @@ export class ProfilesController {
 				{
 					title: "Import profile",
 					name: "Imported profile",
-					notice: imported.warnings.length > 0 ? `Skipped ${skippedSummary(imported.warnings)}` : undefined,
+					notice: [
+						"Not imported yet: review it, fix any ⚠ model, then Ctrl+S to save it as a new profile (Esc discards).",
+						...(imported.warnings.length > 0 ? [`Skipped ${skippedSummary(imported.warnings)}.`] : []),
+					].join(" "),
 				},
 			);
 			if (saved === undefined) return undefined;

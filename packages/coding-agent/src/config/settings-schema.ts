@@ -161,7 +161,16 @@ interface CredentialMarker {
 	credential?: true;
 }
 
-interface BooleanDef extends CredentialMarker {
+/**
+ * Marks a setting bound to this machine or account (local servers, provider
+ * endpoints, billing tiers, saved reset credits). Saved setups never capture
+ * or share it. Read it through `isMachineLocal`.
+ */
+interface MachineLocalMarker {
+	machineLocal?: true;
+}
+
+interface BooleanDef extends CredentialMarker, MachineLocalMarker {
 	type: "boolean";
 	default: boolean | undefined;
 	ui?: UiBoolean;
@@ -173,13 +182,13 @@ interface StringDef extends CredentialMarker {
 	ui?: UiString;
 }
 
-interface NumberDef extends CredentialMarker {
+interface NumberDef extends CredentialMarker, MachineLocalMarker {
 	type: "number";
 	default: number | undefined;
 	ui?: UiNumber;
 }
 
-interface EnumDef<T extends readonly string[]> extends CredentialMarker {
+interface EnumDef<T extends readonly string[]> extends CredentialMarker, MachineLocalMarker {
 	type: "enum";
 	values: T;
 	default: T[number];
@@ -493,6 +502,7 @@ export const SETTINGS_SCHEMA = {
 	disabledExtensions: { type: "array", default: EMPTY_STRING_ARRAY },
 
 	modelRoleStorage: {
+		machineLocal: true,
 		type: "enum",
 		values: ["global", "project"] as const,
 		default: "global",
@@ -885,6 +895,7 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	"images.urls.enabled": {
+		machineLocal: true,
 		type: "boolean",
 		default: false,
 		ui: {
@@ -944,6 +955,7 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	"images.urls.ttlHours": {
+		machineLocal: true,
 		type: "number",
 		default: 72,
 		ui: {
@@ -978,6 +990,7 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	"images.urls.sshRemotePort": {
+		machineLocal: true,
 		type: "number",
 		default: 8787,
 		ui: {
@@ -1642,6 +1655,7 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	"tier.openai": {
+		machineLocal: true,
 		type: "enum",
 		values: SERVICE_TIER_OPENAI_VALUES,
 		default: "none",
@@ -1656,6 +1670,7 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	"tier.anthropic": {
+		machineLocal: true,
 		type: "enum",
 		values: SERVICE_TIER_ANTHROPIC_VALUES,
 		default: "none",
@@ -1670,6 +1685,7 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	"tier.google": {
+		machineLocal: true,
 		type: "enum",
 		values: SERVICE_TIER_GOOGLE_VALUES,
 		default: "none",
@@ -1684,6 +1700,7 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	"tier.subagent": {
+		machineLocal: true,
 		type: "enum",
 		values: SERVICE_TIER_INHERIT_SETTING_VALUES,
 		default: "inherit",
@@ -1698,6 +1715,7 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	"tier.advisor": {
+		machineLocal: true,
 		type: "enum",
 		values: SERVICE_TIER_INHERIT_SETTING_VALUES,
 		default: "none",
@@ -5458,6 +5476,7 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 	"providers.antigravityEndpoint": {
+		machineLocal: true,
 		type: "enum",
 		values: ["auto", "production", "sandbox"] as const,
 		default: "auto",
@@ -5486,6 +5505,7 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 	"providers.fireworksTier": {
+		machineLocal: true,
 		type: "enum",
 		values: ["standard", "priority"] as const,
 		default: "standard",
@@ -5802,6 +5822,7 @@ export const SETTINGS_SCHEMA = {
 	},
 	// Codex saved rate-limit resets (auto-redeem)
 	"codexResets.autoRedeem": {
+		machineLocal: true,
 		type: "enum",
 		values: ["unset", "yes", "no"] as const,
 		default: "unset" as const,
@@ -5823,6 +5844,7 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 	"codexResets.minBlockedMinutes": {
+		machineLocal: true,
 		type: "number",
 		default: 60,
 		ui: {
@@ -5834,6 +5856,7 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 	"codexResets.keepCredits": {
+		machineLocal: true,
 		type: "number",
 		default: 0,
 		ui: {
@@ -5845,6 +5868,7 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 	"codexResets.salvageHorizonHours": {
+		machineLocal: true,
 		type: "number",
 		default: 12,
 		ui: {
@@ -5857,6 +5881,7 @@ export const SETTINGS_SCHEMA = {
 	},
 	// Claude Cedar/Juniper rate-limit resets (independent auto-redeem consent)
 	"claudeResets.autoRedeem": {
+		machineLocal: true,
 		type: "enum",
 		values: ["unset", "yes", "no"] as const,
 		default: "unset" as const,
@@ -5878,6 +5903,7 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 	"claudeResets.minBlockedMinutes": {
+		machineLocal: true,
 		type: "number",
 		default: 60,
 		ui: {
@@ -5889,6 +5915,7 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 	"claudeResets.keepCredits": {
+		machineLocal: true,
 		type: "number",
 		default: 0,
 		ui: {
@@ -5900,6 +5927,7 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 	"claudeResets.salvageHorizonHours": {
+		machineLocal: true,
 		type: "number",
 		default: 12,
 		ui: {
@@ -6153,6 +6181,12 @@ export function isCredential(path: SettingPath): boolean {
 	// both here keeps ONE accessor, so the two spellings cannot produce
 	// different behaviour on different surfaces.
 	return getUi(path)?.secret === true;
+}
+
+/** Whether a setting is tied to this machine or account and must stay out of saved setups. */
+export function isMachineLocal(path: SettingPath): boolean {
+	const def = SETTINGS_SCHEMA[path];
+	return "machineLocal" in def && def.machineLocal === true;
 }
 
 /** Get UI metadata for a path (undefined if no UI) */

@@ -1046,6 +1046,11 @@ export class Settings {
 		return this.#agentDir;
 	}
 
+	/** Explicit config overlays this instance loads (`--config`, `PI_CONFIG_FILES`), as absolute paths. */
+	get configFiles(): readonly string[] {
+		return this.#configFiles;
+	}
+
 	/**
 	 * Monotonic revision for consumers caching derived effective settings.
 	 * Changes after every merged-layer or cwd-scope rebuild, including overlays

@@ -109,7 +109,9 @@ import { HistorySearchComponent } from "@oh-my-pi/pi-tui/overlays/history-search
 import type { LoginDialogComponent as LoginDialogComponentType } from "@oh-my-pi/pi-tui/overlays/login-dialog";
 import type { LogoutAccountSelectorComponent as LogoutAccountSelectorComponentType } from "@oh-my-pi/pi-tui/overlays/logout-account-selector";
 import type {
+	ModelHubCallbacks,
 	ModelHubComponent as ModelHubComponentType,
+	ModelHubSource,
 	ModelRoleSelectionScope,
 } from "@oh-my-pi/pi-tui/overlays/model-hub";
 import { createModelBrowserSource } from "../model-browser-source";
@@ -122,11 +124,12 @@ import { type BranchVariantPath, RewindSelectorComponent } from "@oh-my-pi/pi-tu
 import { renderSegmentTrack } from "@oh-my-pi/pi-tui/chrome/segment-track";
 import { SessionAccountSelectorComponent } from "@oh-my-pi/pi-tui/overlays/session-account-selector";
 import { SessionSelectorComponent, type SessionSelectorOptions } from "@oh-my-pi/pi-tui/overlays/session-selector";
-import { SettingsSelectorComponent } from "@oh-my-pi/pi-tui/overlays/settings-selector";
+import { SettingsSelectorComponent, type SettingsNavigationTab } from "@oh-my-pi/pi-tui/overlays/settings-selector";
 import { ToolExecutionComponent } from "@oh-my-pi/pi-tui/chat/tool-execution";
 import { TranscriptBlock } from "@oh-my-pi/pi-tui/chrome/transcript-container";
 import { TreeSelectorComponent } from "@oh-my-pi/pi-tui/overlays/tree-selector";
 import { UsageDashboardComponent } from "@oh-my-pi/pi-tui/overlays/usage-dashboard";
+import { ProfilesController } from "./profiles-controller";
 import { renderUsageReports } from "./command-controller";
 import type { SessionObserverRegistry } from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
 
@@ -135,6 +138,21 @@ const MANUAL_LOGIN_PROMPT = "Paste the authorization code (or full redirect URL)
 interface ModelOverlayModules {
 	ModelHubComponent: typeof ModelHubComponentType;
 	ModelPickerComponent: typeof ModelPickerComponentType;
+}
+
+export interface ModelHubHostOptions {
+	initialProviderId?: string;
+	initialAssignRole?: string;
+	source?: ModelHubSource;
+	roleCallbacks?: Pick<ModelHubCallbacks, "onAssign" | "onUnassign">;
+	isCancelled?: () => boolean;
+	setClose?: (close: () => void) => void;
+	onDone?: () => void;
+}
+
+export interface AgentsDashboardHostOptions {
+	isCancelled?: () => boolean;
+	onDone?: () => void;
 }
 
 /** Synchronous first-use boundary for model overlays; key callbacks require immediate mounting. */
@@ -177,7 +195,20 @@ function loadProviderToggles(): ProviderToggleModules {
 }
 
 export class SelectorController {
-	constructor(private ctx: InteractiveModeContext) {}
+	readonly #profiles: ProfilesController;
+
+	constructor(private ctx: InteractiveModeContext) {
+		this.#profiles = new ProfilesController(ctx, {
+			showFullscreenMenu: component => this.#showFullscreenMenu(component),
+			showModelHub: options => this.#showModelHub(options),
+			showAgentsDashboard: options => this.showAgentsDashboard(options),
+			acquireDefaultRoleMutation: () => this.#acquireDefaultRoleMutation(),
+		});
+	}
+	#closeSettingsOverlay: (() => void) | undefined;
+	#settingsSelector: SettingsSelectorComponent | undefined;
+	#mountProfilesContent: (() => Promise<void>) | undefined;
+	#settingsOpeningGeneration = 0;
 	/**
 	 * Mount a primary fullscreen menu through the one polished modal path shared
 	 * by Settings, Model Hub, and Agent Hub.
@@ -255,91 +286,139 @@ export class SelectorController {
 		this.ctx.ui.requestRender();
 	}
 
-	showSettingsSelector(): void {
-		getAvailableThemes().then(availableThemes => {
-			// Fullscreen settings editor on the alternate screen: the overlay
-			// enables mouse tracking (click/hover/wheel) for its lifetime and
-			// the transcript stays untouched underneath.
-			const done = () => {
-				overlayHandle?.hide();
-				this.focusActiveEditorArea();
-				this.ctx.ui.requestRender();
-			};
-			const selector = new SettingsSelectorComponent(
-				{
-					availableThinkingLevels: [...this.ctx.session.getAvailableThinkingLevels()],
-					thinkingLevel: this.ctx.session.thinkingLevel,
-					availableThemes,
-					providers: [...new Set(this.ctx.session.getAvailableModels().map(model => model.provider))].sort(
-						(a, b) => a.localeCompare(b),
-					),
-					settings: createSettingsHost(),
-					plugins: createPluginSettingsHost(getProjectDir()),
-					model: this.ctx.session.model,
-					imageBudget: this.ctx.ui.imageBudget,
-					requestRender: () => this.ctx.ui.requestRender(),
-					composerPreviewStatus: this.ctx.statusLine,
+	closeSettingsSelector(): void {
+		this.#settingsOpeningGeneration++;
+		this.#closeSettingsOverlay?.();
+	}
+
+	async showSettingsSelector(initialTab?: SettingsNavigationTab): Promise<void> {
+		const requestedTab = initialTab ?? "appearance";
+		if (this.#closeSettingsOverlay) {
+			const selector = this.#settingsSelector;
+			if (selector) {
+				selector.selectTab(requestedTab);
+				if (requestedTab === "profiles") await this.#mountProfilesContent?.();
+			}
+			return;
+		}
+
+		const generation = ++this.#settingsOpeningGeneration;
+		const availableThemes = await getAvailableThemes();
+		if (generation !== this.#settingsOpeningGeneration || this.ctx.isShuttingDown) return;
+
+		let closed = false;
+		let profilesRequested = false;
+		const settingsOverlay: {
+			selector?: SettingsSelectorComponent;
+			handle?: OverlayHandle;
+		} = {};
+		const restoreStatusLine = () => {
+			this.ctx.statusLine.updateSettings({
+				preset: this.ctx.settings.get("statusLine.preset"),
+				leftSegments: this.ctx.settings.get("statusLine.leftSegments"),
+				rightSegments: this.ctx.settings.get("statusLine.rightSegments"),
+				separator: this.ctx.settings.get("statusLine.separator"),
+				showHookStatus: this.ctx.settings.get("statusLine.showHookStatus"),
+				sessionAccent: this.ctx.settings.get("statusLine.sessionAccent"),
+				transparent: this.ctx.settings.get("statusLine.transparent"),
+				compactThinkingLevel: this.ctx.settings.get("statusLine.compactThinkingLevel"),
+				contextLine: this.ctx.settings.get("statusLine.contextLine"),
+			});
+			this.ctx.ui.requestRender();
+		};
+		const done = () => {
+			if (closed) return;
+			closed = true;
+			this.#settingsOpeningGeneration++;
+			this.#profiles.close();
+			settingsOverlay.handle?.hide();
+			if (this.#closeSettingsOverlay === done) {
+				this.#closeSettingsOverlay = undefined;
+				this.#mountProfilesContent = undefined;
+				this.#settingsSelector = undefined;
+			}
+			restoreStatusLine();
+			this.focusActiveEditorArea();
+			this.ctx.ui.requestRender();
+		};
+		const mountProfiles = async (): Promise<void> => {
+			profilesRequested = true;
+			const { selector, handle } = settingsOverlay;
+			if (!selector || !handle || closed) return;
+			await this.#profiles.mount(selector, handle, done);
+		};
+
+		const selector = new SettingsSelectorComponent(
+			{
+				availableThinkingLevels: [...this.ctx.session.getAvailableThinkingLevels()],
+				thinkingLevel: this.ctx.session.thinkingLevel,
+				availableThemes,
+				providers: [...new Set(this.ctx.session.getAvailableModels().map(model => model.provider))].sort((a, b) =>
+					a.localeCompare(b),
+				),
+				settings: createSettingsHost({
+					source: this.ctx.settings,
+				}),
+				plugins: createPluginSettingsHost(getProjectDir()),
+				model: this.ctx.session.model,
+				imageBudget: this.ctx.ui.imageBudget,
+				requestRender: () => this.ctx.ui.requestRender(),
+				composerPreviewStatus: this.ctx.statusLine,
+			},
+			{
+				onChange: (id, value) => this.handleSettingChange(id, value),
+				onThemePreview: async themeName => {
+					const result = await previewTheme(themeName);
+					if (result.success) {
+						this.ctx.statusLine.invalidate();
+						this.ctx.ui.invalidate();
+						this.ctx.ui.requestRender();
+					}
 				},
-				{
-					onChange: (id, value) => this.handleSettingChange(id, value),
-					onThemePreview: async themeName => {
-						const result = await previewTheme(themeName);
-						if (result.success) {
-							this.ctx.statusLine.invalidate();
-							this.ctx.ui.invalidate();
-							this.ctx.ui.requestRender();
-						}
-					},
-					onStatusLinePreview: previewSettings => {
-						// Update status line with preview settings
-						this.ctx.statusLine.updateSettings({
-							preset: settings.get("statusLine.preset"),
-							leftSegments: settings.get("statusLine.leftSegments"),
-							rightSegments: settings.get("statusLine.rightSegments"),
-							separator: settings.get("statusLine.separator"),
-							showHookStatus: settings.get("statusLine.showHookStatus"),
-							sessionAccent: settings.get("statusLine.sessionAccent"),
-							transparent: settings.get("statusLine.transparent"),
-							compactThinkingLevel: settings.get("statusLine.compactThinkingLevel"),
-							contextLine: settings.get("statusLine.contextLine"),
-							...previewSettings,
-						});
-						this.ctx.ui.requestRender();
-					},
-					getStatusLinePreview: () => {
-						// The bar exactly as the active composer shape renders it (box top
-						// border, claude rule + chip, or the plain standalone bottom bar).
-						const availableWidth = this.ctx.editor.getTopBorderAvailableWidth(this.ctx.ui.terminal.columns);
-						return this.ctx.statusLine.getPreviewLines(availableWidth).join("\n");
-					},
-					onPluginsChanged: async () => {
-						const projectPath = await resolveActiveProjectRegistryPath(this.ctx.sessionManager.getCwd());
-						clearPluginRootsAndCaches(projectPath ? [projectPath] : undefined);
-						await this.ctx.refreshSkillState();
-						await this.ctx.refreshSlashCommandState();
-						resetCapabilities();
-						this.ctx.ui.requestRender();
-					},
-					onCancel: () => {
-						done();
-						// Restore status line to saved settings
-						this.ctx.statusLine.updateSettings({
-							preset: settings.get("statusLine.preset"),
-							leftSegments: settings.get("statusLine.leftSegments"),
-							rightSegments: settings.get("statusLine.rightSegments"),
-							separator: settings.get("statusLine.separator"),
-							showHookStatus: settings.get("statusLine.showHookStatus"),
-							sessionAccent: settings.get("statusLine.sessionAccent"),
-							transparent: settings.get("statusLine.transparent"),
-							compactThinkingLevel: settings.get("statusLine.compactThinkingLevel"),
-							contextLine: settings.get("statusLine.contextLine"),
-						});
-						this.ctx.ui.requestRender();
-					},
+				onStatusLinePreview: previewSettings => {
+					this.ctx.statusLine.updateSettings({
+						preset: this.ctx.settings.get("statusLine.preset"),
+						leftSegments: this.ctx.settings.get("statusLine.leftSegments"),
+						rightSegments: this.ctx.settings.get("statusLine.rightSegments"),
+						separator: this.ctx.settings.get("statusLine.separator"),
+						showHookStatus: this.ctx.settings.get("statusLine.showHookStatus"),
+						sessionAccent: this.ctx.settings.get("statusLine.sessionAccent"),
+						transparent: this.ctx.settings.get("statusLine.transparent"),
+						compactThinkingLevel: this.ctx.settings.get("statusLine.compactThinkingLevel"),
+						contextLine: this.ctx.settings.get("statusLine.contextLine"),
+						...previewSettings,
+					});
+					this.ctx.ui.requestRender();
 				},
-			);
-			const overlayHandle = this.#showFullscreenMenu(selector);
-		});
+				getStatusLinePreview: () => {
+					const availableWidth = this.ctx.editor.getTopBorderAvailableWidth(this.ctx.ui.terminal.columns);
+					return this.ctx.statusLine.getPreviewLines(availableWidth).join("\n");
+				},
+				onPluginsChanged: async () => {
+					const projectPath = await resolveActiveProjectRegistryPath(this.ctx.sessionManager.getCwd());
+					clearPluginRootsAndCaches(projectPath ? [projectPath] : undefined);
+					await this.ctx.refreshSkillState();
+					await this.ctx.refreshSlashCommandState();
+					resetCapabilities();
+					this.ctx.ui.requestRender();
+				},
+				onProfilesSelected: () => {
+					void mountProfiles();
+				},
+				onCancel: done,
+			},
+			{
+				initialTab: requestedTab,
+				profiles: new Text(theme.fg("muted", "Loading profiles…"), 1, 0),
+			},
+		);
+		settingsOverlay.selector = selector;
+		const overlayHandle = this.#showFullscreenMenu(selector);
+		settingsOverlay.handle = overlayHandle;
+		this.#settingsSelector = selector;
+		this.#closeSettingsOverlay = done;
+		this.#mountProfilesContent = mountProfiles;
+		if (profilesRequested || requestedTab === "profiles") await mountProfiles();
 	}
 
 	/**
@@ -558,7 +637,7 @@ export class SelectorController {
 	 * Fullscreen agents hub on the alternate screen (the /models idiom): scope
 	 * sidebar, agent rows, and chip strips that dive into the model browser.
 	 */
-	async showAgentsDashboard(): Promise<void> {
+	async showAgentsDashboard(options: AgentsDashboardHostOptions = {}): Promise<() => void> {
 		const activeModel = this.ctx.session.model;
 		const activeModelPattern = activeModel ? `${activeModel.provider}/${activeModel.id}` : undefined;
 		const defaultModelPattern = this.ctx.settings.getModelRole("default");
@@ -567,9 +646,12 @@ export class SelectorController {
 			if (closed) return;
 			closed = true;
 			hub?.dispose();
-			overlayHandle?.hide();
-			this.focusActiveEditorArea();
-			this.ctx.ui.requestRender();
+			overlayHandle.hide();
+			if (options.onDone) options.onDone();
+			else {
+				this.focusActiveEditorArea();
+				this.ctx.ui.requestRender();
+			}
 		};
 		const hub = await AgentsHubComponent.create(
 			this.ctx.ui,
@@ -581,9 +663,15 @@ export class SelectorController {
 				activeModelPattern,
 				defaultModelPattern,
 			),
-			{ onCancel: () => done() },
+			{ onCancel: done },
 		);
+		if (options.isCancelled?.()) {
+			closed = true;
+			hub.dispose();
+			return () => {};
+		}
 		const overlayHandle = this.#showFullscreenMenu(hub);
+		return done;
 	}
 
 	/**
@@ -1049,29 +1137,37 @@ export class SelectorController {
 	/**
 	 * Fullscreen model hub on the alternate screen (the /settings idiom): the
 	 * overlay enables mouse tracking for its lifetime and the transcript stays
-	 * untouched underneath. `initialProviderId` preselects a provider's sidebar
-	 * entry — used when reopening the hub after a /login round-trip.
+	 * untouched underneath. Provider and focused-role entry points share the
+	 * same live mutation callbacks unless an isolated role destination is supplied.
 	 */
-	#showModelHub(hubOptions: { initialProviderId?: string }): void {
+	#showModelHub(hubOptions: ModelHubHostOptions): () => void {
 		const { ModelHubComponent } = loadModelOverlayComponents();
 		let closed = false;
-		const done = () => {
-			// Re-entrant guard: cancel paths (Esc, login forward) may race;
-			// the overlay must hide exactly once.
-			if (closed) return;
+		const closeOverlay = (): boolean => {
+			if (closed) return false;
 			closed = true;
 			hub?.dispose();
 			overlayHandle?.hide();
-			this.focusActiveEditorArea();
-			this.ctx.ui.requestRender();
+			return true;
+		};
+		const done = () => {
+			if (!closeOverlay()) return;
+			if (hubOptions.onDone) hubOptions.onDone();
+			else {
+				this.focusActiveEditorArea();
+				this.ctx.ui.requestRender();
+			}
 		};
 		const hub = new ModelHubComponent(
 			this.ctx.ui,
-			createModelBrowserSource(this.ctx.settings),
+			hubOptions.source ?? createModelBrowserSource(this.ctx.settings),
 			this.ctx.session.modelRegistry,
 			this.ctx.session.scopedModels,
 			{
 				onAssign: async (model, role, thinkingLevel, selector, scope?: ModelRoleSelectionScope) => {
+					if (hubOptions.roleCallbacks) {
+						return hubOptions.roleCallbacks.onAssign(model, role, thinkingLevel, selector, scope);
+					}
 					const releaseDefaultMutation = role === "default" ? await this.#acquireDefaultRoleMutation() : undefined;
 					const configuredStorage = this.ctx.settings.get("modelRoleStorage");
 					const targetScope = configuredStorage === "project" ? (scope ?? "project") : "global";
@@ -1158,6 +1254,7 @@ export class SelectorController {
 					}
 				},
 				onUnassign: async (role, scope?: ModelRoleSelectionScope) => {
+					if (hubOptions.roleCallbacks) return hubOptions.roleCallbacks.onUnassign(role, scope);
 					const releaseDefaultMutation = role === "default" ? await this.#acquireDefaultRoleMutation() : undefined;
 					const configuredStorage = this.ctx.settings.get("modelRoleStorage");
 					const targetScope = configuredStorage === "project" ? (scope ?? "project") : "global";
@@ -1229,61 +1326,83 @@ export class SelectorController {
 								}
 							}
 						}
+						return true;
 					} catch (error) {
 						this.ctx.showError(error instanceof Error ? error.message : String(error));
+						return false;
 					} finally {
 						releaseDefaultMutation?.();
 						hub?.refreshAfterExternalMutation();
 					}
 				},
-				onFallbackChainChange: (role, chain) => {
-					try {
-						const chains = { ...this.ctx.settings.get("retry.fallbackChains") };
-						if (chain.length === 0) {
-							delete chains[role];
-						} else {
-							chains[role] = chain;
-						}
-						this.ctx.settings.set("retry.fallbackChains", chains);
-						const roleInfo = getRoleInfo(role, settings);
-						this.ctx.showStatus(
-							chain.length > 0
-								? `${roleInfo?.tag ?? roleInfo?.name ?? role} fallbacks: ${chain.join(" → ")}`
-								: `${roleInfo?.tag ?? roleInfo?.name ?? role} fallbacks cleared`,
-						);
-					} catch (error) {
-						this.ctx.showError(error instanceof Error ? error.message : String(error));
-					}
-				},
+				onFallbackChainChange: hubOptions.roleCallbacks
+					? undefined
+					: (role, chain) => {
+							try {
+								const chains = { ...this.ctx.settings.get("retry.fallbackChains") };
+								if (chain.length === 0) {
+									delete chains[role];
+								} else {
+									chains[role] = chain;
+								}
+								this.ctx.settings.set("retry.fallbackChains", chains);
+								const roleInfo = getRoleInfo(role, settings);
+								this.ctx.showStatus(
+									chain.length > 0
+										? `${roleInfo?.tag ?? roleInfo?.name ?? role} fallbacks: ${chain.join(" → ")}`
+										: `${roleInfo?.tag ?? roleInfo?.name ?? role} fallbacks cleared`,
+								);
+							} catch (error) {
+								this.ctx.showError(error instanceof Error ? error.message : String(error));
+							}
+						},
 
-				onLoginRequest: providerId => {
-					done();
-					void this.#loginThenReopenModelHub(providerId);
-				},
-				onCycleOrderChange: order => {
-					try {
-						this.ctx.settings.set("cycleOrder", order);
-						this.ctx.showStatus(
-							order.length > 0 ? `Quick-switch cycle: ${order.join(" → ")}` : "Quick-switch cycle cleared",
-						);
-					} catch (error) {
-						this.ctx.showError(error instanceof Error ? error.message : String(error));
-					}
-				},
+				onLoginRequest: hubOptions.initialAssignRole
+					? undefined
+					: providerId => {
+							if (hubOptions.onDone) {
+								if (!closeOverlay()) return;
+								void this.#loginThenReopenModelHub(providerId, hubOptions);
+							} else {
+								done();
+								void this.#loginThenReopenModelHub(providerId);
+							}
+						},
+				onCycleOrderChange: hubOptions.roleCallbacks
+					? undefined
+					: order => {
+							try {
+								this.ctx.settings.set("cycleOrder", order);
+								this.ctx.showStatus(
+									order.length > 0 ? `Quick-switch cycle: ${order.join(" → ")}` : "Quick-switch cycle cleared",
+								);
+							} catch (error) {
+								this.ctx.showError(error instanceof Error ? error.message : String(error));
+							}
+						},
 				onCancel: () => done(),
 			},
 			{
 				initialProviderId: hubOptions.initialProviderId,
+				initialAssignRole: hubOptions.initialAssignRole,
 			},
 		);
 		const overlayHandle = this.#showFullscreenMenu(hub);
+		hubOptions.setClose?.(done);
+		return done;
 	}
 
 	/** /login round-trip for a locked provider; reopen the hub on that provider only after a successful login. */
-	async #loginThenReopenModelHub(providerId: string): Promise<void> {
+	async #loginThenReopenModelHub(
+		providerId: string,
+		hostOptions?: Pick<ModelHubHostOptions, "isCancelled" | "onDone" | "setClose">,
+	): Promise<void> {
 		const succeeded = await this.#handleOAuthLogin(providerId);
+		if (hostOptions?.isCancelled?.()) return;
 		if (succeeded) {
-			this.#showModelHub({ initialProviderId: providerId });
+			this.#showModelHub({ initialProviderId: providerId, ...hostOptions });
+		} else {
+			hostOptions?.onDone?.();
 		}
 	}
 

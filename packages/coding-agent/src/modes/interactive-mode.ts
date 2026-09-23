@@ -113,6 +113,7 @@ import planFilenamePrompt from "../prompts/system/plan-filename.md" with { type:
 import planModeApprovedPrompt from "../prompts/system/plan-mode-approved.md" with { type: "text" };
 import planModeCompactInstructionsPrompt from "../prompts/system/plan-mode-compact-instructions.md" with { type: "text" };
 import type { AgentHubRegistry } from "@oh-my-pi/pi-tui/overlays/agent-hub-types";
+import type { SettingsNavigationTab } from "@oh-my-pi/pi-tui/overlays/settings-selector";
 import { formatCost } from "@oh-my-pi/pi-tui/overlays/agent-hub-renderer";
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import {
@@ -1596,6 +1597,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			beginDispose: () => this.session.beginDispose(),
 			saveDraft: text => this.sessionManager.saveDraft(text),
 			disposeSession: async reason => {
+				this.#selectorController.closeSettingsSelector();
 				await this.#btwController.dispose();
 				await this.session.dispose({
 					mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS,
@@ -6568,6 +6570,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		await this.#commandController.handleClearCommand();
 	}
 
+	async startNewSession(label: string): Promise<boolean> {
+		if (this.#vibeSessionTransitionBlocked()) return false;
+		await this.prepareSessionSwitch();
+		return this.#commandController.startNewSession(label);
+	}
+
 	handleFreshCommand(): Promise<void> {
 		return this.#commandController.handleFreshCommand();
 	}
@@ -6802,8 +6810,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	// Selector handling
-	showSettingsSelector(): void {
-		this.#selectorController.showSettingsSelector();
+	showSettingsSelector(initialTab?: SettingsNavigationTab): Promise<void> {
+		return this.#selectorController.showSettingsSelector(initialTab);
 	}
 
 	showUsageDashboard(reports: UsageReport[]): void {
@@ -6882,8 +6890,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		await runProviderSetupWizard(this);
 	}
 
-	showHookConfirm(title: string, message: string): Promise<boolean> {
-		return this.#extensionUiController.showHookConfirm(title, message);
+	showHookConfirm(title: string, message: string, dialogOptions?: ExtensionUIDialogOptions): Promise<boolean> {
+		return this.#extensionUiController.showHookConfirm(title, message, dialogOptions);
 	}
 
 	// Input handling
@@ -7164,8 +7172,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#extensionUiController.hideHookSelector();
 	}
 
-	showHookInput(title: string, placeholder?: string): Promise<string | undefined> {
-		return this.#extensionUiController.showHookInput(title, placeholder);
+	showHookInput(
+		title: string,
+		placeholder?: string,
+		dialogOptions?: ExtensionUIDialogOptions,
+	): Promise<string | undefined> {
+		return this.#extensionUiController.showHookInput(title, placeholder, dialogOptions);
 	}
 
 	hideHookInput(): void {

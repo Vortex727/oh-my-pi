@@ -5,6 +5,9 @@
 ### Added
 
 - Added a fullscreen annotation overlay for diffs and text, with multi-line notes, editing, deletion, and undo ([#12601](https://github.com/can1357/oh-my-pi/pull/12601) by [@anatoli-tsinovoy](https://github.com/anatoli-tsinovoy))
+- Added a composed settings surface that hosts embedded tabs such as Profiles, native section-sidebar row helpers, and a focused single-role model-hub editor ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727))
+- Exported the model browser's context, cost, intelligence, and measured-performance formatters for reuse ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727))
+- Added `SettingsSelectorComponent.clearSearch()` so embedded editors can reveal errors hidden by a search filter ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727))
 
 ### Changed
 

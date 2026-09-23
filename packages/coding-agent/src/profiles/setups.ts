@@ -5,7 +5,7 @@
  * version of omp cannot own are skipped with a warning instead of rejecting the
  * whole file, so setups survive setting renames and removals across upgrades.
  */
-import type { Stats } from "node:fs";
+import type { BigIntStats, Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { formatModelSelectorValue } from "@oh-my-pi/pi-tui/overlays/model-selector";
@@ -18,8 +18,15 @@ import {
 	LEGACY_MODEL_ROLE_ALIAS_PREFIX,
 	MODEL_ROLE_ALIAS_PREFIX,
 } from "../config/model-roles";
-import { getUi, isCredential, isMachineLocal, SETTINGS_SCHEMA, type SettingPath } from "../config/settings-schema";
-import { replaceFileAtomically } from "../utils/atomic-file";
+import {
+	getUi,
+	isCredential,
+	isMachineLocal,
+	isSafetySensitive,
+	SETTINGS_SCHEMA,
+	type SettingPath,
+} from "../config/settings-schema";
+import { createFileAtomically, replaceFileAtomically } from "../utils/atomic-file";
 import {
 	type ModelRoleAssignments,
 	PROFILE_EMOJIS,
@@ -43,10 +50,16 @@ const WINDOWS_RESERVED_BASENAME_RE = /^(?:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(?:\
 const PROTOTYPE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 const PROFILE_EMOJI_SET = new Set<string>(PROFILE_EMOJIS.map(option => option.emoji));
 const GROUP_ORDER = new Map<string, number>(PROFILE_SETTINGS_GROUPS.map((group, index) => [group.id, index]));
-/** Structured settings a setup may own; every other setup setting is a boolean, number, or enum. */
-const STRUCTURED_SETUP_PATHS: Partial<Record<SettingPath, true>> = {
+/** Per-agent task settings; they have no Settings tab, so they group under Agents & tasks. */
+const AGENT_TASK_PATHS: Partial<Record<SettingPath, true>> = {
 	"task.disabledAgents": true,
 	"task.agentModelOverrides": true,
+	"task.agentPrewalk": true,
+	"task.agentAdvisor": true,
+};
+/** Structured settings a setup may own; every other setup setting is a boolean, number, or enum. */
+const STRUCTURED_SETUP_PATHS: Partial<Record<SettingPath, true>> = {
+	...AGENT_TASK_PATHS,
 	"retry.fallbackChains": true,
 };
 
@@ -76,6 +89,14 @@ export interface LoadedSetup extends ProfileDraft {
 	path: string;
 	/** Entries skipped while loading, each naming the setting and why. */
 	warnings: string[];
+}
+
+/** A profile read from an exported file or the clipboard. */
+export interface ImportedProfile extends ProfileDraft {
+	/** Entries this version of omp cannot load, each naming the setting and why. */
+	warnings: string[];
+	/** Safety-sensitive settings the shared text set; an import never carries them. */
+	withheld: SettingPath[];
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -113,7 +134,7 @@ function setupFilePath(name: string, agentDir: string): string {
 // ─── Setting ownership ───────────────────────────────────────────────────────
 
 function settingGroup(settingPath: SettingPath): ProfileSettingsGroup | undefined {
-	if (settingPath === "task.disabledAgents" || settingPath === "task.agentModelOverrides") return "tasks";
+	if (Object.hasOwn(AGENT_TASK_PATHS, settingPath)) return "tasks";
 	const tab = getUi(settingPath)?.tab;
 	return tab !== undefined && GROUP_ORDER.has(tab) ? (tab as ProfileSettingsGroup) : undefined;
 }
@@ -137,6 +158,12 @@ const SETUP_BRANCHES = new Set<string>(
 		return segments.slice(1).map((_, index) => segments.slice(0, index + 1).join("."));
 	}),
 );
+/**
+ * Setup settings that loosen approvals or secret redaction, or hand over the
+ * user's real browser, desktop, or code execution. Saved profiles may hold
+ * them; exports and imports never carry them.
+ */
+const SAFETY_SENSITIVE_SETUP_PATHS = SETUP_SETTING_PATHS.filter(isSafetySensitive);
 
 /** Settings a setup includes when `group` is enabled. */
 export function getSetupGroupPaths(group: ProfileSettingsGroup): SettingPath[] {
@@ -165,6 +192,16 @@ function validSettingValue(settingPath: SettingPath, value: unknown): unknown {
 				if (selector === null || typeof selector === "string") overrides[agent] = selector;
 				else if (isStringArray(selector)) overrides[agent] = [...selector];
 				else return undefined;
+			}
+			return overrides;
+		}
+		case "task.agentPrewalk":
+		case "task.agentAdvisor": {
+			if (!isPlainRecord(value)) return undefined;
+			const overrides: Record<string, string | null> = {};
+			for (const [agent, setting] of Object.entries(value)) {
+				if (PROTOTYPE_KEYS.has(agent) || (setting !== null && typeof setting !== "string")) return undefined;
+				overrides[agent] = setting;
 			}
 			return overrides;
 		}
@@ -390,16 +427,6 @@ export function modelsOnlyDraft(draft: ProfileDraft): ProfileDraft {
 	return { metadata: { ...draft.metadata, enabledGroups: [] }, config: { modelRoles: draftModelRoles(draft) } };
 }
 
-/** Flatten a setup's settings into path-keyed overrides for a read-only preview `Settings`. */
-export function setupOverrides(draft: ProfileDraft): Partial<Record<SettingPath, unknown>> {
-	const overrides: Partial<Record<SettingPath, unknown>> = { modelRoles: draftModelRoles(draft) };
-	for (const settingPath of SETUP_SETTING_PATHS) {
-		const found = readConfigPath(draft.config, settingPath);
-		if (found.present) overrides[settingPath] = found.value;
-	}
-	return overrides;
-}
-
 /**
  * Start a models-only draft from the effective configuration. When the live
  * session's model is supplied, it becomes the saved default together with its
@@ -553,14 +580,7 @@ export async function saveSetup(
 	if (options.overwrite) {
 		await replaceSetupFile(filePath, content);
 	} else {
-		try {
-			await fs.writeFile(filePath, content, { flag: "wx" });
-		} catch (error) {
-			if (isEexist(error)) {
-				throw new SetupError("exists", `A profile named "${normalized}" already exists`, { cause: error });
-			}
-			throw error;
-		}
+		await createSetupFile(filePath, content, normalized);
 	}
 	return { name: normalized, updatedAt: Date.now(), metadata: draft.metadata };
 }
@@ -605,26 +625,42 @@ export async function renameSavedSetup(
 	if (from === to) return to;
 	const fromPath = setupFilePath(from, agentDir);
 	const toPath = setupFilePath(to, agentDir);
-	if (from.toLowerCase() === to.toLowerCase()) {
-		// Same file on case-insensitive filesystems: an in-place rename changes only the case.
-		await fs.rename(fromPath, toPath);
-		return to;
-	}
-	let content: string;
+	let source: BigIntStats;
 	try {
-		content = await Bun.file(fromPath).text();
+		source = await fs.stat(fromPath, { bigint: true });
 	} catch (error) {
 		if (isEnoent(error)) throw new SetupError("not-found", `Profile "${from}" was not found`, { cause: error });
 		throw error;
 	}
-	try {
-		await fs.writeFile(toPath, content, { flag: "wx" });
-	} catch (error) {
-		if (isEexist(error)) throw new SetupError("exists", `A profile named "${to}" already exists`, { cause: error });
-		throw error;
+	if (await resolvesToFile(toPath, source)) {
+		// A case-insensitive filesystem resolves both names to this file: renaming in place changes only the case.
+		await fs.rename(fromPath, toPath);
+		return to;
 	}
+	await createSetupFile(toPath, await Bun.file(fromPath).text(), to);
 	await fs.rm(fromPath);
 	return to;
+}
+
+/** Whether `candidate` names the file `source` describes, as case variants do on case-insensitive filesystems. */
+async function resolvesToFile(candidate: string, source: BigIntStats): Promise<boolean> {
+	try {
+		const target = await fs.stat(candidate, { bigint: true });
+		return target.dev === source.dev && target.ino === source.ino;
+	} catch (error) {
+		if (isEnoent(error)) return false;
+		throw error;
+	}
+}
+
+/** Create a setup file that must not exist yet; nothing partial is ever visible under `filePath`. */
+async function createSetupFile(filePath: string, content: string, name: string): Promise<void> {
+	try {
+		await createFileAtomically(filePath, content);
+	} catch (error) {
+		if (isEexist(error)) throw new SetupError("exists", `A profile named "${name}" already exists`, { cause: error });
+		throw error;
+	}
 }
 
 /** Delete one saved setup file. Live settings and other setups are untouched. */
@@ -641,18 +677,32 @@ export async function deleteSavedSetup(name: string, agentDir: string = getAgent
 // ─── Sharing ─────────────────────────────────────────────────────────────────
 // An exported profile is the same document as a saved one, so imports follow
 // the same tolerant rules: entries this version cannot load are skipped and named.
+// Safety-sensitive settings never travel: exports leave them out, imports withhold them.
+
+/** Safety-sensitive settings `draft` sets. */
+export function safetySensitivePaths(draft: ProfileDraft): SettingPath[] {
+	return SAFETY_SENSITIVE_SETUP_PATHS.filter(settingPath => readConfigPath(draft.config, settingPath).present);
+}
+
+/** `draft` without its safety-sensitive settings: the form an export shares. */
+export function shareableDraft(draft: ProfileDraft): { draft: ProfileDraft; withheld: SettingPath[] } {
+	const withheld = safetySensitivePaths(draft);
+	if (withheld.length === 0) return { draft, withheld };
+	const config = structuredClone(draft.config);
+	for (const settingPath of withheld) deleteConfigPath(config, settingPath);
+	return { draft: { metadata: draft.metadata, config }, withheld };
+}
 
 /** Parse profile text from an exported file or the clipboard. */
-export function parseProfileText(text: string): ProfileDraft & { warnings: string[] } {
+export function parseProfileText(text: string): ImportedProfile {
 	if (Buffer.byteLength(text) > MAX_SETUP_BYTES) throw new SetupError("too-large", "The profile is larger than 1 MiB");
-	return parseSetupDocument(parseYamlDocument(text, "The profile"));
+	const { warnings, ...parsed } = parseSetupDocument(parseYamlDocument(text, "The profile"));
+	const shared = shareableDraft(parsed);
+	return { ...shared.draft, warnings, withheld: shared.withheld };
 }
 
 /** Read an exported profile file. `label` names the file in errors (default: its path). */
-export async function readProfileFile(
-	filePath: string,
-	label: string = filePath,
-): Promise<ProfileDraft & { warnings: string[] }> {
+export async function readProfileFile(filePath: string, label: string = filePath): Promise<ImportedProfile> {
 	let stats: Stats;
 	try {
 		stats = await fs.stat(filePath);

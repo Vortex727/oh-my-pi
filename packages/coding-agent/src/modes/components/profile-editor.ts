@@ -19,7 +19,7 @@ import {
 	type SettingsRuntimeContext,
 	type SettingsSelectorSection,
 } from "@oh-my-pi/pi-tui/overlays/settings-selector";
-import { type RawSettings, type Settings } from "../../config/settings";
+import type { Settings } from "../../config/settings";
 import { createSettingsHost } from "../../config/settings-ui";
 import {
 	draftModelRoles,
@@ -139,7 +139,8 @@ export interface ProfileEditorCallbacks {
 	requestRender(): void;
 	onEditRole(role: string, draft: ProfileDraft): Promise<ProfileDraft | undefined>;
 	onSave(draft: ProfileDraft, saveAsNew: boolean): void | Promise<void>;
-	onEditAgent(agent: string, draft: ProfileDraft): Promise<ProfileDraft | undefined>;
+	/** Edit the draft's agents in the agents hub, opened on `initialAgent`. Resolves the edited draft, or undefined. */
+	onEditAgents(draft: ProfileDraft, initialAgent?: string): Promise<ProfileDraft | undefined>;
 	onCancel(): void;
 	/**
 	 * Commit only the emoji of an existing saved profile. Resolves true once
@@ -307,16 +308,6 @@ export class ProfileEditorComponent implements Component {
 			this.#nested.handleInput?.(data);
 			return;
 		}
-		const selectedId = this.#selectedId;
-		if (
-			data === " " &&
-			!this.#selector.hasOpenSubmenu() &&
-			selectedId?.startsWith("agent:") &&
-			this.#draft.metadata.enabledGroups.includes("tasks")
-		) {
-			this.#toggleAgent(selectedId.slice("agent:".length));
-			return;
-		}
 		this.#selector.handleInput(data);
 	}
 
@@ -399,11 +390,11 @@ export class ProfileEditorComponent implements Component {
 						label: `Agent · ${cleanImportedLine(agent.name)}`,
 						currentValue: `${agent.disabled ? "Disabled" : "Enabled"} · ${selector}`,
 						description: enabled
-							? "Enter edits the model assignment; Space toggles availability in this draft."
+							? "Enter opens the agents hub on this draft to change models or availability."
 							: "Inherited from local configuration. Include Agents & tasks to edit.",
 						disabled: !enabled,
 						onActivate: () => {
-							void this.#editAgent(agent.name);
+							void this.#editAgents(agent.name);
 						},
 					});
 				}
@@ -496,22 +487,6 @@ export class ProfileEditorComponent implements Component {
 		if (this.#error) this.#selector.selectItem("editor:error");
 	}
 
-	#toggleAgent(agent: string): void {
-		const task =
-			this.#draft.config.task &&
-			typeof this.#draft.config.task === "object" &&
-			!Array.isArray(this.#draft.config.task)
-				? (this.#draft.config.task as RawSettings)
-				: {};
-		const disabled = Array.isArray(task.disabledAgents)
-			? task.disabledAgents.filter((name): name is string => typeof name === "string")
-			: [];
-		task.disabledAgents = disabled.includes(agent) ? disabled.filter(name => name !== agent) : [...disabled, agent];
-		this.#draft.config.task = task;
-		this.#error = undefined;
-		this.#refresh();
-	}
-
 	#openEmojiPicker(): void {
 		const picker = new ProfileEmojiPicker({
 			name: this.#name,
@@ -581,11 +556,11 @@ export class ProfileEditorComponent implements Component {
 		}
 	}
 
-	async #editAgent(agent: string): Promise<void> {
+	async #editAgents(agent: string): Promise<void> {
 		if (this.#busy) return;
 		this.#busy = true;
 		try {
-			const next = await this.#callbacks.onEditAgent(agent, structuredClone(this.#draft));
+			const next = await this.#callbacks.onEditAgents(structuredClone(this.#draft), agent);
 			if (!next) return;
 			this.#draft = structuredClone(next);
 			this.#error = undefined;

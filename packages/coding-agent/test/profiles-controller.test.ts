@@ -6,6 +6,7 @@ import { stripVTControlCharacters } from "node:util";
 import { AuthStorage, SqliteAuthCredentialStore, type UsageReport } from "@oh-my-pi/pi-ai";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { SettingPath } from "@oh-my-pi/pi-coding-agent/config/settings-schema";
 import type { ProfileDashboard } from "@oh-my-pi/pi-coding-agent/modes/components/profile-dashboard";
 import type { ProfileEditorComponent } from "@oh-my-pi/pi-coding-agent/modes/components/profile-editor";
 import { ProfilesController, type ProfilesHost } from "@oh-my-pi/pi-coding-agent/modes/controllers/profiles-controller";
@@ -14,7 +15,8 @@ import { parseProfileText, saveSetup } from "@oh-my-pi/pi-coding-agent/profiles/
 import { PROFILE_EMOJIS } from "@oh-my-pi/pi-coding-agent/profiles/types";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import * as clipboard from "@oh-my-pi/pi-coding-agent/utils/clipboard";
-import type { Component, OverlayHandle } from "@oh-my-pi/pi-tui";
+import type { Component, OverlayHandle, TUI } from "@oh-my-pi/pi-tui";
+import { AgentsHubComponent } from "@oh-my-pi/pi-tui/overlays/agents-hub";
 import type { SettingsSelectorComponent } from "@oh-my-pi/pi-tui/overlays/settings-selector";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { setAgentDir, setProjectDir, TempDir } from "@oh-my-pi/pi-utils";
@@ -52,6 +54,21 @@ const FOCUS_WITH_FUTURE_ENTRY = [
 	"  flag: true",
 	"",
 ].join("\n");
+/** The saved `focus` profile plus a safety setting; imports and exports never carry it. */
+const FOCUS_WITH_SAFETY_SETTING = [
+	"$setup:",
+	"  version: 1",
+	"  enabledGroups: [context]",
+	"modelRoles:",
+	"  smol: anthropic/claude-haiku-4-5",
+	"compaction:",
+	"  enabled: true",
+	"tools:",
+	"  approvalMode: yolo",
+	"",
+].join("\n");
+/** Narrow TUI stub: the agents hub only reads terminal rows and requests renders. */
+const TUI_STUB = { requestRender: () => {}, terminal: { rows: 30 } } as unknown as TUI;
 
 interface DialogOptions {
 	signal?: AbortSignal;
@@ -142,11 +159,15 @@ describe("ProfilesController", () => {
 		const refreshed = Promise.withResolvers<void>();
 		const inputs: Array<string | undefined> = [];
 		const prompts: string[] = [];
+		const confirmTitles: string[] = [];
 		const editors = signalQueue<ProfileEditorComponent>();
 		let editorsOpened = 0;
 		const settingsShown = signalQueue<void>();
 		const rendered = signalQueue<void>();
+		const hubs = signalQueue<{ hub: AgentsHubComponent; initialAgent: string | undefined }>();
 		const startNewSession = vi.fn(async (_label: string) => true);
+		const showWarning = vi.fn((_message: string) => {});
+		const applySettingEffects = vi.fn((_paths: readonly SettingPath[]) => {});
 		const ctx = {
 			settings,
 			session: {
@@ -164,11 +185,12 @@ describe("ProfilesController", () => {
 			sessionManager: { getCwd: () => projectDir },
 			ui: { requestRender: () => rendered.fire(), setFocus: () => {}, terminal: { rows: 40 } },
 			statusLine: {},
-			showWarning: () => {},
+			showWarning,
 			startNewSession,
 			showHookSelector: (_title: string, _items: unknown, options?: DialogOptions) =>
 				dialog(choices.length > 0 ? Promise.resolve(choices.shift()) : choice.promise, undefined, options?.signal),
-			showHookConfirm: (_title: string, message: string, options?: DialogOptions) => {
+			showHookConfirm: (title: string, message: string, options?: DialogOptions) => {
+				confirmTitles.push(title);
 				const promise = dialog(confirm.promise, false, options?.signal);
 				confirmShown.resolve({ promise, signal: options?.signal, message });
 				return promise;
@@ -185,8 +207,20 @@ describe("ProfilesController", () => {
 				return { hide: () => {}, setHidden: () => {} } as unknown as OverlayHandle;
 			},
 			showModelHub: () => () => {},
-			showAgentsDashboard: async () => () => {},
+			showAgentsDashboard: async options => {
+				if (!options.deps) throw new Error("Only the profile draft's agents hub is under test");
+				const done = () => options.onDone?.();
+				const hub = await AgentsHubComponent.create(
+					TUI_STUB,
+					options.deps,
+					{ onCancel: done },
+					{ title: options.title, initialAgent: options.initialAgent },
+				);
+				hubs.fire({ hub, initialAgent: options.initialAgent });
+				return done;
+			},
 			acquireDefaultRoleMutation: async () => () => {},
+			applySettingEffects,
 		};
 		const controller = new ProfilesController(ctx, host);
 		let dashboard: ProfileDashboard | undefined;
@@ -216,10 +250,14 @@ describe("ProfilesController", () => {
 			refreshed: refreshed.promise,
 			inputs,
 			prompts,
+			confirmTitles,
 			nextEditor: editors.next,
 			editorsOpened: () => editorsOpened,
 			nextSettingsShown: settingsShown.next,
 			startNewSession,
+			showWarning,
+			applySettingEffects,
+			nextHub: hubs.next,
 			closeSettings,
 			mount,
 			dashboard: () => dashboard!,
@@ -258,9 +296,12 @@ describe("ProfilesController", () => {
 		expect(h.settings.get("compaction.enabled")).toBe(true);
 		expect(h.settings.getModelRole("smol")).toBe("anthropic/claude-haiku-4-5");
 		expect(await Bun.file(configPath).bytes()).toEqual(configBytes);
+		// The layer's changes get the same live effects a Settings edit runs.
+		expect(h.applySettingEffects).toHaveBeenCalledTimes(1);
+		expect(h.applySettingEffects.mock.calls[0]![0]).toContain("compaction.enabled");
 	});
 
-	it("leaves the setup unapplied when a hook cancels the new session", async () => {
+	it("leaves the setup unapplied and says so when a hook cancels the new session", async () => {
 		const h = await harness();
 		const started = Promise.withResolvers<{ result: Promise<boolean> }>();
 		h.startNewSession.mockImplementation(() => {
@@ -276,6 +317,49 @@ describe("ProfilesController", () => {
 
 		expect(h.settings.get("compaction.enabled")).toBe(false);
 		expect(h.settings.getModelRole("smol")).toBeUndefined();
+		expect(h.applySettingEffects).not.toHaveBeenCalled();
+		// Settings closed before the session switch, so only a chat warning can reach the user.
+		expect(h.showWarning).toHaveBeenCalledTimes(1);
+		expect(h.showWarning.mock.calls[0]![0]).toContain("focus");
+	});
+
+	it("lists the safety settings a profile sets before starting a session with it", async () => {
+		await Bun.write(path.join(agentDir, "setups", "focus.yml"), FOCUS_WITH_SAFETY_SETTING);
+		const h = await harness();
+		h.loadFocus();
+		const shown = await h.confirmShown;
+		expect(shown.message).toContain("Tool Approval");
+		expect(shown.message).toContain("yolo");
+		h.confirm.resolve(false);
+		expect(await shown.promise).toBe(false);
+		expect(h.startNewSession).not.toHaveBeenCalled();
+	});
+
+	it("unloads a loaded profile, restoring config values with their live effects; Unload needs a loaded profile", async () => {
+		const configBytes = await Bun.file(configPath).bytes();
+		const h = await harness();
+		expect(h.screen()).not.toContain("u to unload profile");
+		h.dashboard().handleInput("u");
+		expect(h.confirmTitles).toEqual([]);
+
+		h.loadFocus();
+		h.confirm.resolve(true);
+		await h.refreshed;
+		await h.mount();
+		const loaded = h.screen().split("\n");
+		expect(loaded.find(line => line.includes("Active session"))).toContain("focus");
+		expect(loaded.join("\n")).toContain("u to unload profile");
+
+		h.applySettingEffects.mockClear();
+		const unloaded = h.nextSettingsShown();
+		h.dashboard().handleInput("u");
+		await unloaded;
+		expect(h.settings.get("compaction.enabled")).toBe(false);
+		expect(h.settings.getModelRole("smol")).toBeUndefined();
+		expect(h.applySettingEffects).toHaveBeenCalledTimes(1);
+		expect(h.applySettingEffects.mock.calls[0]![0]).toContain("compaction.enabled");
+		expect(h.screen()).not.toContain("u to unload profile");
+		expect(await Bun.file(configPath).bytes()).toEqual(configBytes);
 	});
 
 	it("closing Settings while a load dialog is pending aborts it without starting a session", async () => {
@@ -382,7 +466,25 @@ describe("ProfilesController", () => {
 			metadata: { version: 1, enabledGroups: [] },
 			config: { modelRoles: { smol: "anthropic/claude-haiku-4-5" } },
 			warnings: [],
+			withheld: [],
 		});
+	});
+
+	it("exports a whole profile without its safety settings and names what it left out", async () => {
+		await Bun.write(path.join(agentDir, "setups", "focus.yml"), FOCUS_WITH_SAFETY_SETTING);
+		const target = path.join(projectDir, "shared.yml");
+		const h = await harness();
+		h.choices.push("Whole profile", "Save to file");
+		h.inputs.push(target);
+		const done = h.nextSettingsShown();
+		h.dashboard().handleInput("\x1b[B");
+		h.dashboard().handleInput("x");
+		await done;
+
+		const exported = YAML.parse(await Bun.file(target).text()) as Record<string, Record<string, unknown>>;
+		expect(exported.compaction).toEqual({ enabled: true });
+		expect(exported.tools?.approvalMode).toBeUndefined();
+		expect(h.screen()).toContain("Tool Approval");
 	});
 
 	it("imports clipboard text into the editor when reviewing, flags skipped entries and unavailable models, and saves it new", async () => {
@@ -431,6 +533,68 @@ describe("ProfilesController", () => {
 		const rows = h.screen().split("\n");
 		expect(rows.some(row => row.includes("quick (New)"))).toBe(true);
 		expect(rows.some(row => row.includes("focus (New)"))).toBe(false);
+	});
+
+	it("imports without a shared profile's safety settings and names what it left out", async () => {
+		vi.spyOn(clipboard, "readTextFromClipboard").mockResolvedValue(FOCUS_WITH_SAFETY_SETTING);
+		const h = await harness();
+		h.choices.push("From clipboard", "No, save it now");
+		h.inputs.push("shared");
+		const done = h.nextSettingsShown();
+		h.dashboard().handleInput("i");
+		await done;
+
+		const stored = YAML.parse(await Bun.file(path.join(agentDir, "setups", "shared.yml")).text()) as Record<
+			string,
+			Record<string, unknown>
+		>;
+		expect(stored.compaction).toEqual({ enabled: true });
+		expect(stored.tools?.approvalMode).toBeUndefined();
+		expect(h.screen()).toContain("Tool Approval");
+	});
+
+	it("edits a draft's agents in the agents hub without touching live settings or offering agent creation", async () => {
+		await Bun.write(
+			path.join(agentDir, "setups", "focus.yml"),
+			[
+				"$setup:",
+				"  version: 1",
+				"  enabledGroups: [tasks]",
+				"task:",
+				"  agentModelOverrides:",
+				"    reviewer: anthropic/claude-haiku-4-5",
+				"",
+			].join("\n"),
+		);
+		const configBytes = await Bun.file(configPath).bytes();
+		const h = await harness();
+		const editorShown = h.nextEditor();
+		h.dashboard().handleInput("\x1b[B");
+		h.dashboard().handleInput("\r");
+		const editor = await editorShown;
+		for (const character of "reviewer") editor.handleInput(character);
+		const hubShown = h.nextHub();
+		editor.handleInput("\r");
+		const { hub, initialAgent } = await hubShown;
+		expect(initialAgent).toBe("reviewer");
+		expect(stripVTControlCharacters(hub.render(120).join("\n"))).not.toContain("New agent");
+
+		hub.handleInput(" "); // disable reviewer
+		hub.handleInput("\r"); // agent strip, model first
+		hub.handleInput("\r"); // model values: pick model…, pattern…, clear override
+		hub.handleInput("\x1b[C");
+		hub.handleInput("\x1b[C");
+		hub.handleInput("\r");
+		hub.handleInput("\x1b"); // leave the hub
+		const task = () =>
+			editor.draft.config.task as { disabledAgents?: string[]; agentModelOverrides?: Record<string, unknown> };
+		// A cleared override is stored as null (Automatic), which masks the user's own override once loaded.
+		await h.renderedUntil(() => task().agentModelOverrides?.reviewer === null);
+
+		expect(task().disabledAgents).toContain("reviewer");
+		expect(h.settings.get("task.disabledAgents")).not.toContain("reviewer");
+		expect(h.settings.get("task.agentModelOverrides")).toEqual({});
+		expect(await Bun.file(configPath).bytes()).toEqual(configBytes);
 	});
 
 	it("writes nothing when the review question is cancelled", async () => {

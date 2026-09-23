@@ -14,6 +14,7 @@ import {
 	saveSetup,
 	serializeSetup,
 	setDraftGroup,
+	shareableDraft,
 	writeProfileFile,
 } from "@oh-my-pi/pi-coding-agent/profiles/setups";
 import type { ProfileDraft } from "@oh-my-pi/pi-coding-agent/profiles/types";
@@ -34,6 +35,13 @@ async function expectSetupError(promise: Promise<unknown>, kind: SetupError["kin
 	expect(error).toBeInstanceOf(SetupError);
 	expect((error as SetupError).kind).toBe(kind);
 }
+
+/** Linux temp directories tell `probe` and `PROBE` apart; Windows and macOS defaults do not. */
+const caseSensitiveTemp = await (async () => {
+	using dir = TempDir.createSync("@omp-setups-case-probe-");
+	await Bun.write(dir.join("probe"), "");
+	return !(await Bun.file(dir.join("PROBE")).exists());
+})();
 
 describe("saved setups storage", () => {
 	it("round-trips a human-named setup through save, list, and load", async () => {
@@ -65,6 +73,8 @@ describe("saved setups storage", () => {
 			"exists",
 		);
 		expect((await loadSavedSetup("focus", dir.path())).config.modelRoles).toEqual({ default: "first/model" });
+		// A refused create leaves no staged copy behind.
+		expect(await fs.readdir(dir.join("setups"))).toEqual(["focus.yml"]);
 
 		await saveSetup("focus", draft({ modelRoles: { default: "second/model" } }), {
 			agentDir: dir.path(),
@@ -142,6 +152,19 @@ describe("saved setups storage", () => {
 		expect((await listSavedSetups(dir.path())).map(item => item.name)).toEqual(["Alpha", "beta"]);
 		expect((await fs.readdir(path.join(dir.path(), "setups"))).sort()).toEqual(["Alpha.yml", "beta.yml"]);
 	});
+
+	it.skipIf(!caseSensitiveTemp)(
+		"never lets a case-only rename replace a different setup on a case-sensitive filesystem",
+		async () => {
+			using dir = TempDir.createSync("@omp-setups-rename-case-");
+			await saveSetup("work", draft({ modelRoles: { default: "lower/model" } }), { agentDir: dir.path() });
+			await saveSetup("Work", draft({ modelRoles: { default: "upper/model" } }), { agentDir: dir.path() });
+
+			await expectSetupError(renameSavedSetup("work", "Work", dir.path()), "exists");
+			expect((await loadSavedSetup("Work", dir.path())).config.modelRoles).toEqual({ default: "upper/model" });
+			expect((await loadSavedSetup("work", dir.path())).config.modelRoles).toEqual({ default: "lower/model" });
+		},
+	);
 });
 
 describe("setup drafts", () => {
@@ -182,7 +205,12 @@ describe("profile sharing", () => {
 		config: {
 			modelRoles: { default: "anthropic/claude-sonnet-4-5:high", smol: null, task: "@default" },
 			compaction: { enabled: false },
-			task: { disabledAgents: ["reviewer"], agentModelOverrides: { scout: ["openai/gpt-5.4-mini", "@smol"] } },
+			task: {
+				disabledAgents: ["reviewer"],
+				agentModelOverrides: { scout: ["openai/gpt-5.4-mini", "@smol"], task: null },
+				agentPrewalk: { scout: "off" },
+				agentAdvisor: { task: null },
+			},
 		},
 	};
 
@@ -190,12 +218,13 @@ describe("profile sharing", () => {
 		using dir = TempDir.createSync("@omp-profile-share-");
 		const file = dir.join("focus.profile.yml");
 		await writeProfileFile(file, shared);
-		expect(await readProfileFile(file)).toEqual({ ...shared, warnings: [] });
+		expect(await readProfileFile(file)).toEqual({ ...shared, warnings: [], withheld: [] });
 
 		expect(parseProfileText(serializeSetup(modelsOnlyDraft(shared)))).toEqual({
 			metadata: { version: 1, emoji: "⚡", enabledGroups: [] },
 			config: { modelRoles: shared.config.modelRoles },
 			warnings: [],
+			withheld: [],
 		});
 	});
 
@@ -205,6 +234,25 @@ describe("profile sharing", () => {
 		await Bun.write(file, "keep me\n");
 		await expectSetupError(writeProfileFile(file, shared), "exists");
 		expect(await Bun.file(file).text()).toBe("keep me\n");
+	});
+
+	it("never carries safety-sensitive settings through an export or import, while a saved profile keeps them", async () => {
+		using dir = TempDir.createSync("@omp-profile-share-safety-");
+		const portable = { modelRoles: { default: "a/model" }, compaction: { enabled: false } };
+		const own = draft({ ...portable, tools: { approvalMode: "yolo" } }, ["context", "interaction"]);
+		await saveSetup("sandbox", own, { agentDir: dir.path() });
+		const saved = await loadSavedSetup("sandbox", dir.path());
+		expect(saved.config).toEqual(own.config);
+
+		const exported = shareableDraft(saved);
+		expect(exported.withheld).toEqual(["tools.approvalMode"]);
+		expect(parseProfileText(serializeSetup(exported.draft)).config).toEqual(portable);
+
+		// Text that still sets it, e.g. hand-edited, imports without it and says so.
+		const imported = parseProfileText(serializeSetup(own));
+		expect(imported.config).toEqual(portable);
+		expect(imported.withheld).toEqual(["tools.approvalMode"]);
+		expect(imported.warnings).toEqual([]);
 	});
 
 	it("imports a plain config.yml-style document without letting credentials or machine-local settings in", () => {

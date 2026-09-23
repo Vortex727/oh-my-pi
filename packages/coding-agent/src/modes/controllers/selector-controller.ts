@@ -27,7 +27,7 @@ import { formatLoginIdentity } from "../../cli/oauth-terminal";
 import { resolveAdvisorRoleSelection, resolveModelRoleValue } from "../../config/model-resolver";
 import { formatModelSelectorValue } from "@oh-my-pi/pi-tui/overlays/model-selector";
 import { getRoleInfo } from "../../config/model-roles";
-import { settings } from "../../config/settings";
+import { type SettingPath, settings } from "../../config/settings";
 import { createSettingsHost } from "../../config/settings-ui";
 import { createPluginSettingsHost } from "../../extensibility/plugins/settings-host";
 import type { disableProvider as DisableProvider, enableProvider as EnableProvider } from "../../discovery";
@@ -99,7 +99,7 @@ import { collapseSharedUsageReports } from "@oh-my-pi/pi-tui/overlays/usage-disp
 import { limitMatchesActiveAccount } from "../../slash-commands/helpers/active-oauth-account";
 import { AgentHubOverlayComponent } from "@oh-my-pi/pi-tui/overlays/agent-hub";
 import { createAgentHubRuntime } from "../agent-hub-runtime";
-import { AgentsHubComponent } from "@oh-my-pi/pi-tui/overlays/agents-hub";
+import { AgentsHubComponent, type AgentsHubDeps } from "@oh-my-pi/pi-tui/overlays/agents-hub";
 import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
 import { CopySelectorComponent } from "@oh-my-pi/pi-tui/overlays/copy-selector";
 import { ExtensionDashboard } from "@oh-my-pi/pi-tui/overlays/extensions/extension-dashboard";
@@ -151,6 +151,12 @@ export interface ModelHubHostOptions {
 }
 
 export interface AgentsDashboardHostOptions {
+	/** Hub dependencies; defaults to the live settings of this session. */
+	deps?: AgentsHubDeps;
+	/** Header label; defaults to "Agents". */
+	title?: string;
+	/** Agent whose row is selected on open. */
+	initialAgent?: string;
 	isCancelled?: () => boolean;
 	onDone?: () => void;
 }
@@ -203,6 +209,7 @@ export class SelectorController {
 			showModelHub: options => this.#showModelHub(options),
 			showAgentsDashboard: options => this.showAgentsDashboard(options),
 			acquireDefaultRoleMutation: () => this.#acquireDefaultRoleMutation(),
+			applySettingEffects: paths => this.applySettingEffects(paths),
 		});
 	}
 	#closeSettingsOverlay: (() => void) | undefined;
@@ -638,9 +645,6 @@ export class SelectorController {
 	 * sidebar, agent rows, and chip strips that dive into the model browser.
 	 */
 	async showAgentsDashboard(options: AgentsDashboardHostOptions = {}): Promise<() => void> {
-		const activeModel = this.ctx.session.model;
-		const activeModelPattern = activeModel ? `${activeModel.provider}/${activeModel.id}` : undefined;
-		const defaultModelPattern = this.ctx.settings.getModelRole("default");
 		let closed = false;
 		const done = () => {
 			if (closed) return;
@@ -655,15 +659,9 @@ export class SelectorController {
 		};
 		const hub = await AgentsHubComponent.create(
 			this.ctx.ui,
-			createAgentsHubDeps(
-				getProjectDir(),
-				this.ctx.settings,
-				this.ctx.session.modelRegistry,
-				() => this.ctx.session.effectiveExtensionRoots,
-				activeModelPattern,
-				defaultModelPattern,
-			),
+			options.deps ?? this.#liveAgentsHubDeps(),
 			{ onCancel: done },
+			{ title: options.title, initialAgent: options.initialAgent },
 		);
 		if (options.isCancelled?.()) {
 			closed = true;
@@ -674,10 +672,22 @@ export class SelectorController {
 		return done;
 	}
 
+	#liveAgentsHubDeps(): AgentsHubDeps {
+		const activeModel = this.ctx.session.model;
+		return createAgentsHubDeps(
+			getProjectDir(),
+			this.ctx.settings,
+			this.ctx.session.modelRegistry,
+			() => this.ctx.session.effectiveExtensionRoots,
+			activeModel ? `${activeModel.provider}/${activeModel.id}` : undefined,
+			this.ctx.settings.getModelRole("default"),
+		);
+	}
+
 	/**
-	 * Handle setting changes from the settings selector.
-	 * Most settings are saved directly via SettingsManager in the definitions.
-	 * This handles side effects and session-specific settings.
+	 * Handle setting changes from the settings selector. The selector already
+	 * saved schema settings; this applies their side effects and persists the
+	 * session-managed ones.
 	 */
 	handleSettingChange(id: string, value: unknown): void {
 		// Discovery provider toggles
@@ -691,12 +701,33 @@ export class SelectorController {
 			}
 			return;
 		}
+		this.#applySettingEffect(id, value, true);
+	}
 
+	/**
+	 * Apply the runtime side effects of `paths` at their current effective
+	 * values without persisting anything, e.g. after a profile replaced the
+	 * setup layer.
+	 */
+	applySettingEffects(paths: readonly SettingPath[]): void {
+		for (const path of paths) this.#applySettingEffect(path, this.ctx.settings.get(path), false);
+	}
+
+	/**
+	 * The one side-effect dispatch shared by settings-panel edits and setup-layer
+	 * changes. `persist` is false for the setup layer, which must never write
+	 * config or release a setup-owned path.
+	 */
+	#applySettingEffect(id: string, value: unknown, persist: boolean): void {
 		switch (id) {
-			// Session-managed settings (not in SettingsManager)
+			// Settings-panel id for a session-managed setting (not a schema path)
 			case "autoCompact":
-				this.ctx.session.setAutoCompactionEnabled(value as boolean, true);
+				this.ctx.session.setAutoCompactionEnabled(value as boolean, persist);
 				this.ctx.statusLine.setAutoCompactEnabled(value as boolean);
+				break;
+			case "compaction.enabled":
+			case "compaction.methodOrder":
+				this.ctx.statusLine.setAutoCompactEnabled(this.ctx.session.autoCompactionEnabled);
 				break;
 			case "composer.shape":
 				this.ctx.syncComposerShape();
@@ -713,17 +744,17 @@ export class SelectorController {
 				}
 				break;
 			case "steeringMode":
-				this.ctx.session.setSteeringMode(value as "all" | "one-at-a-time", true);
+				this.ctx.session.setSteeringMode(value as "all" | "one-at-a-time", persist);
 				break;
 			case "followUpMode":
-				this.ctx.session.setFollowUpMode(value as "all" | "one-at-a-time", true);
+				this.ctx.session.setFollowUpMode(value as "all" | "one-at-a-time", persist);
 				break;
 			case "interruptMode":
-				this.ctx.session.setInterruptMode(value as "immediate" | "wait", true);
+				this.ctx.session.setInterruptMode(value as "immediate" | "wait", persist);
 				break;
 			case "thinkingLevel":
 			case "defaultThinkingLevel":
-				this.ctx.session.setThinkingLevel(value as ConfiguredThinkingLevel, true);
+				this.ctx.session.setThinkingLevel(value as ConfiguredThinkingLevel, persist);
 				this.ctx.statusLine.invalidate();
 				this.ctx.updateEditorBorderColor();
 				break;
@@ -1104,10 +1135,9 @@ export class SelectorController {
 				onPickTask: (_model, selector) => {
 					// Session-only: layer the Task override onto the runtime settings
 					// layer so it is never persisted, mirroring the session-model pick.
-					this.ctx.settings.override("task.agentModelOverrides", {
-						...this.ctx.settings.get("task.agentModelOverrides"),
-						task: selector,
-					});
+					// Records merge by key, so only `task` is overridden; copying the
+					// merged record would pin a loaded profile's other agents past unload.
+					this.ctx.settings.override("task.agentModelOverrides", { task: selector });
 					this.ctx.showStatus(`Task subagent model (session-only): ${selector}. Use /agents to persist.`);
 					done();
 				},
@@ -1132,6 +1162,48 @@ export class SelectorController {
 		});
 		this.ctx.ui.setFocus(picker);
 		this.ctx.ui.requestRender();
+	}
+
+	/**
+	 * After a default-role edit, switch the live session to a newly exposed
+	 * project or global default without writing it back. Overlay and runtime
+	 * provenance remain authoritative and session-neutral. Returns false only
+	 * when the session refused the switch.
+	 */
+	async #adoptExposedDefault(previousRoleValue: string | undefined): Promise<boolean> {
+		const fallbackRoleValue = this.ctx.settings.getModelRole("default");
+		const fallbackProvenance = this.ctx.settings.getModelRoleProvenance("default");
+		const exposesPersistedFallback = fallbackProvenance === "project" || fallbackProvenance === "global";
+		if (!fallbackRoleValue || fallbackRoleValue === previousRoleValue || !exposesPersistedFallback) return true;
+		const scopedModels = this.ctx.session.scopedModels.map(sm => sm.model);
+		const availableModels = scopedModels.length > 0 ? scopedModels : this.ctx.session.getAvailableModels();
+		const resolved = resolveModelRoleValue(fallbackRoleValue, availableModels, { settings: this.ctx.settings });
+		if (!resolved.model) return true;
+		const isAuto = resolved.thinkingLevel === AUTO_THINKING;
+		let concreteThinking = concreteThinkingLevel(resolved.thinkingLevel);
+		let isAutoFromDefault = false;
+		if (!resolved.explicitThinkingLevel && !concreteThinking) {
+			const defaultLevel = parseConfiguredThinkingLevel(this.ctx.settings.get("defaultThinkingLevel"));
+			if (defaultLevel === AUTO_THINKING) {
+				isAutoFromDefault = true;
+			} else if (defaultLevel) {
+				concreteThinking = defaultLevel;
+			}
+		}
+		const effectiveIsAuto = isAuto || isAutoFromDefault;
+		const { switched } = await this.ctx.session.setModel(resolved.model, "default", {
+			persist: false,
+			thinkingLevel: effectiveIsAuto ? ThinkingLevel.Inherit : (concreteThinking ?? ThinkingLevel.Inherit),
+		});
+		if (!switched) return false;
+		if (effectiveIsAuto) {
+			this.ctx.session.setThinkingLevel(AUTO_THINKING, true);
+		} else if (concreteThinking && concreteThinking !== ThinkingLevel.Inherit) {
+			this.ctx.session.setThinkingLevel(concreteThinking);
+		}
+		this.ctx.statusLine.invalidate();
+		this.ctx.updateEditorBorderColor();
+		return true;
 	}
 
 	/**
@@ -1181,7 +1253,11 @@ export class SelectorController {
 							// persist an explicit `:auto` suffix and must not mutate the current model.
 							const isAuto = thinkingLevel === AUTO_THINKING;
 							const concreteThinking = isAuto || thinkingLevel === undefined ? undefined : thinkingLevel;
-							const effectiveProvenance = this.ctx.settings.getModelRoleProvenance("default");
+							// A profile's default is released by the write below, so shadowing is
+							// judged by the layer that supplies the role once it is released.
+							const effectiveProvenance = this.ctx.settings.getModelRoleProvenance("default", {
+								ignoreSetup: true,
+							});
 							const shadowedGlobal =
 								configuredStorage === "project" &&
 								targetScope === "global" &&
@@ -1193,22 +1269,19 @@ export class SelectorController {
 								configuredStorage === "project" &&
 								targetScope === "project" &&
 								effectiveProvenance === "overlay";
-							if (shadowedGlobal) {
-								this.ctx.settings.setModelRole(
-									"default",
-									formatModelSelectorValue(selectorValue, concreteThinking),
-								);
+							if (shadowedGlobal || shadowedProject) {
+								const previousEffectiveRoleValue = this.ctx.settings.getModelRole("default");
+								const roleValue = formatModelSelectorValue(selectorValue, concreteThinking);
+								if (shadowedGlobal) {
+									this.ctx.settings.setModelRole("default", roleValue);
+								} else {
+									this.ctx.settings.setProjectModelRole("default", roleValue);
+								}
 								if (isAuto) {
 									this.ctx.settings.set("defaultThinkingLevel", AUTO_THINKING);
 								}
-							} else if (shadowedProject) {
-								this.ctx.settings.setProjectModelRole(
-									"default",
-									formatModelSelectorValue(selectorValue, concreteThinking),
-								);
-								if (isAuto) {
-									this.ctx.settings.set("defaultThinkingLevel", AUTO_THINKING);
-								}
+								// Releasing a profile's default can expose a different persisted default.
+								await this.#adoptExposedDefault(previousEffectiveRoleValue);
 							} else {
 								const { switched } = await this.ctx.session.setModel(model, role, {
 									selector,
@@ -1273,59 +1346,9 @@ export class SelectorController {
 							`${scopeLabel}${roleInfo?.tag ?? roleInfo?.name ?? role} role cleared — auto-selection applies`,
 						);
 						// Clearing either persisted scope can also remove a captured
-						// runtime override. When that changes the effective default,
-						// resolve the newly exposed persisted layer and switch the live
-						// session without writing it back to global settings. Overlay
-						// and runtime provenance remain authoritative and session-neutral.
-						if (role === "default") {
-							const fallbackRoleValue = this.ctx.settings.getModelRole("default");
-							const fallbackProvenance = this.ctx.settings.getModelRoleProvenance("default");
-							const exposesPersistedFallback =
-								fallbackProvenance === "project" || fallbackProvenance === "global";
-							if (
-								fallbackRoleValue &&
-								fallbackRoleValue !== previousEffectiveRoleValue &&
-								exposesPersistedFallback
-							) {
-								const scopedModels = this.ctx.session.scopedModels.map(sm => sm.model);
-								const availableModels =
-									scopedModels.length > 0 ? scopedModels : this.ctx.session.getAvailableModels();
-								const resolved = resolveModelRoleValue(fallbackRoleValue, availableModels, {
-									settings: this.ctx.settings,
-								});
-								if (resolved.model) {
-									const fallbackModel = resolved.model;
-									const isAuto = resolved.thinkingLevel === AUTO_THINKING;
-									let concreteThinking = concreteThinkingLevel(resolved.thinkingLevel);
-									let isAutoFromDefault = false;
-									if (!resolved.explicitThinkingLevel && !concreteThinking) {
-										const defaultLevel = parseConfiguredThinkingLevel(
-											this.ctx.settings.get("defaultThinkingLevel"),
-										);
-										if (defaultLevel === AUTO_THINKING) {
-											isAutoFromDefault = true;
-										} else if (defaultLevel) {
-											concreteThinking = defaultLevel;
-										}
-									}
-									const effectiveIsAuto = isAuto || isAutoFromDefault;
-									const { switched } = await this.ctx.session.setModel(fallbackModel, "default", {
-										persist: false,
-										thinkingLevel: effectiveIsAuto
-											? ThinkingLevel.Inherit
-											: (concreteThinking ?? ThinkingLevel.Inherit),
-									});
-									if (!switched) return;
-									if (effectiveIsAuto) {
-										this.ctx.session.setThinkingLevel(AUTO_THINKING, true);
-									} else if (concreteThinking && concreteThinking !== ThinkingLevel.Inherit) {
-										this.ctx.session.setThinkingLevel(concreteThinking);
-									}
-									this.ctx.statusLine.invalidate();
-									this.ctx.updateEditorBorderColor();
-								}
-							}
-						}
+						// runtime override or a profile's default. When that changes the
+						// effective default, switch the live session to the exposed layer.
+						if (role === "default" && !(await this.#adoptExposedDefault(previousEffectiveRoleValue))) return;
 						return true;
 					} catch (error) {
 						this.ctx.showError(error instanceof Error ? error.message : String(error));
@@ -1339,13 +1362,11 @@ export class SelectorController {
 					? undefined
 					: (role, chain) => {
 							try {
-								const chains = { ...this.ctx.settings.get("retry.fallbackChains") };
-								if (chain.length === 0) {
-									delete chains[role];
-								} else {
-									chains[role] = chain;
-								}
-								this.ctx.settings.set("retry.fallbackChains", chains);
+								this.ctx.settings.setRecordEntry(
+									"retry.fallbackChains",
+									role,
+									chain.length > 0 ? chain : undefined,
+								);
 								const roleInfo = getRoleInfo(role, settings);
 								this.ctx.showStatus(
 									chain.length > 0

@@ -9,9 +9,11 @@ import { SelectorController } from "@oh-my-pi/pi-coding-agent/modes/controllers/
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { SecretObfuscator } from "@oh-my-pi/pi-coding-agent/secrets";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import * as modelHubModule from "@oh-my-pi/pi-tui/overlays/model-hub";
 
 describe("SelectorController prompt-affecting settings", () => {
 	it("refreshes the active prompt when xdev docs mode changes", async () => {
@@ -29,7 +31,7 @@ describe("SelectorController prompt-affecting settings", () => {
 		expect(ctx.showError).not.toHaveBeenCalled();
 	});
 
-	describe("queue-mode toggles from the settings panel", () => {
+	describe("with a live session and persisted settings", () => {
 		let tempDir: TempDir;
 		let authStorage: AuthStorage;
 		let settings: Settings;
@@ -56,11 +58,15 @@ describe("SelectorController prompt-affecting settings", () => {
 				modelRegistry,
 				obfuscator: new SecretObfuscator([]),
 			});
-			controller = new SelectorController({ session } as unknown as InteractiveModeContext);
+			controller = new SelectorController({ session, settings } as unknown as InteractiveModeContext);
 		});
 
 		afterEach(async () => {
+			vi.restoreAllMocks();
 			authStorage.close();
+			AgentStorage.close();
+			// SQLite keeps agent.db open until GC finalizes its statements; Windows cannot delete an open file.
+			Bun.gc(true);
 			try {
 				await tempDir.remove();
 			} catch {}
@@ -84,6 +90,66 @@ describe("SelectorController prompt-affecting settings", () => {
 			expect(onDisk).toContain("steeringMode: all");
 			expect(onDisk).toContain("followUpMode: all");
 			expect(onDisk).toContain("interruptMode: wait");
+		});
+
+		it("applies a profile's queue modes live without writing config or releasing them", async () => {
+			const changed = settings.applySetupLayer({ steeringMode: "all", interruptMode: "wait" });
+			controller.applySettingEffects(changed);
+			await settings.flush();
+
+			expect(session.steeringMode).toBe("all");
+			expect(session.interruptMode).toBe("wait");
+			// The profile still owns both settings, so unloading it restores the user's values.
+			expect(settings.getSetupLayer()).toEqual({ steeringMode: "all", interruptMode: "wait" });
+			expect(settings.getGlobalSettings()).not.toHaveProperty("steeringMode");
+			expect(settings.getGlobalSettings()).not.toHaveProperty("interruptMode");
+			const onDisk = await Bun.file(configPath)
+				.text()
+				.catch(() => "");
+			expect(onDisk).not.toContain("steeringMode");
+			expect(onDisk).not.toContain("interruptMode");
+		});
+
+		it("assigning a global default while a profile owns it switches to the default that becomes effective", async () => {
+			const model = (id: string) => getBundledModel("anthropic", id) as Model;
+			settings.set("modelRoleStorage", "project");
+			settings.setProjectModelRole("default", "anthropic/claude-opus-4-5");
+			settings.applySetupLayer({ modelRoles: { default: "anthropic/claude-haiku-4-5" } });
+			await session.setModel(model("claude-haiku-4-5"), "default");
+
+			let callbacks: modelHubModule.ModelHubCallbacks | undefined;
+			vi.spyOn(modelHubModule, "ModelHubComponent").mockImplementation(function (...args: unknown[]) {
+				callbacks = args[4] as modelHubModule.ModelHubCallbacks;
+				return { refreshAfterExternalMutation: () => {}, dispose: () => {} };
+			} as never);
+			const hubController = new SelectorController({
+				session,
+				settings,
+				ui: { showOverlay: () => ({ hide: () => {} }), setFocus: () => {}, requestRender: () => {} },
+				statusLine: { invalidate: () => {} },
+				updateEditorBorderColor: () => {},
+				showStatus: () => {},
+				showError: (message: string) => {
+					throw new Error(message);
+				},
+			} as unknown as InteractiveModeContext);
+			hubController.showModelSelector();
+			if (!callbacks) throw new Error("model hub was not opened");
+
+			await callbacks.onAssign(
+				model("claude-opus-4-1"),
+				"default",
+				undefined,
+				"anthropic/claude-opus-4-1",
+				"global",
+			);
+			await settings.flush();
+
+			// The assignment released the profile's default and persisted globally; the
+			// project default now in effect is what the session runs.
+			expect(settings.getGlobalModelRole("default")).toBe("anthropic/claude-opus-4-1");
+			expect(settings.getModelRoleProvenance("default")).toBe("project");
+			expect(session.model?.id).toBe("claude-opus-4-5");
 		});
 	});
 

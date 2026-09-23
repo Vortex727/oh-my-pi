@@ -115,12 +115,12 @@ describe("applySetupModelRoles", () => {
 		expect(settings.getModelRole("slow")).toBe(targetSelector);
 		expect(settings.getModelRole("task")).toBe("@default");
 		expect(settings.getModelRole("smol")).toBeUndefined();
-		expect(settings.getModelRoleProvenance("smol")).toBe("overlay");
+		expect(settings.getModelRoleProvenance("smol")).toBe("setup");
 		expect(settings.getModelRole("vision")).toBe(modelValue(initialModel));
 
 		settings.overrideModelRoles({ advisor: modelValue(targetModel) });
 		expect(settings.getModelRole("smol")).toBeUndefined();
-		expect(settings.getModelRoleProvenance("smol")).toBe("overlay");
+		expect(settings.getModelRoleProvenance("smol")).toBe("setup");
 
 		expect(session.sessionId).toBe(sessionId);
 		expect(session.sessionFile).toBe(sessionFile);
@@ -215,8 +215,30 @@ describe("applySetupModelRoles", () => {
 
 		expect(session.model).toBe(initialModel);
 		expect(settings.getModelRole("default")).toBeUndefined();
-		expect(settings.getModelRoleProvenance("default")).toBe("overlay");
+		expect(settings.getModelRoleProvenance("default")).toBe("setup");
 		expect(settings.getModelRole("task")).toBe("@default");
+	});
+
+	it("keeps the settings of a fully loaded profile while replacing its model roles", async () => {
+		const compaction = settings.get("compaction.enabled");
+		settings.applySetupLayer({
+			compaction: { enabled: !compaction },
+			modelRoles: { smol: modelValue(targetModel) },
+		});
+
+		const changed = await applySetupModelRoles({
+			session,
+			settings,
+			roles: { slow: modelValue(targetModel) },
+			getBlockReason: () => undefined,
+		});
+
+		expect(settings.get("compaction.enabled")).toBe(!compaction);
+		expect(settings.getModelRole("slow")).toBe(modelValue(targetModel));
+		// The earlier profile's roles give way to the applied ones.
+		expect(settings.getModelRole("smol")).toBe(modelValue(initialModel));
+		expect(changed).toContain("modelRoles");
+		expect(changed).not.toContain("compaction.enabled");
 	});
 
 	it("restores the previous live model when switching fails after mutation", async () => {

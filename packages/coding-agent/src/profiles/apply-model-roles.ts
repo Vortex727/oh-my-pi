@@ -5,6 +5,7 @@ import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { getModelMatchPreferences, pickDefaultAvailableModel, resolveModelRoleValue } from "../config/model-resolver";
 import { getRoleInfo, roleCandidatePool } from "../config/model-roles";
 import type { Settings } from "../config/settings";
+import type { SettingPath } from "../config/settings-schema";
 import type { AgentSession } from "../session/agent-session";
 import type { ModelRoleAssignments } from "./types";
 
@@ -117,9 +118,11 @@ function applicationFailure(error: unknown, restoreError: unknown, session: Agen
 
 /**
  * Apply only a saved setup's model roles to the live conversation. The roles
- * become the session's setup layer, replacing any previously loaded setup.
+ * replace the setup layer's model roles; settings a previously loaded setup
+ * supplied keep applying. Resolves the settings whose effective value
+ * changed, so the caller can run their live effects.
  */
-export async function applySetupModelRoles(options: ApplySetupModelRolesOptions): Promise<void> {
+export async function applySetupModelRoles(options: ApplySetupModelRolesOptions): Promise<SettingPath[]> {
 	assertReady(options);
 	const previousModel = options.session.model;
 	if (!previousModel) {
@@ -213,7 +216,7 @@ export async function applySetupModelRoles(options: ApplySetupModelRolesOptions)
 			options.session.setThinkingLevel(proposedDefault.thinkingLevel);
 		}
 		assertReady(options);
-		options.settings.applySetupLayer({ modelRoles: options.roles });
+		return options.settings.applySetupLayer({ ...options.settings.getSetupLayer(), modelRoles: options.roles });
 	} catch (error) {
 		const stateChanged =
 			sessionMutated ||

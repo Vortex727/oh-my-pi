@@ -36,7 +36,7 @@ function createEditor(overrides: Partial<ConstructorParameters<typeof ProfileEdi
 		callbacks: {
 			requestRender: () => {},
 			onEditRole: async (_role, draft) => draft,
-			onEditAgent: async (_agent, draft) => draft,
+			onEditAgents: async draft => draft,
 			onSave: (draft, saveAsNew) => {
 				saved.push({ draft, saveAsNew });
 			},
@@ -160,7 +160,7 @@ describe("profile draft editor isolation", () => {
 		expect(cancelled).toHaveBeenCalledTimes(1);
 	});
 
-	test("reviews captured agent assignments and toggles availability without losing ordered fallbacks", () => {
+	test("shows captured agent assignments and keeps the agents hub's edits in the draft", async () => {
 		const draft = modelsOnlyDraft();
 		draft.metadata.enabledGroups = ["tasks"];
 		draft.config.task = {
@@ -169,17 +169,38 @@ describe("profile draft editor isolation", () => {
 				reviewer: ["anthropic/first", "openai/second"],
 			},
 		};
+		const opened: Array<string | undefined> = [];
+		// The editor re-renders once it has applied the hub's result.
+		const applied = Promise.withResolvers<void>();
+		let hubClosed = false;
 		const { editor } = createEditor({
 			draft,
 			agentNames: ["scout", "reviewer", "security-reviewer"],
 			initialGroup: "tasks",
+			callbacks: {
+				requestRender: () => {
+					if (hubClosed) applied.resolve();
+				},
+				onEditRole: async () => undefined,
+				onEditAgents: async (current, agent) => {
+					opened.push(agent);
+					const next = structuredClone(current);
+					next.config.task = { ...(next.config.task as object), disabledAgents: ["scout", "reviewer"] };
+					hubClosed = true;
+					return next;
+				},
+				onSave: () => {},
+				onCancel: () => {},
+			},
 		});
 		typeText(editor, "reviewer");
 		const text = editor.render(120).map(stripVTControlCharacters).join("\n");
 		expect(text).toContain("Agent · reviewer");
 		expect(text).toContain("anthropic/first → openai/second");
 
-		editor.handleInput(" ");
+		editor.handleInput("\r");
+		await applied.promise;
+		expect(opened).toEqual(["reviewer"]);
 		expect(draftValue(editor.draft, "task.disabledAgents")).toEqual(["scout", "reviewer"]);
 		expect(draftValue(editor.draft, "task.agentModelOverrides.reviewer")).toEqual([
 			"anthropic/first",
@@ -220,7 +241,7 @@ describe("profile draft editor isolation", () => {
 				},
 				onSave: () => {},
 				onCancel: cancelled,
-				onEditAgent: async (_agent, draft) => draft,
+				onEditAgents: async draft => draft,
 			},
 		});
 		editor.handleInput("\x1b[B");
@@ -260,7 +281,7 @@ describe("profile draft editor isolation", () => {
 			callbacks: {
 				requestRender: () => {},
 				onEditRole: async (_role, current) => current,
-				onEditAgent: async (_agent, current) => current,
+				onEditAgents: async current => current,
 				onSave: () => {},
 				onSaveEmoji,
 				onCancel: cancelled,
@@ -305,7 +326,7 @@ describe("profile draft editor isolation", () => {
 			callbacks: {
 				requestRender: () => {},
 				onEditRole: async (_role, draft) => draft,
-				onEditAgent: async (_agent, draft) => draft,
+				onEditAgents: async draft => draft,
 				onSave: draft => {
 					attempts++;
 					if (attempts === 1) throw new Error("disk\tfull");

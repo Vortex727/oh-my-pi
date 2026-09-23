@@ -62,9 +62,11 @@ import {
 	type GroupPrefix,
 	type GroupTypeMap,
 	getDefault,
+	type RecordSettingPath,
 	SETTINGS_SCHEMA,
 	type SettingPath,
 	type SettingValue,
+	type StringListSettingPath,
 } from "./settings-schema";
 
 // Re-export types that callers need
@@ -236,7 +238,7 @@ const SETTING_GROUP_MEMBERS: Record<GroupPrefix, readonly [suffix: string, path:
  * Set a nested value in an object by path segments.
  * Creates intermediate objects as needed.
  */
-function setByPath(obj: RawSettings, segments: string[], value: unknown): void {
+function setByPath(obj: RawSettings, segments: readonly string[], value: unknown): void {
 	let current = obj;
 	for (let i = 0; i < segments.length - 1; i++) {
 		const segment = segments[i];
@@ -246,6 +248,16 @@ function setByPath(obj: RawSettings, segments: string[], value: unknown): void {
 		current = current[segment] as RawSettings;
 	}
 	current[segments[segments.length - 1]] = value;
+}
+
+/** Delete a nested value by path segments; a missing parent is a no-op. */
+function deleteByPath(obj: RawSettings, segments: readonly string[]): void {
+	let parent: unknown = obj;
+	for (const segment of segments.slice(0, -1)) {
+		if (!isRecord(parent)) return;
+		parent = parent[segment];
+	}
+	if (isRecord(parent)) delete parent[segments[segments.length - 1]];
 }
 
 /**
@@ -563,8 +575,11 @@ export class Settings {
 	#effectiveChangeListeners = new Set<(path: SettingPath, value: unknown, previous: unknown) => void>();
 	#editVariantCache: readonly EditVariantEntry[] | undefined;
 
-	/** Paths modified during this session (for partial save) */
-	#modified = new Set<string>();
+	/**
+	 * Global writes pending save, keyed by `JSON.stringify(segments)` so record
+	 * entry keys may contain dots (for partial save).
+	 */
+	#modified = new Map<string, readonly string[]>();
 	/** Individual project model roles modified during this session */
 	#modifiedProjectModelRoles = new Set<string>();
 	/** Individual global model roles modified during this session (for partial save) */
@@ -597,7 +612,8 @@ export class Settings {
 	/** Whether to persist changes */
 	#persist: boolean;
 
-	private constructor(options: SettingsOptions = {}) {
+	/** `track: false` keeps a throwaway instance out of {@link findScopedSettings} and test resets. */
+	private constructor(options: SettingsOptions = {}, track = true) {
 		this.#cwd = path.normalize(options.cwd ?? getProjectDir());
 		this.#agentDir = path.normalize(options.agentDir ?? getAgentDir());
 		this.#configPath = options.inMemory ? null : path.join(this.#agentDir, MAIN_CONFIG_FILENAMES[0]);
@@ -605,7 +621,7 @@ export class Settings {
 		if (options.configFiles) configFiles.push(...options.configFiles);
 		this.#configFiles = configFiles.map(file => path.resolve(this.#cwd, expandTilde(file)));
 		this.#persist = !options.inMemory && options.readOnly !== true;
-		liveSettingsInstances.add(new WeakRef(this));
+		if (track) liveSettingsInstances.add(new WeakRef(this));
 
 		if (options.overrides) {
 			for (const [key, value] of Object.entries(options.overrides)) {
@@ -730,21 +746,69 @@ export class Settings {
 	set<P extends SettingPath>(path: P, value: SettingValue<P>): void {
 		assertKnownStatusLineSegments(path, value);
 		const prev = this.get(path);
-		const segments = path.split(".");
-		this.#captureGlobalMutation(path, this.#modifiedPathMutations, getByPath(this.#global, segments));
-		setByPath(this.#global, segments, value);
-		this.#releaseSetupPath(segments);
+		const segments = SETTING_PATH_SEGMENTS[path];
+		deleteByPath(this.#setupLayer, segments);
+		this.#writeGlobal(segments, value);
+		this.#commitGlobalChange(path, prev);
+	}
+
+	/**
+	 * Set or delete (`value === undefined`) one entry of a record setting.
+	 * Persists only that entry and releases only that entry from the setup
+	 * layer, so the rest of a setup-owned record keeps applying.
+	 */
+	setRecordEntry(path: RecordSettingPath, key: string, value: unknown): void {
+		const prev = this.get(path);
+		const segments = [...SETTING_PATH_SEGMENTS[path], key];
+		deleteByPath(this.#setupLayer, segments);
+		this.#writeGlobal(segments, value);
+		this.#commitGlobalChange(path, prev);
+	}
+
+	/**
+	 * Add (`member`) or remove one item of a string-list setting. The persisted
+	 * global list changes by that item only. Arrays replace rather than merge,
+	 * so a setup-owned list gets the same membership change and the rest of it
+	 * keeps applying for the session.
+	 */
+	setListMember(path: StringListSettingPath, item: string, member: boolean): void {
+		const prev = this.get(path);
+		const segments = SETTING_PATH_SEGMENTS[path];
+		const withMembership = (list: readonly unknown[]): unknown[] => {
+			if (!member) return list.filter(entry => entry !== item);
+			return list.includes(item) ? [...list] : [...list, item];
+		};
+		const setupList = getByPath(this.#setupLayer, segments);
+		if (Array.isArray(setupList)) setByPath(this.#setupLayer, segments, withMembership(setupList));
+		const globalList = getByPath(this.#global, segments);
+		const base: readonly unknown[] = Array.isArray(globalList) ? globalList : getDefault(path);
+		if (base.includes(item) !== member) {
+			const next = withMembership(base);
+			assertKnownStatusLineSegments(path, next);
+			this.#writeGlobal(segments, next);
+		}
+		this.#commitGlobalChange(path, prev);
+	}
+
+	/** Stage a global-layer write of `segments`; `undefined` deletes the value. */
+	#writeGlobal(segments: readonly string[], value: unknown): void {
+		const key = JSON.stringify(segments);
+		this.#captureGlobalMutation(key, this.#modifiedPathMutations, getByPath(this.#global, segments));
+		if (value === undefined) {
+			deleteByPath(this.#global, segments);
+		} else {
+			setByPath(this.#global, segments, value);
+		}
 		this.#persistedMutationGeneration++;
-		this.#modified.add(path);
+		this.#modified.set(key, segments);
+	}
+
+	/** Rebuild, queue the save, and notify after a global-layer edit of `path`. */
+	#commitGlobalChange(path: SettingPath, prev: unknown): void {
 		this.#rebuildMerged();
 		const next = this.get(path);
 		this.#queueSave();
-
-		// Trigger hook if exists
-		const hook = SETTING_HOOKS[path];
-		if (hook) {
-			hook(next, prev);
-		}
+		SETTING_HOOKS[path]?.(next, prev);
 		this.#fireEffectiveSettingChanged(path, next, prev);
 	}
 
@@ -791,31 +855,52 @@ export class Settings {
 	 * explicit `--config` overlays and below runtime overrides, and is never
 	 * persisted. Editing a setting it owns drops that path from the layer so the
 	 * edit takes effect and persists as usual. `undefined` clears the layer.
+	 * Returns the settings whose effective value changed, in schema order.
 	 */
-	applySetupLayer(config: RawSettings | undefined): void {
+	applySetupLayer(config: RawSettings | undefined): SettingPath[] {
 		const paths = Object.keys(SETTINGS_SCHEMA) as SettingPath[];
 		const previous = paths.map(path => this.get(path));
 		const previousCodeModeValues = this.#codeModeSignalSnapshot();
 		this.#setupLayer = config === undefined ? {} : this.#migrateRawSettings(structuredClone(config), false);
 		this.#rebuildMerged();
 		this.#fireCodeModeChangeIfNeeded(previousCodeModeValues);
+		const changed: SettingPath[] = [];
 		for (const [index, path] of paths.entries()) {
 			const prev = previous[index];
 			const next = this.get(path);
 			if (Bun.deepEquals(next, prev)) continue;
+			changed.push(path);
 			SETTING_HOOKS[path]?.(next, prev);
 			this.#fireEffectiveSettingChanged(path, next, prev);
 		}
+		return changed;
 	}
 
-	/** Drop a setup-owned path so an explicit edit of that setting takes effect. */
-	#releaseSetupPath(segments: readonly string[]): void {
-		let parent: unknown = this.#setupLayer;
-		for (const segment of segments.slice(0, -1)) {
-			if (!isRecord(parent)) return;
-			parent = parent[segment];
-		}
-		if (isRecord(parent)) delete parent[segments[segments.length - 1]];
+	/** The saved-setup layer applied to this session (`{}` when none), as a copy. */
+	getSetupLayer(): RawSettings {
+		return structuredClone(this.#setupLayer);
+	}
+
+	/**
+	 * A read-only copy of these settings with `config` as the setup layer, for
+	 * previewing a profile at the rank it loads with. Building it runs no hooks,
+	 * listeners, or signals; it never saves and is not a scoped-settings
+	 * candidate for {@link findScopedSettings}.
+	 */
+	previewSetup(config: RawSettings | undefined): Settings {
+		const preview = new Settings({ cwd: this.#cwd, agentDir: this.#agentDir, readOnly: true }, false);
+		preview.#storage = this.#storage;
+		preview.#global = structuredClone(this.#global);
+		preview.#project = structuredClone(this.#project);
+		preview.#projectShellPathSource = this.#projectShellPathSource;
+		preview.#configFiles = [...this.#configFiles];
+		preview.#configOverlay = structuredClone(this.#configOverlay);
+		preview.#overlayShellPathSource = this.#overlayShellPathSource;
+		preview.#overrides = structuredClone(this.#overrides);
+		preview.#savedRuntimeModelRoleOverrides = new Map(this.#savedRuntimeModelRoleOverrides);
+		preview.#setupLayer = config === undefined ? {} : this.#migrateRawSettings(structuredClone(config), false);
+		preview.#rebuildMerged();
+		return preview;
 	}
 
 	/** Effective values of every setting that repartitions the Code Mode surface. */
@@ -1304,7 +1389,7 @@ export class Settings {
 		const projectRoles = getByPath(this.#project, ["modelRoles"]);
 		const current: Record<string, unknown> = isRecord(projectRoles) ? { ...projectRoles } : {};
 		current[role] = modelId;
-		this.#releaseSetupPath(["modelRoles", role]);
+		deleteByPath(this.#setupLayer, ["modelRoles", role]);
 		setByPath(this.#project, ["modelRoles"], current);
 		this.#modifiedProjectModelRoles.add(role);
 		this.#persistedMutationGeneration++;
@@ -1331,7 +1416,7 @@ export class Settings {
 		const prev = this.get("modelRoles");
 		const current = this.#modelRolesFromLayer(this.#global);
 		this.#captureGlobalMutation(role, this.#modifiedGlobalModelRoleMutations, current[role]);
-		this.#releaseSetupPath(["modelRoles", role]);
+		deleteByPath(this.#setupLayer, ["modelRoles", role]);
 		if (modelId === undefined) {
 			delete current[role];
 		} else {
@@ -1409,10 +1494,11 @@ export class Settings {
 
 	/**
 	 * Report which layer actually supplies the effective model role across
-	 * full merge precedence (runtime override → saved setup / config overlay →
-	 * project → global → default). A saved-setup role reports as `"overlay"`:
-	 * both are explicit non-persisted layers above project config. Unlike
-	 * {@link getModelRoleSource}, this accounts
+	 * full merge precedence (runtime override → saved setup → config overlay →
+	 * project → global → default). A saved-setup role reports as `"setup"`:
+	 * unlike an overlay role, editing the role releases it. `ignoreSetup`
+	 * reports the layer that would supply the role once that release happens.
+	 * Unlike {@link getModelRoleSource}, this accounts
 	 * for runtime and config-overlay layers and detects ownership by key
 	 * presence rather than normalized value, so a `null` tombstone in the
 	 * overlay or runtime layer correctly blocks lower layers. The project
@@ -1420,9 +1506,12 @@ export class Settings {
 	 * project null is a cleared value (falls back to global), not a
 	 * tombstone.
 	 */
-	getModelRoleProvenance(role: ModelRole | string): "runtime" | "overlay" | "project" | "global" | "default" {
+	getModelRoleProvenance(
+		role: ModelRole | string,
+		options: { ignoreSetup?: boolean } = {},
+	): "runtime" | "setup" | "overlay" | "project" | "global" | "default" {
 		if (this.#modelRoleLayerOwns(this.#overrides, role)) return "runtime";
-		if (this.#modelRoleLayerOwns(this.#setupLayer, role)) return "overlay";
+		if (!options.ignoreSetup && this.#modelRoleLayerOwns(this.#setupLayer, role)) return "setup";
 		if (this.#modelRoleLayerOwns(this.#configOverlay, role)) return "overlay";
 		if (this.#modelRoleLayerOwns(this.#projectSettingsForMerge(), role)) return "project";
 		if (this.#modelRoleLayerOwns(this.#global, role)) return "global";
@@ -3130,9 +3219,8 @@ export class Settings {
 
 				// Apply pending changes unless a newer file generation also
 				// changed that setting. Disjoint external edits still merge.
-				for (const modPath of modifiedPaths) {
-					const segments = modPath.split(".");
-					const mutation = modifiedPathMutations.get(modPath);
+				for (const [modKey, segments] of modifiedPaths) {
+					const mutation = modifiedPathMutations.get(modKey);
 					const canApply =
 						mutation !== undefined &&
 						mutation.generation.kind !== "unreadable" &&
@@ -3141,12 +3229,16 @@ export class Settings {
 					if (!canApply) {
 						logger.warn("Settings: skipped stale change after external config edit", {
 							path: configPath,
-							setting: modPath,
+							setting: segments.join("."),
 						});
 						continue;
 					}
 					const value = getByPath(this.#global, segments);
-					setByPath(current, segments, value);
+					if (value === undefined) {
+						deleteByPath(current, segments);
+					} else {
+						setByPath(current, segments, value);
+					}
 					shouldWrite = true;
 				}
 
@@ -3225,8 +3317,8 @@ export class Settings {
 				? this.#readYamlGeneration(configPath)
 				: undefined;
 			// Re-add failed paths for retry, retaining any newer mutation's generation.
-			for (const p of modifiedPaths) {
-				this.#modified.add(p);
+			for (const [p, segments] of modifiedPaths) {
+				this.#modified.set(p, segments);
 				if (!this.#modifiedPathMutations.has(p)) {
 					const mutation = modifiedPathMutations.get(p) ?? {
 						generation: { kind: "unreadable" },

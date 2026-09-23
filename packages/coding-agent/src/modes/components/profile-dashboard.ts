@@ -36,6 +36,13 @@ export type ProfileDashboardSetupRef =
 			imported?: boolean;
 	  };
 export type ProfileDashboardSavedSetupRef = Extract<ProfileDashboardSetupRef, { kind: "saved" }>;
+/** Profiles the running session loaded; a name is absent once that part of the profile no longer applies. */
+export interface ProfileDashboardActiveProfile {
+	/** The profile whose settings apply. */
+	settings?: string;
+	/** The profile whose model roles apply. */
+	models?: string;
+}
 type DashboardFocus = "profiles" | "details";
 type DetailAction = "save" | ProfileDashboardActiveControl;
 
@@ -62,6 +69,8 @@ export interface ProfileDashboardCallbacks {
 	deleteSetup(setup: ProfileDashboardSavedSetupRef): void | Promise<void>;
 	renameSetup(setup: ProfileDashboardSavedSetupRef): void | Promise<void>;
 	openActiveControl(control: ProfileDashboardActiveControl): void;
+	/** Unload the session's profile; offered only while one applies. */
+	unloadProfile(): void | Promise<void>;
 }
 
 export interface ProfileDashboardOptions {
@@ -74,7 +83,17 @@ interface HitZone {
 	line: number;
 	start: number;
 	end: number;
-	action: "edit-profile" | "load" | "save" | "import" | "export" | "delete" | "rename" | "close" | DetailAction;
+	action:
+		| "edit-profile"
+		| "load"
+		| "save"
+		| "import"
+		| "export"
+		| "delete"
+		| "rename"
+		| "unload"
+		| "close"
+		| DetailAction;
 }
 
 interface FooterHint {
@@ -106,6 +125,16 @@ function setupTitle(setup: ProfileDashboardSetupRef): string {
 	if (setup.kind === "current") return "Current profile";
 	const emoji = setup.metadata?.emoji ? `${cleanLine(setup.metadata.emoji)} ` : "";
 	return `${emoji}${cleanLine(setup.name)}${setup.imported ? ` ${theme.fg("accent", "(New)")}` : ""}`;
+}
+
+/** What the current session loaded, e.g. "profile focus loaded" or "models from profile fast". */
+function loadedText(active: ProfileDashboardActiveProfile): string {
+	const { settings, models } = active;
+	if (settings !== undefined && settings === models) return `profile ${cleanLine(settings)} loaded`;
+	const parts: string[] = [];
+	if (settings !== undefined) parts.push(`settings from profile ${cleanLine(settings)}`);
+	if (models !== undefined) parts.push(`models from profile ${cleanLine(models)}`);
+	return parts.length > 0 ? parts.join(" · ") : "profile loaded";
 }
 
 function normalizeSetups(setups: readonly ProfileDashboardSetupRef[]): ProfileDashboardSetupRef[] {
@@ -145,6 +174,7 @@ export class ProfileDashboard implements Component {
 	readonly #states = new Map<string, ProfileDashboardProfileState>();
 
 	#actionNotice: { text: string; tone: "error" | "success" | "info" } | undefined;
+	#activeProfile: ProfileDashboardActiveProfile | undefined;
 	#focus: DashboardFocus = "profiles";
 	#selectedKey = "current";
 	#filter = "";
@@ -220,6 +250,13 @@ export class ProfileDashboard implements Component {
 		if (this.#disposed) return;
 		const text = message ? cleanLine(message) : "";
 		this.#actionNotice = text ? { text, tone } : undefined;
+		this.#callbacks.requestRender();
+	}
+
+	/** Show what the session loaded; `undefined` when no profile applies, which also withholds Unload. */
+	setActiveProfile(active: ProfileDashboardActiveProfile | undefined): void {
+		if (this.#disposed) return;
+		this.#activeProfile = active ? { ...active } : undefined;
 		this.#callbacks.requestRender();
 	}
 
@@ -386,6 +423,10 @@ export class ProfileDashboard implements Component {
 			}
 			if (data === ",") {
 				this.#callbacks.openActiveControl("settings");
+				return;
+			}
+			if (data === "u" && this.#activeProfile) {
+				void this.#callbacks.unloadProfile();
 				return;
 			}
 		}
@@ -571,10 +612,13 @@ export class ProfileDashboard implements Component {
 		const snapshot = state?.snapshot;
 		const focus = this.#focus === "details" ? `${theme.fg("accent", theme.nav.cursor)} ` : "";
 		const header: string[] = [theme.bold(truncateToWidth(`${focus}${setupTitle(setup)}`, width))];
-		const descriptor =
-			setup.kind === "current"
-				? "Active session · read-only summary"
-				: "Saved profile · read-only preview · not loaded";
+		const loaded = this.#activeProfile;
+		let descriptor = `Active session · ${loaded ? loadedText(loaded) : "read-only summary"}`;
+		if (setup.kind === "saved") {
+			const loadState =
+				loaded?.settings === setup.name ? "loaded" : loaded?.models === setup.name ? "models loaded" : "not loaded";
+			descriptor = `Saved profile · read-only preview · ${loadState}`;
+		}
 		const status: string[] = [];
 		if (state?.error && !snapshot) {
 			status.push(theme.fg("error", `${theme.status.error} ${cleanLine(state.error)}`));
@@ -681,6 +725,7 @@ export class ProfileDashboard implements Component {
 				{ text: "a to edit agents", action: "agents" },
 				{ text: ", to edit settings", action: "settings" },
 			);
+			if (this.#activeProfile) hints.push({ text: "u to unload profile", action: "unload" });
 		}
 		if (this.#focus === "profiles") {
 			hints.push({ text: "↑/↓ to select profile" });
@@ -818,6 +863,9 @@ export class ProfileDashboard implements Component {
 				if (setup?.kind === "saved") void this.#callbacks.renameSetup(setup);
 				break;
 			}
+			case "unload":
+				if (this.selectedSetup?.kind === "current" && this.#activeProfile) void this.#callbacks.unloadProfile();
+				break;
 			case "import":
 				void this.#callbacks.importProfile();
 				break;

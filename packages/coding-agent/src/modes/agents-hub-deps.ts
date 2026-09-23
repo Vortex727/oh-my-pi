@@ -61,6 +61,7 @@ export function createAgentsHubDeps(
 			const prewalkOverrides = settings.get("task.agentPrewalk") ?? {};
 			const advisorOverrides = settings.get("task.agentAdvisor") ?? {};
 			return agents.map(agent => {
+				// Profile drafts store `null` for "Automatic"; `??` and `?.` read it as no override.
 				const override = overrides[agent.name];
 				const overrideModel = (Array.isArray(override) ? override.join(",") : (override ?? "")).trim();
 				return {
@@ -104,16 +105,17 @@ export function createAgentsHubDeps(
 			});
 			return selection ? (selection.model ?? "@advisor") : undefined;
 		},
-		setDisabledAgents: names => settings.set("task.disabledAgents", names),
-		setOverrides: (property, overrides) => {
-			const key =
+		setAgentDisabled: (name, disabled) => settings.setListMember("task.disabledAgents", name, disabled),
+		setAgentOverride: (property, name, value) =>
+			settings.setRecordEntry(
 				property === "model"
 					? "task.agentModelOverrides"
 					: property === "prewalk"
 						? "task.agentPrewalk"
-						: "task.agentAdvisor";
-			settings.set(key, overrides);
-		},
+						: "task.agentAdvisor",
+				name,
+				value,
+			),
 		generateAgent: async (description, onText) => {
 			await modelRegistry.refresh();
 			const patterns = resolveConfiguredModelPatterns(

@@ -71,6 +71,9 @@ function setup(height = 24, savedSetupNames: readonly string[] = ["beta"]) {
 				actions.push(`edit-profile:${label(value)}`);
 			},
 			openActiveControl: control => actions.push(`control:${control}`),
+			unloadProfile: () => {
+				actions.push("unload");
+			},
 		},
 	});
 	for (const value of setups) dashboard.setSetupState(value, { snapshot: snapshot(), loading: false });

@@ -3,23 +3,24 @@ import { THINKING_EFFORTS } from "@oh-my-pi/pi-catalog/effort";
 import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { type Component, type OverlayHandle, Text } from "@oh-my-pi/pi-tui";
+import type { AgentsHubDeps } from "@oh-my-pi/pi-tui/overlays/agents-hub";
 import type { ModelHubSource } from "@oh-my-pi/pi-tui/overlays/model-hub";
 import { formatModelSelectorValue } from "@oh-my-pi/pi-tui/overlays/model-selector";
 import type { SettingsSelectorComponent } from "@oh-my-pi/pi-tui/overlays/settings-selector";
-import { replaceTabs } from "@oh-my-pi/pi-tui/render/render-utils";
+import { replaceTabs, TRUNCATE_LENGTHS } from "@oh-my-pi/pi-tui/render/render-utils";
 import { getAvailableThemes, theme } from "@oh-my-pi/pi-tui/theme";
 import { oneLineLabel } from "@oh-my-pi/pi-tui/tools/task";
 import type { UsageReport } from "@oh-my-pi/pi-ai";
-import { logger, sanitizeText } from "@oh-my-pi/pi-utils";
+import { getProjectDir, isRecord, logger, sanitizeText } from "@oh-my-pi/pi-utils";
 import { getModelMatchPreferences, resolveModelRoleValue } from "../../config/model-resolver";
 import { type RawSettings, Settings } from "../../config/settings";
-import { SETTINGS_SCHEMA, type SettingPath } from "../../config/settings-schema";
+import { getUi, SETTINGS_SCHEMA, type SettingPath } from "../../config/settings-schema";
 import { applySetupModelRoles } from "../../profiles/apply-model-roles";
 import {
 	createSetupDraft,
 	deleteSavedSetup,
 	draftModelRoles,
-	type LoadedSetup,
+	type ImportedProfile,
 	listSavedSetups,
 	loadSavedSetup,
 	modelsOnlyDraft,
@@ -29,10 +30,11 @@ import {
 	renameSavedSetup,
 	type SavedSetupDescriptor,
 	SetupError,
+	safetySensitivePaths,
 	saveSetup,
 	serializeSetup,
 	setSavedSetupEmoji,
-	setupOverrides,
+	shareableDraft,
 	writeProfileFile,
 } from "../../profiles/setups";
 import { buildProfileSnapshot, projectProfileRoles } from "../../profiles/snapshot";
@@ -40,10 +42,12 @@ import type { ProfileDraft, ProfileEmoji, ProfileSnapshot } from "../../profiles
 import {
 	ProfileDashboard,
 	type ProfileDashboardActiveControl,
+	type ProfileDashboardActiveProfile,
 	type ProfileDashboardSavedSetupRef,
 	type ProfileDashboardSetupRef,
 } from "../components/profile-dashboard";
 import { ProfileEditorComponent } from "../components/profile-editor";
+import { createAgentsHubDeps } from "../agents-hub-deps";
 import { createModelBrowserSource } from "../model-browser-source";
 import { resolveToCwd } from "../../tools/path-utils";
 import { copyToClipboard, readTextFromClipboard } from "../../utils/clipboard";
@@ -56,6 +60,8 @@ export interface ProfilesHost {
 	showModelHub(options: ModelHubHostOptions): () => void;
 	showAgentsDashboard(options: AgentsDashboardHostOptions): Promise<() => void>;
 	acquireDefaultRoleMutation(): Promise<() => void>;
+	/** Run the live effects of each setting's current effective value, as a Settings edit does; never persists. */
+	applySettingEffects(paths: readonly SettingPath[]): void;
 }
 
 interface Notice {
@@ -91,9 +97,36 @@ function setupKey(setup: ProfileDashboardSetupRef): string {
 	return setup.kind === "current" ? "current" : `saved\0${setup.name}`;
 }
 
-function cleanText(value: unknown): string {
+function cleanText(value: unknown, max?: number): string {
 	const sanitized = replaceTabs(sanitizeText(String(value ?? "")));
-	return oneLineLabel(sanitized, sanitized.length || 1);
+	return oneLineLabel(sanitized, max ?? (sanitized.length || 1));
+}
+
+/**
+ * Safety settings by their Settings-menu labels, e.g. "1 safety setting: Tool Approval".
+ * With `config`, each label also shows the value `config` sets.
+ */
+function safetySettingsText(paths: readonly SettingPath[], config?: RawSettings): string {
+	const entries = paths.map(settingPath => {
+		const label = cleanText(getUi(settingPath)?.label ?? settingPath);
+		if (!config) return label;
+		const { value } = readConfigPath(config, settingPath);
+		return `${label} = ${cleanText(typeof value === "string" ? value : JSON.stringify(value), TRUNCATE_LENGTHS.TITLE)}`;
+	});
+	return `${paths.length} safety setting${paths.length === 1 ? "" : "s"}: ${entries.join(", ")}`;
+}
+
+/** Whether a setup layer node still sets anything, counting a `null` role that masks a configured one. */
+function setsAnything(value: unknown): boolean {
+	return isRecord(value) ? Object.values(value).some(setsAnything) : value !== undefined;
+}
+
+/** "profile focus", or "profiles focus and fast" when settings and models came from different profiles. */
+function loadedProfileLabel(active: ProfileDashboardActiveProfile): string {
+	const names = [...new Set([active.settings, active.models])]
+		.filter((name): name is string => name !== undefined)
+		.map(name => cleanText(name));
+	return names.length === 0 ? "the loaded profile" : `profile${names.length === 1 ? "" : "s"} ${names.join(" and ")}`;
 }
 
 function errorText(error: unknown, fallback: string): string {
@@ -123,6 +156,12 @@ export class ProfilesController {
 	#usage: UsageReport[] | undefined;
 	/** Profiles imported during this run of omp, marked "(New)". Kept across Settings mounts. */
 	readonly #imported = new Set<string>();
+	/**
+	 * Names of the profiles this run loaded: the one whose settings the session's
+	 * setup layer holds and the one whose model roles it holds. Kept across
+	 * Settings mounts; shown only while the layer still sets that part.
+	 */
+	#loaded: ProfileDashboardActiveProfile = {};
 
 	constructor(
 		private readonly ctx: InteractiveModeContext,
@@ -174,9 +213,11 @@ export class ProfilesController {
 				deleteSetup: setup => this.#deleteSetup(setup),
 				renameSetup: setup => this.#renameSetup(setup),
 				openActiveControl: control => this.#openActiveControl(control),
+				unloadProfile: () => this.#unloadProfile(),
 			},
 		});
 		this.#dashboard = dashboard;
+		dashboard.setActiveProfile(this.#activeProfile());
 		selector.setProfilesContent(dashboard);
 		this.ctx.ui.setFocus(selector);
 		this.ctx.ui.requestRender();
@@ -228,7 +269,20 @@ export class ProfilesController {
 		this.#snapshots.clear();
 		this.#previews.clear();
 		dashboard.setSetups(this.#setupRefs(), selected);
+		dashboard.setActiveProfile(this.#activeProfile());
 		await this.#preview(dashboard.selectedSetup ?? CURRENT_SETUP);
+	}
+
+	/** Which loaded profiles the setup layer still applies; undefined when it sets nothing. */
+	#activeProfile(): ProfileDashboardActiveProfile | undefined {
+		const { modelRoles, ...rest } = this.ctx.settings.getSetupLayer();
+		const models = setsAnything(modelRoles);
+		const settings = setsAnything(rest);
+		if (!models && !settings) return undefined;
+		return {
+			settings: settings ? this.#loaded.settings : undefined,
+			models: models ? this.#loaded.models : undefined,
+		};
 	}
 
 	#preview(setup: ProfileDashboardSetupRef): Promise<void> {
@@ -304,25 +358,11 @@ export class ProfilesController {
 		const loaded = await loadSavedSetup(setup.name, this.#agentDir());
 		const snapshot = await buildProfileSnapshot({
 			cwd,
-			settings: await this.#previewSettings(loaded),
+			settings: this.ctx.settings.previewSetup(loaded.config),
 			modelRegistry: session.modelRegistry,
 		});
 		snapshot.warnings.push(...loaded.warnings);
 		return snapshot;
-	}
-
-	/**
-	 * Read-only settings as they resolve with `draft` loaded on top of the
-	 * persisted configuration and launch overlays. Building them fires no global
-	 * setting hooks, so previews cannot change the live UI.
-	 */
-	#previewSettings(draft: ProfileDraft | undefined): Promise<Settings> {
-		return Settings.loadReadOnly({
-			cwd: this.ctx.sessionManager.getCwd(),
-			agentDir: this.#agentDir(),
-			configFiles: [...this.ctx.settings.configFiles],
-			overrides: draft ? setupOverrides(draft) : undefined,
-		});
 	}
 
 	/** Run one modal flow with the Settings overlay hidden; at most one runs at a time. */
@@ -428,12 +468,13 @@ export class ProfilesController {
 		options: EditorOptions = {},
 	): Promise<string | undefined> {
 		const skipped = options.skipped ?? [];
-		const effective = this.#draftSettings(draft, "default", "PROFILE DRAFT");
-		const inherited = setup.kind === "saved" ? await this.#previewSettings(undefined) : this.ctx.settings;
+		const effectiveSettings = this.#isolatedDraftSettings(draft);
+		// A saved profile replaces any loaded one, so it inherits the configuration without the setup layer.
+		const inherited = setup.kind === "saved" ? this.ctx.settings.previewSetup(undefined) : this.ctx.settings;
 		const availableThemes = await getAvailableThemes();
 		const models = this.ctx.session.modelRegistry.getAll();
-		const draftModel = resolveModelRoleValue(effective.settings.getModelRole("default"), models, {
-			settings: effective.settings,
+		const draftModel = resolveModelRoleValue(effectiveSettings.getModelRole("default"), models, {
+			settings: effectiveSettings,
 		}).model;
 		if (this.#dialogs.signal.aborted) return undefined;
 		const result = Promise.withResolvers<string | undefined>();
@@ -454,7 +495,7 @@ export class ProfilesController {
 		};
 		const editor = new ProfileEditorComponent({
 			draft,
-			effectiveSettings: effective.settings,
+			effectiveSettings,
 			inheritedSettings: inherited,
 			name: options.name ?? (setup.kind === "saved" ? setup.name : "Current profile"),
 			title: options.title ?? "Edit profile",
@@ -478,15 +519,15 @@ export class ProfilesController {
 				onEditRole: async (role, value) => {
 					handle.setHidden(true);
 					try {
-						return await this.#chooseRole(role, value, "PROFILE DRAFT");
+						return await this.#chooseRole(role, value);
 					} finally {
 						reveal();
 					}
 				},
-				onEditAgent: async (agent, value) => {
+				onEditAgents: async (value, agent) => {
 					handle.setHidden(true);
 					try {
-						return await this.#chooseAgent(agent, value);
+						return await this.#editAgents(value, agent);
 					} finally {
 						reveal();
 					}
@@ -541,39 +582,34 @@ export class ProfilesController {
 		return Settings.isolated(overrides, { storage: this.ctx.settings.getStorage() });
 	}
 
-	/** Draft settings plus a model-hub source whose role lookups read the draft. */
-	#draftSettings(draft: ProfileDraft, role: string, label: string): { settings: Settings; source: ModelHubSource } {
+	/** A model-hub source whose role lookups read `draft`; `focusRole` is tagged as the draft's. */
+	#draftSource(draft: ProfileDraft, focusRole?: string): ModelHubSource {
 		const roles = draftModelRoles(draft);
-		const settings = this.#isolatedDraftSettings(draft);
-		const baseSource = createModelBrowserSource(settings);
+		const baseSource = createModelBrowserSource(this.#isolatedDraftSettings(draft));
 		return {
-			settings,
-			source: {
-				...baseSource,
-				getModelRole: candidate =>
-					Object.hasOwn(roles, candidate) ? (roles[candidate] ?? undefined) : baseSource.getModelRole(candidate),
-				getRoleInfo: candidate => {
-					const info = baseSource.getRoleInfo(candidate);
-					if (candidate !== role) return info;
-					return { ...info, tag: `${label} · ${info.tag ?? info.name ?? candidate}` };
-				},
+			...baseSource,
+			getModelRole: candidate =>
+				Object.hasOwn(roles, candidate) ? (roles[candidate] ?? undefined) : baseSource.getModelRole(candidate),
+			getRoleInfo: candidate => {
+				const info = baseSource.getRoleInfo(candidate);
+				if (candidate !== focusRole) return info;
+				return { ...info, tag: `PROFILE DRAFT · ${info.tag ?? info.name ?? candidate}` };
 			},
 		};
 	}
 
 	/** Pick a model for one draft role in the focused model hub. Resolves the changed draft, or undefined. */
-	async #chooseRole(role: string, draft: ProfileDraft, label: string): Promise<ProfileDraft | undefined> {
+	async #chooseRole(role: string, draft: ProfileDraft): Promise<ProfileDraft | undefined> {
 		if (this.#dialogs.signal.aborted) return undefined;
 		const staged = structuredClone(draft);
 		const roles = draftModelRoles(staged);
 		staged.config.modelRoles = roles;
-		const preview = this.#draftSettings(staged, role, label);
 		const result = Promise.withResolvers<ProfileDraft | undefined>();
 		let changed = false;
 		let finished = false;
 		const close = this.host.showModelHub({
 			initialAssignRole: role,
-			source: preview.source,
+			source: this.#draftSource(staged, role),
 			roleCallbacks: {
 				onAssign: (model, assignedRole, thinkingLevel, selector) => {
 					if (finished || assignedRole !== role) return false;
@@ -602,72 +638,74 @@ export class ProfilesController {
 		}
 	}
 
-	/** Edit one agent's model override and fallbacks in the draft. Resolves the changed draft, or undefined. */
-	async #chooseAgent(agent: string, source: ProfileDraft): Promise<ProfileDraft | undefined> {
-		const signal = this.#dialogs.signal;
-		const draft = structuredClone(source);
-		const task = (draft.config.task ??= {}) as RawSettings;
-		const overrides = (task.agentModelOverrides ??= {}) as Record<string, string | string[] | null>;
-		let edited = false;
-		for (;;) {
-			if (signal.aborted) return undefined;
-			const configured = overrides[agent];
-			const chain = Array.isArray(configured) ? configured : typeof configured === "string" ? [configured] : [];
-			const entries = chain.map((selector, index) => ({
-				label: `${index + 1}. ${cleanText(selector)}`,
-				description: "Replace this assignment without changing other fallback positions",
-			}));
-			const choice = await this.ctx.showHookSelector(
-				`Agent ${cleanText(agent)} — draft only`,
-				[
-					...entries,
-					"Choose model",
-					...(chain.length > 0 ? ["Add fallback", "Remove fallback"] : []),
-					...(chain.length > 1 ? ["Move fallback earlier"] : []),
-					"Use Automatic",
-					"Remove saved override",
-					"Use changes",
-					"Cancel",
-				],
-				{ signal },
+	/**
+	 * Edit the draft's agents in the agents hub. The hub reads a preview with the
+	 * draft loaded and writes into a copy of the draft, never into live settings;
+	 * a hub reload reads that copy back, so its edits stay visible. Agent creation
+	 * is not offered. Resolves the edited draft, or undefined when nothing changed.
+	 */
+	async #editAgents(source: ProfileDraft, initialAgent: string | undefined): Promise<ProfileDraft | undefined> {
+		if (this.#dialogs.signal.aborted) return undefined;
+		const { session } = this.ctx;
+		const staged = structuredClone(source);
+		const draftDefault = draftModelRoles(staged).default ?? undefined;
+		const previewDeps = (): AgentsHubDeps =>
+			createAgentsHubDeps(
+				getProjectDir(),
+				this.ctx.settings.previewSetup(staged.config),
+				session.modelRegistry,
+				() => session.effectiveExtensionRoots,
+				draftDefault,
+				draftDefault,
 			);
-			if (choice === undefined || choice === "Cancel") return undefined;
-			if (choice === "Use changes") return edited ? draft : source;
-			edited = true;
-			if (choice === "Use Automatic") {
-				overrides[agent] = null;
-				continue;
-			}
-			if (choice === "Remove saved override") {
-				delete overrides[agent];
-				continue;
-			}
-			if (choice === "Remove fallback" || choice === "Move fallback earlier") {
-				const candidates = choice === "Move fallback earlier" ? entries.slice(1) : entries;
-				const selected = await this.ctx.showHookSelector(choice, [...candidates, "Cancel"], { signal });
-				if (selected === undefined || selected === "Cancel") return undefined;
-				const index = entries.findIndex(entry => entry.label === selected);
-				if (index < 0) continue;
-				const next = [...chain];
-				if (choice === "Remove fallback") next.splice(index, 1);
-				else [next[index - 1], next[index]] = [next[index]!, next[index - 1]!];
-				if (next.length === 0) delete overrides[agent];
-				else overrides[agent] = Array.isArray(configured) ? next : next[0]!;
-				continue;
-			}
-			const index = entries.findIndex(entry => entry.label === choice);
-			if (index < 0 && choice !== "Choose model" && choice !== "Add fallback") continue;
-			const picked = await this.#chooseRole("default", draft, `AGENT ${cleanText(agent)} DRAFT`);
-			if (!picked) return undefined;
-			const selector = draftModelRoles(picked).default ?? null;
-			if (selector === null || choice === "Choose model") overrides[agent] = selector;
-			else if (choice === "Add fallback") overrides[agent] = [...chain, selector];
-			else if (Array.isArray(configured)) {
-				const next = [...configured];
-				next[index] = selector;
-				overrides[agent] = next;
-			} else overrides[agent] = selector;
+		const stagedTask = (): RawSettings => {
+			if (!isRecord(staged.config.task)) staged.config.task = {};
+			return staged.config.task as RawSettings;
+		};
+		let edited = false;
+		const deps: AgentsHubDeps = {
+			...previewDeps(),
+			browserSource: this.#draftSource(staged),
+			loadAgents: () => previewDeps().loadAgents(),
+			setAgentDisabled: (name, disabled) => {
+				const task = stagedTask();
+				const current = Array.isArray(task.disabledAgents)
+					? task.disabledAgents.filter((item): item is string => typeof item === "string")
+					: this.ctx.settings.previewSetup(staged.config).get("task.disabledAgents");
+				const others = current.filter(item => item !== name);
+				task.disabledAgents = disabled ? [...others, name] : others;
+				edited = true;
+			},
+			setAgentOverride: (property, name, value) => {
+				const task = stagedTask();
+				const key =
+					property === "model" ? "agentModelOverrides" : property === "prewalk" ? "agentPrewalk" : "agentAdvisor";
+				if (!isRecord(task[key])) task[key] = {};
+				// null is Automatic (or the agent's own default) and masks the user's override once loaded.
+				(task[key] as Record<string, string | null>)[name] = value ?? null;
+				edited = true;
+			},
+			generateAgent: undefined,
+			saveAgent: undefined,
+		};
+		const done = Promise.withResolvers<void>();
+		const close = await this.host.showAgentsDashboard({
+			deps,
+			title: "Agents · profile draft",
+			initialAgent,
+			isCancelled: () => this.#dialogs.signal.aborted,
+			onDone: () => done.resolve(),
+		});
+		// Cancelled while loading: the hub never opened and never reports done.
+		if (this.#dialogs.signal.aborted) return undefined;
+		const previousChild = this.#closeChild;
+		this.#closeChild = close;
+		try {
+			await done.promise;
+		} finally {
+			if (this.#closeChild === close) this.#closeChild = previousChild;
 		}
+		return edited && !this.#dialogs.signal.aborted ? staged : undefined;
 	}
 
 	#renameSetup(setup: ProfileDashboardSavedSetupRef): Promise<void> {
@@ -676,6 +714,8 @@ export class ProfilesController {
 			if (input === undefined) return undefined;
 			const renamed = await renameSavedSetup(setup.name, input, this.#agentDir());
 			if (this.#imported.delete(setup.name)) this.#imported.add(renamed);
+			if (this.#loaded.settings === setup.name) this.#loaded.settings = renamed;
+			if (this.#loaded.models === setup.name) this.#loaded.models = renamed;
 			await this.#refresh({ kind: "saved", name: renamed });
 			return { message: `Renamed profile ${cleanText(setup.name)} to ${cleanText(renamed)}`, tone: "success" };
 		});
@@ -716,6 +756,7 @@ export class ProfilesController {
 			if (!imported) return undefined;
 			const draft: ProfileDraft = { metadata: imported.metadata, config: imported.config };
 			const unavailable = this.#roleWarnings(draft).size;
+			const withheld = imported.withheld.length > 0 ? safetySettingsText(imported.withheld) : undefined;
 			const findings = [
 				...(unavailable > 0
 					? [`${unavailable} model${unavailable === 1 ? "" : "s"} not available on this machine`]
@@ -723,6 +764,7 @@ export class ProfilesController {
 				...(imported.warnings.length > 0
 					? [`${imported.warnings.length} entr${imported.warnings.length === 1 ? "y" : "ies"} skipped`]
 					: []),
+				...(withheld ? [`left out ${withheld}`] : []),
 			];
 			const review = await this.ctx.showHookSelector(
 				"Look over the imported profile before saving it?",
@@ -746,18 +788,20 @@ export class ProfilesController {
 					notice: [
 						"Not imported yet: review it, fix any ⚠ model, then Ctrl+S to save it as a new profile (Esc discards).",
 						...(imported.warnings.length > 0 ? [`Skipped ${skippedSummary(imported.warnings)}.`] : []),
+						...(withheld ? [`Left out ${withheld}; imports never change safety settings.`] : []),
 					].join(" "),
 				});
 			}
 			if (saved === undefined) return undefined;
 			this.#imported.add(saved);
 			await this.#refresh({ kind: "saved", name: saved });
-			return { message: `Imported profile ${cleanText(saved)}. Load it to use it.`, tone: "success" };
+			const leftOut = withheld ? ` (left out ${withheld})` : "";
+			return { message: `Imported profile ${cleanText(saved)}${leftOut}. Load it to use it.`, tone: "success" };
 		});
 	}
 
 	/** Prompt for an exported profile file until one reads; undefined when cancelled or left empty. */
-	async #readImportFile(): Promise<(ProfileDraft & { warnings: string[] }) | undefined> {
+	async #readImportFile(): Promise<ImportedProfile | undefined> {
 		let prompt = "Import profile from file";
 		for (;;) {
 			const input = await this.ctx.showHookInput(prompt, "Path to an exported profile", {
@@ -778,7 +822,7 @@ export class ProfilesController {
 		return this.#interaction(async () => {
 			const signal = this.#dialogs.signal;
 			const label = setup.kind === "saved" ? setup.name : "Current profile";
-			let draft: ProfileDraft;
+			let source: ProfileDraft;
 			let skipped: readonly string[] = [];
 			if (setup.kind === "saved") {
 				const loaded = await loadSavedSetup(setup.name, this.#agentDir());
@@ -792,12 +836,13 @@ export class ProfilesController {
 					{ signal },
 				);
 				if (scope !== WHOLE_PROFILE && scope !== MODELS_ONLY) return undefined;
-				draft = scope === WHOLE_PROFILE ? loaded : modelsOnlyDraft(loaded);
+				source = scope === WHOLE_PROFILE ? loaded : modelsOnlyDraft(loaded);
 				skipped = loaded.warnings;
 			} else {
 				// The current profile is already models-only; save it first to share settings groups.
-				draft = this.#currentDraft();
+				source = this.#currentDraft();
 			}
+			const { draft, withheld } = shareableDraft(source);
 			const destination = await this.ctx.showHookSelector(
 				`Export profile ${cleanText(label)}`,
 				[
@@ -818,8 +863,12 @@ export class ProfilesController {
 			} else {
 				return undefined;
 			}
+			const leftOut = withheld.length > 0 ? ` (left out ${safetySettingsText(withheld)})` : "";
 			const without = skipped.length > 0 ? `, without ${skippedSummary(skipped)}` : "";
-			return { message: `Exported profile ${cleanText(label)} to ${cleanText(where)}${without}`, tone: "success" };
+			return {
+				message: `Exported profile ${cleanText(label)} to ${cleanText(where)}${leftOut}${without}`,
+				tone: "success",
+			};
 		});
 	}
 
@@ -857,7 +906,7 @@ export class ProfilesController {
 					{
 						label: APPLY_MODELS_CHOICE,
 						description:
-							"Switch model roles and thinking now; other settings and this conversation stay as they are",
+							"Switch model roles and thinking now; this conversation and other settings, including a loaded profile's, stay as they are",
 					},
 					{
 						label: NEW_SESSION_CHOICE,
@@ -876,8 +925,9 @@ export class ProfilesController {
 	async #applyModels(setup: ProfileDashboardSavedSetupRef): Promise<Notice> {
 		const loaded = await loadSavedSetup(setup.name, this.#agentDir());
 		const release = await this.host.acquireDefaultRoleMutation();
+		let changed: SettingPath[];
 		try {
-			await applySetupModelRoles({
+			changed = await applySetupModelRoles({
 				session: this.ctx.session,
 				settings: this.ctx.settings,
 				roles: draftModelRoles(loaded),
@@ -890,6 +940,8 @@ export class ProfilesController {
 		} finally {
 			release();
 		}
+		this.#loaded.models = loaded.name;
+		this.host.applySettingEffects(changed);
 		await this.#refresh(CURRENT_SETUP);
 		return {
 			message: `This conversation now uses the models from profile ${cleanText(loaded.name)}`,
@@ -900,31 +952,81 @@ export class ProfilesController {
 	/**
 	 * Start a new session in this process with the whole setup applied. The
 	 * setup becomes the session's setup layer, so it outranks persisted config
-	 * until another setup is loaded or omp restarts.
+	 * until it is unloaded, another setup is loaded, or omp restarts.
 	 */
 	async #startSession(setup: ProfileDashboardSavedSetupRef): Promise<Notice | undefined> {
 		const loaded = await loadSavedSetup(setup.name, this.#agentDir());
+		const name = cleanText(loaded.name);
+		const safety = safetySensitivePaths(loaded);
 		const confirmed = await this.ctx.showHookConfirm(
-			`Start a new session with profile ${cleanText(loaded.name)}?`,
-			"This conversation is saved and can be resumed. The profile applies until you load another profile or restart omp.",
+			`Start a new session with profile ${name}?`,
+			[
+				"This conversation is saved and can be resumed. The profile applies until you unload it, load another profile, or restart omp.",
+				...(safety.length > 0 ? [`It also sets ${safetySettingsText(safety, loaded.config)}.`] : []),
+			].join("\n"),
 			{ signal: this.#dialogs.signal },
 		);
 		if (!confirmed) return undefined;
 		this.#closeSettings?.();
-		if (!(await this.ctx.startNewSession(`New session with profile ${loaded.name}`))) return undefined;
-		this.ctx.settings.applySetupLayer(loaded.config);
+		if (!(await this.ctx.startNewSession(`New session with profile ${loaded.name}`))) {
+			// Settings is already closed, so a dashboard notice would never show.
+			this.ctx.showWarning(`Profile ${name} was not loaded: the new session did not start`);
+			return undefined;
+		}
+		const changed = this.ctx.settings.applySetupLayer(loaded.config);
+		this.#loaded = { settings: loaded.name, models: loaded.name };
+		this.host.applySettingEffects(changed);
 		await this.ctx.session.refreshBaseSystemPrompt();
-		await this.#useSetupDefaultModel(loaded);
+		await this.#useDefaultModel(`Profile ${name}`);
 		if (loaded.warnings.length > 0) {
 			this.ctx.showWarning(
-				`Profile ${cleanText(loaded.name)} skipped ${loaded.warnings.length} entr${loaded.warnings.length === 1 ? "y" : "ies"}: ${cleanText(loaded.warnings[0])}`,
+				`Profile ${name} skipped ${loaded.warnings.length} entr${loaded.warnings.length === 1 ? "y" : "ies"}: ${cleanText(loaded.warnings[0])}`,
 			);
 		}
 		return undefined;
 	}
 
-	/** Switch the fresh session to the setup's default role without persisting a model choice. */
-	async #useSetupDefaultModel(setup: LoadedSetup): Promise<void> {
+	/**
+	 * Drop the session's setup layer so the user's own settings and models apply
+	 * again, running each changed setting's live effects. When the profile owned
+	 * the default role, the session moves to the default that applies now.
+	 */
+	#unloadProfile(): Promise<void> {
+		return this.#interaction(async () => {
+			const active = this.#activeProfile();
+			if (!active) return undefined;
+			const label = loadedProfileLabel(active);
+			const confirmed = await this.ctx.showHookConfirm(
+				`Unload ${label}?`,
+				"Your own settings and models apply again. This conversation continues, and nothing is saved.",
+				{ signal: this.#dialogs.signal },
+			);
+			if (!confirmed) return undefined;
+			const { session, settings } = this.ctx;
+			const ownsDefault = settings.getModelRoleProvenance("default") === "setup";
+			if (ownsDefault && session.isStreaming) {
+				return { message: "Wait for the current response to finish before unloading the profile", tone: "error" };
+			}
+			const release = await this.host.acquireDefaultRoleMutation();
+			try {
+				const changed = settings.applySetupLayer(undefined);
+				this.#loaded = {};
+				this.host.applySettingEffects(changed);
+				await session.refreshBaseSystemPrompt();
+				if (ownsDefault) await this.#useDefaultModel(`Unloaded ${label}`);
+			} finally {
+				release();
+			}
+			await this.#refresh(CURRENT_SETUP);
+			return { message: `Unloaded ${label}; your own settings and models apply again`, tone: "success" };
+		});
+	}
+
+	/**
+	 * Switch the session to the effective default role without persisting a model
+	 * choice. When that model is unavailable, warn (led by `subject`) and keep the current one.
+	 */
+	async #useDefaultModel(subject: string): Promise<void> {
 		const { session, settings } = this.ctx;
 		const selector = settings.getModelRole("default");
 		if (!selector) return;
@@ -935,7 +1037,7 @@ export class ProfilesController {
 		if (!resolved.model || !session.modelRegistry.hasConfiguredAuth(resolved.model)) {
 			const current = session.model ? `${session.model.provider}/${session.model.id}` : "no model";
 			this.ctx.showWarning(
-				`Profile ${cleanText(setup.name)}: default model ${cleanText(selector)} is not available; keeping ${current}`,
+				`${subject}: default model ${cleanText(selector)} is not available; keeping ${cleanText(current)}`,
 			);
 			return;
 		}

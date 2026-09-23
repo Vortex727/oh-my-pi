@@ -166,7 +166,8 @@ Write behavior:
 
 - `settings.set(...)` writes to the **global** layer (the global YAML file selected at startup) and queues a background save.
 - Project settings and config overlays are read-only from the settings API.
-- The setup layer is never written. `settings.set(...)` on a path it owns releases that path from the layer, so the edit takes effect for the rest of the session.
+- The setup layer is never written. `settings.set(...)` on a path it owns releases that path from the layer, so the edit takes effect for the rest of the session. `setRecordEntry(...)` and `setListMember(...)` persist a single record entry or list member and release only that one, so the rest of a setup-owned record or list keeps applying; UI edits of one fallback chain or one agent use them so layered values never reach `config.yml`.
+- `settings.previewSetup(config)` returns a read-only copy with `config` as its setup layer, for previewing a profile at the rank it loads with; building it runs no hooks and it never saves.
 
 ### Settings load failures
 

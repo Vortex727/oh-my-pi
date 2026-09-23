@@ -170,7 +170,18 @@ interface MachineLocalMarker {
 	machineLocal?: true;
 }
 
-interface BooleanDef extends CredentialMarker, MachineLocalMarker {
+/**
+ * Marks a setting whose permissive value loosens tool approvals or secret
+ * redaction, grants control of the user's real browser or desktop, or
+ * automatically runs or installs project or third-party code and services.
+ * Profile imports and exports withhold it; the user's own saved profiles keep
+ * it. Read it through `isSafetySensitive`.
+ */
+interface SafetySensitiveMarker {
+	safetySensitive?: true;
+}
+
+interface BooleanDef extends CredentialMarker, MachineLocalMarker, SafetySensitiveMarker {
 	type: "boolean";
 	default: boolean | undefined;
 	ui?: UiBoolean;
@@ -182,13 +193,13 @@ interface StringDef extends CredentialMarker {
 	ui?: UiString;
 }
 
-interface NumberDef extends CredentialMarker, MachineLocalMarker {
+interface NumberDef extends CredentialMarker, MachineLocalMarker, SafetySensitiveMarker {
 	type: "number";
 	default: number | undefined;
 	ui?: UiNumber;
 }
 
-interface EnumDef<T extends readonly string[]> extends CredentialMarker, MachineLocalMarker {
+interface EnumDef<T extends readonly string[]> extends CredentialMarker, MachineLocalMarker, SafetySensitiveMarker {
 	type: "enum";
 	values: T;
 	default: T[number];
@@ -2184,6 +2195,7 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	"marketplace.autoUpdate": {
+		safetySensitive: true,
 		type: "enum",
 		values: ["off", "notify", "auto"] as const,
 		default: "notify",
@@ -2361,6 +2373,7 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	"collab.autoStart": {
+		safetySensitive: true,
 		type: "enum",
 		values: ["off", "view", "control"] as const,
 		default: "off",
@@ -2423,6 +2436,7 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	"share.redactSecrets": {
+		safetySensitive: true,
 		type: "boolean",
 		default: true,
 		ui: {
@@ -3923,6 +3937,7 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	"bash.allowCompoundCommands": {
+		safetySensitive: true,
 		type: "boolean",
 		default: false,
 		ui: {
@@ -4149,6 +4164,7 @@ export const SETTINGS_SCHEMA = {
 	//   "write"      — auto-approves read and write-tier tools; prompts for exec.
 	//   "yolo"       — auto-approves every tier.
 	"tools.approvalMode": {
+		safetySensitive: true,
 		type: "enum",
 		values: ["always-ask", "write", "yolo"] as const,
 		default: "yolo",
@@ -4392,6 +4408,7 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	"computer.enabled": {
+		safetySensitive: true,
 		type: "boolean",
 		default: false,
 		ui: {
@@ -4594,6 +4611,7 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	"browser.relay": {
+		safetySensitive: true,
 		type: "boolean",
 		default: false,
 		ui: {
@@ -4837,6 +4855,7 @@ export const SETTINGS_SCHEMA = {
 
 	// MCP
 	"mcp.enableProjectConfig": {
+		safetySensitive: true,
 		type: "boolean",
 		default: true,
 		ui: {
@@ -5436,6 +5455,7 @@ export const SETTINGS_SCHEMA = {
 
 	// Secret handling
 	"secrets.enabled": {
+		safetySensitive: true,
 		type: "boolean",
 		default: false,
 		ui: {
@@ -6155,6 +6175,20 @@ export type SettingValue<P extends SettingPath> = Schema[P] extends { type: "boo
 								? D
 								: never;
 
+/**
+ * Record settings edited one entry at a time. `modelRoles` is excluded: its
+ * role API also maintains runtime and project-storage overrides.
+ */
+export type RecordSettingPath = Exclude<
+	{ [P in SettingPath]: Schema[P] extends { type: "record" } ? P : never }[SettingPath],
+	"modelRoles"
+>;
+
+/** Array settings whose members are strings, edited one member at a time. */
+export type StringListSettingPath = {
+	[P in SettingPath]: Schema[P] extends { type: "array" } ? (SettingValue<P> extends string[] ? P : never) : never;
+}[SettingPath];
+
 /** Get the default value for a setting path */
 export function getDefault<P extends SettingPath>(path: P): SettingValue<P> {
 	const definition = SETTINGS_SCHEMA[path];
@@ -6187,6 +6221,12 @@ export function isCredential(path: SettingPath): boolean {
 export function isMachineLocal(path: SettingPath): boolean {
 	const def = SETTINGS_SCHEMA[path];
 	return "machineLocal" in def && def.machineLocal === true;
+}
+
+/** Whether a setting is safety-sensitive and must be withheld from imported and exported profiles. */
+export function isSafetySensitive(path: SettingPath): boolean {
+	const def = SETTINGS_SCHEMA[path];
+	return "safetySensitive" in def && def.safetySensitive === true;
 }
 
 /** Get UI metadata for a path (undefined if no UI) */

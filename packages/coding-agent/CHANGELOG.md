@@ -29,7 +29,7 @@
 - Fixed comma-separated line selectors such as `:19,59` in `read`, `grep` paths, and `fetch` reading from the first number through EOF. A bare number in a list is now that single line; a lone `:50` still reads from line 50.
 - Fixed `write` success text reporting JavaScript string length as bytes. The count is now the UTF-8 byte length.
 - Fixed headless print mode (`-p`) silently dropping MCP servers slower than the startup window; print mode now waits for configured servers (bounded by `OMP_MCP_TIMEOUT_MS`) and warns on stderr when one is not ready ([#12188](https://github.com/can1357/oh-my-pi/issues/12188), reported by [@aaronjmars](https://github.com/aaronjmars)).
-- Fixed `/model` and the model-role picker crashing omp on Windows with a `file:file:…` module error once extensions support was loaded.
+- Fixed `/model` and the model-role picker crashing omp on Windows with a `file:file:…` module error once extensions support was loaded ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727)).
 
 ## [18.2.11] - 2026-09-23
 

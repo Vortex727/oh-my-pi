@@ -19,6 +19,7 @@ Settings are stored as plain YAML mappings. Every key, its type, default, and en
 | Project           | `<cwd>/.omp/config.yml` (plus `.omp/settings.json`)   | Loaded when the process working directory has a non-empty `.omp/`.                                                                       | Settings commands do not write arbitrary project keys. With `modelRoleStorage: project`, model-selector role assignments update only `modelRoles` here; edit other keys by hand. |
 | Project legacy    | `<cwd>/.omp/settings.json`                            | Still read; project `config.yml` is merged on top of it.                                                                                 | Not written by settings commands.                                                                                                                                                |
 | CLI overlay       | Any file passed with `--config <file>`                | Loaded after global and project settings, for that one process. Repeatable.                                                              | Never persisted.                                                                                                                                                                 |
+| Loaded profile    | `~/.omp/agent/setups/<name>.yml`                      | Applied for the rest of the session when a profile is loaded into a new session. See [Profiles](#profiles).                              | Never persisted by loading; profiles are saved from the **Profiles** tab.                                                                                                        |
 | Runtime overrides | In-memory only                                        | Set by dedicated CLI flags (`--model`, `--approval-mode`, …) and feature env vars.                                                       | Never persisted.                                                                                                                                                                 |
 
 `PI_CODING_AGENT_DIR` relocates the `~/.omp/agent` base directory. When it is set, the global `config.yml`, the auth store (`agent.db`), and everything else under the agent directory move with it. Use `omp config path` to print the active agent directory.
@@ -93,16 +94,17 @@ Keys must match a real schema path exactly. There is no shorthand — set `theme
 From lowest to highest priority, the effective value of a setting is built as:
 
 ```text
-built-in defaults  <-  global config  <-  project config  <-  CLI overlays  <-  runtime overrides
+built-in defaults  <-  global config  <-  project config  <-  CLI overlays  <-  loaded profile  <-  runtime overrides
 ```
 
 From highest to lowest:
 
 1. **Runtime overrides** — dedicated CLI flags and feature env vars applied in memory for the current process: `--model`, `--smol`, `--slow`, `--plan`, `--approval-mode`, `--auto-approve`/`--yolo`, `--hide-thinking`, `--advisor`, `--no-pty`, `--api-key`, and protocol-mode defaults. Never persisted.
-2. **CLI config overlays** — each `--config <file>`; later overlay files override earlier ones.
-3. **Project settings** — `<cwd>/.omp/settings.json` then `<cwd>/.omp/config.yml` (and contributions from other discovery providers at project level).
-4. **Global settings** — `~/.omp/agent/config.yml`.
-5. **Built-in defaults** — from the settings schema.
+2. **Loaded profile** — the profile loaded with *Start a new session* (see [Profiles](#profiles)). Session-only; never persisted.
+3. **CLI config overlays** — each `--config <file>`; later overlay files override earlier ones.
+4. **Project settings** — `<cwd>/.omp/settings.json` then `<cwd>/.omp/config.yml` (and contributions from other discovery providers at project level).
+5. **Global settings** — `~/.omp/agent/config.yml`.
+6. **Built-in defaults** — from the settings schema.
 
 A key that is unset at every layer resolves to its schema default at read time.
 
@@ -272,6 +274,17 @@ omp --config ./base.yml --config ./experiment.yml "try this model"
 Wrappers may instead set `PI_CONFIG_FILES` to a platform-delimited path list (`:` on Unix, `;` on Windows). Environment overlays load in listed order before explicit `--config` overlays.
 
 Overlay paths are resolved relative to the process working directory (and `~` is expanded). Each overlay must parse as a YAML mapping; a missing file, invalid YAML, or a top-level array/scalar is a hard error — it does **not** silently fall back to lower-precedence settings.
+
+## Profiles
+
+A profile is a named, reusable set of model roles, agent assignments, and chosen groups of settings. Manage profiles in the **Profiles** tab of `/settings` (or open it directly with `/profiles`). Each profile is stored as `~/.omp/agent/setups/<name>.yml`: the same YAML as `config.yml`, plus a `$setup` block holding its emoji and included settings groups.
+
+- **Preview.** Selecting a profile shows what it resolves to (models, agents, memory). Selecting never changes the session.
+- **Save and edit.** `s` saves the current models as a new profile; Enter or `e` opens a draft editor. Including a settings group captures the settings you have configured in it; groups left out keep using your local configuration. Draft changes save only with Ctrl+S. Picking an emoji for a saved profile saves it immediately.
+- **Load (`l`).** *Apply models to this conversation* switches model roles and thinking now and leaves everything else as it is. *Start a new session* saves the conversation and starts a new one with everything the profile includes. The profile then applies as a session-only layer above `--config` overlays (see [Precedence](#precedence)) until you load another profile or restart `omp`; it is never written to `config.yml`. Changing one of its settings in `/settings` takes effect immediately and stops the profile from overriding that setting.
+- **Export and import (`x` / `i`).** Export writes a profile whole or models-only to a new file (an existing file is never replaced) or to the clipboard. Import reads either, opens the profile in the draft editor with unavailable models flagged, and saves it under a new name.
+- **What travels.** Credentials, local endpoints, billing tiers, and other machine-local settings are never saved, exported, or imported. A profile from another `omp` version loads what this version understands and names every entry it skipped; saving over such a profile drops those entries, and the confirmation says which.
+- `d` deletes and `n` renames a saved profile; neither touches your settings.
 
 ## Path-scoped arrays
 

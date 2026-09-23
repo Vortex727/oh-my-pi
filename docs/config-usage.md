@@ -152,12 +152,13 @@ The runtime settings model is layered:
 1. Global settings: the first present file among `~/.omp/agent/config.yml` and `config.yaml`
 2. Project settings: discovered via the settings capability (`settings.json` and `config.yml` from providers)
 3. Config overlays: `PI_CONFIG_FILES` (platform path-list), followed by repeated `omp --config <path>` files; all are loaded as `config.yml`-style YAML for this process only
-4. Runtime overrides: in-memory, non-persistent
-5. Schema defaults: from `SETTINGS_SCHEMA`
+4. Setup layer: a saved profile loaded into this session (`Settings.applySetupLayer`), in memory only
+5. Runtime overrides: in-memory, non-persistent
+6. Schema defaults: from `SETTINGS_SCHEMA`
 
 Effective precedence:
 
-`defaults <- global <- project <- PI_CONFIG_FILES overlays <- --config overlays <- runtime overrides`
+`defaults <- global <- project <- PI_CONFIG_FILES overlays <- --config overlays <- setup layer <- runtime overrides`
 
 Within either overlay list, later files override earlier files. Overlay paths are resolved relative to the active project directory (after `~` expansion).
 
@@ -165,6 +166,7 @@ Write behavior:
 
 - `settings.set(...)` writes to the **global** layer (the global YAML file selected at startup) and queues a background save.
 - Project settings and config overlays are read-only from the settings API.
+- The setup layer is never written. `settings.set(...)` on a path it owns releases that path from the layer, so the edit takes effect for the rest of the session.
 
 ### Settings load failures
 

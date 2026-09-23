@@ -1,3 +1,4 @@
+import type { UsageReport } from "@oh-my-pi/pi-ai";
 import {
 	type Component,
 	extractPrintableText,
@@ -37,8 +38,8 @@ export interface ProfileDashboardProfileState {
 	error?: string;
 	/** A failed refresh keeps snapshot as the last-good value and annotates it. */
 	refreshError?: string;
-	/** Current profile only: this session's account usage report, rendered for a width. */
-	usage?: (width: number) => string;
+	/** Current profile only: this session's account usage reports. */
+	usage?: readonly UsageReport[];
 }
 
 export interface ProfileDashboardCallbacks {

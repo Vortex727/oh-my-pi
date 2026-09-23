@@ -48,7 +48,6 @@ import { createModelBrowserSource } from "../model-browser-source";
 import { resolveToCwd } from "../../tools/path-utils";
 import { copyToClipboard, readTextFromClipboard } from "../../utils/clipboard";
 import type { InteractiveModeContext } from "../types";
-import { renderUsageReports } from "./command-controller";
 import type { AgentsDashboardHostOptions, ModelHubHostOptions } from "./selector-controller";
 
 /** Selector-controller capabilities the Profiles tab reuses instead of duplicating. */
@@ -118,8 +117,8 @@ export class ProfilesController {
 	#busy = false;
 	#dialogs = new AbortController();
 	#closeChild: (() => void) | undefined;
-	/** This session's usage report bound to a width, once fetched for the current mount. */
-	#usage: ((width: number) => string) | undefined;
+	/** This session's usage reports, once fetched for the current mount. */
+	#usage: UsageReport[] | undefined;
 
 	constructor(
 		private readonly ctx: InteractiveModeContext,
@@ -263,9 +262,9 @@ export class ProfilesController {
 	}
 
 	/**
-	 * Fetch this session's account usage once per mount, the same report `/usage`
-	 * shows, and attach it to the current profile's preview. A failure or an empty
-	 * report leaves the section out, as `/usage` does.
+	 * Fetch this session's account usage once per mount, the same reports `/usage`
+	 * shows, and attach them to the current profile's preview. A failure or an
+	 * empty result leaves the section out, as `/usage` does.
 	 */
 	async #loadUsage(dashboard: ProfileDashboard): Promise<void> {
 		const { session } = this.ctx;
@@ -277,23 +276,9 @@ export class ProfilesController {
 			return;
 		}
 		if (this.#dashboard !== dashboard || !reports || reports.length === 0) return;
-		const provider = session.model?.provider;
-		const account = provider
-			? session.modelRegistry.authStorage.oauth.identity(provider, session.sessionId)
-			: undefined;
-		const selectors = session.getUsageReportingModelSelectors(reports);
-		const usage = (width: number): string =>
-			renderUsageReports(
-				reports,
-				theme,
-				Date.now(),
-				width,
-				id => (id === provider ? account : undefined),
-				selectors,
-			);
-		this.#usage = usage;
+		this.#usage = reports;
 		const snapshot = this.#snapshots.get(setupKey(CURRENT_SETUP));
-		if (snapshot) dashboard.setSetupState(CURRENT_SETUP, { snapshot, loading: false, usage });
+		if (snapshot) dashboard.setSetupState(CURRENT_SETUP, { snapshot, loading: false, usage: reports });
 	}
 
 	async #buildSnapshot(setup: ProfileDashboardSetupRef): Promise<ProfileSnapshot> {

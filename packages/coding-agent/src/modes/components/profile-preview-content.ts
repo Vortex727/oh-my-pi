@@ -1,3 +1,4 @@
+import type { UsageReport } from "@oh-my-pi/pi-ai";
 import {
 	padding,
 	renderTableRow,
@@ -6,6 +7,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@oh-my-pi/pi-tui";
+import { formatProviderName } from "@oh-my-pi/pi-tui/chrome/format";
 import {
 	formatContext,
 	formatCostPair,
@@ -13,10 +15,16 @@ import {
 	formatModelPerformance,
 } from "@oh-my-pi/pi-tui/overlays/model-browser";
 import { formatModelSelectorValue } from "@oh-my-pi/pi-tui/overlays/model-selector";
+import {
+	buildProviderCards,
+	CARD_MAX_WINDOWS,
+	renderUsageBar,
+	usageStatusColor,
+} from "@oh-my-pi/pi-tui/overlays/usage-dashboard";
 import { thinkingLevelGlyph } from "@oh-my-pi/pi-tui/render/render-utils";
-import { getConfiguredThinkingLevelMetadata } from "@oh-my-pi/pi-tui/thinking";
+import { type ConfiguredThinkingLevel, getConfiguredThinkingLevelMetadata } from "@oh-my-pi/pi-tui/thinking";
 import { theme } from "@oh-my-pi/pi-tui/theme";
-import { sanitizeText } from "@oh-my-pi/pi-utils";
+import { formatDuration, sanitizeText } from "@oh-my-pi/pi-utils";
 import {
 	PROFILE_SETTINGS_GROUPS,
 	type ProfileAgentRow,
@@ -25,10 +33,9 @@ import {
 } from "../../profiles/types";
 import type { ProfileDashboardSetupRef } from "./profile-dashboard";
 
-interface LabelValue {
-	label: string;
-	value: string;
-}
+const TABLE_INDENT = "  ";
+const TABLE_GAP = "  ";
+const USAGE_BAR_WIDTH = 10;
 
 function cleanLine(value: unknown): string {
 	return replaceTabs(sanitizeText(String(value ?? "")))
@@ -50,101 +57,147 @@ function wrapLines(lines: readonly string[], width: number): string[] {
 function pushIndented(lines: string[], value: string, indent: number, width: number): void {
 	const safeWidth = Math.max(1, width);
 	const safeIndent = Math.min(indent, Math.max(0, safeWidth - 1));
-	const contentWidth = Math.max(1, safeWidth - safeIndent);
 	const prefix = padding(safeIndent);
-	const wrapped = wrapTextWithAnsi(value, contentWidth);
-	if (wrapped.length === 0) {
-		lines.push(prefix);
-		return;
-	}
-	for (const line of wrapped) lines.push(`${prefix}${line}`);
+	for (const line of wrapTextWithAnsi(value, Math.max(1, safeWidth - safeIndent))) lines.push(`${prefix}${line}`);
 }
 
-interface WrappedTableCell {
-	text: string;
+function muted(text: string): string {
+	return theme.fg("muted", text);
+}
+
+function dim(text: string): string {
+	return theme.fg("dim", text);
+}
+
+function sectionHeading(label: string, detail?: string): string {
+	const heading = theme.bold(theme.fg("accent", cleanLine(label)));
+	return detail ? `${heading}${dim(` · ${detail}`)}` : heading;
+}
+
+interface CompactColumn {
+	header: string;
+	/** One cell per row; `""` is "no value" and renders as `placeholder`. */
+	cells: readonly string[];
 	align?: "left" | "right";
+	placeholder?: string;
+	/** Upper bound on the column's natural width. */
+	max?: number;
+	/** Set on the one column that absorbs leftover width and truncates; it is never dropped. */
+	flexMin?: number;
+	/**
+	 * Dropped, lowest first, when the pane is too narrow. Such a column is also
+	 * left out when no row has a value. Columns without it always stay.
+	 */
+	drop?: number;
 }
 
-function renderWrappedTableRow(
-	cells: readonly WrappedTableCell[],
-	widths: readonly number[],
-	width: number,
-	options: { indent?: string; gap?: string } = {},
-): string[] {
-	const columns: TableColumn[] = widths.map((columnWidth, index) => ({
-		width: Math.max(1, columnWidth),
-		align: cells[index]?.align ?? "left",
-		overflow: "allow",
+/**
+ * One line per row at any width: optional columns drop out before anything
+ * wraps, and only the flex column shrinks, truncating with an ellipsis.
+ */
+function renderCompactTable(columns: readonly CompactColumn[], width: number): string[] {
+	const natural = (column: CompactColumn): number =>
+		Math.min(
+			column.max ?? Number.MAX_SAFE_INTEGER,
+			Math.max(
+				visibleWidth(column.header),
+				...column.cells.map(cell => visibleWidth(cell || column.placeholder || "")),
+			),
+		);
+	const gapWidth = visibleWidth(TABLE_GAP);
+	const available = Math.max(1, width - visibleWidth(TABLE_INDENT));
+	const needed = (set: readonly CompactColumn[]): number =>
+		set.reduce(
+			(sum, column) =>
+				sum + (column.flexMin === undefined ? natural(column) : Math.min(column.flexMin, natural(column))),
+			gapWidth * (set.length - 1),
+		);
+	let kept = columns.filter(column => column.drop === undefined || column.cells.some(Boolean));
+	const droppable = kept.filter(column => column.drop !== undefined).sort((a, b) => a.drop! - b.drop!);
+	for (const column of droppable) {
+		if (needed(kept) <= available) break;
+		kept = kept.filter(candidate => candidate !== column);
+	}
+	const fixed = kept.reduce(
+		(sum, column) => (column.flexMin === undefined ? sum + natural(column) : sum),
+		gapWidth * (kept.length - 1),
+	);
+	const tableColumns: TableColumn[] = kept.map(column => ({
+		width: column.flexMin === undefined ? natural(column) : Math.max(1, Math.min(natural(column), available - fixed)),
+		align: column.align ?? "left",
+		overflow: "truncate",
+		priority: column.flexMin === undefined ? 1 : 0,
 	}));
-	const wrapped = cells.map((cell, index) => {
-		const lines = wrapTextWithAnsi(cell.text, columns[index]?.width ?? 1);
-		return lines.length > 0 ? lines : [""];
-	});
-	const lineCount = Math.max(1, ...wrapped.map(lines => lines.length));
-	const lines: string[] = [];
-	for (let lineIndex = 0; lineIndex < lineCount; lineIndex++) {
+	const options = { indent: TABLE_INDENT, gap: TABLE_GAP };
+	const lines = [
+		renderTableRow(
+			kept.map(column => ({ text: column.header, style: muted })),
+			tableColumns,
+			width,
+			options,
+		),
+	];
+	const rowCount = Math.max(0, ...kept.map(column => column.cells.length));
+	for (let row = 0; row < rowCount; row++) {
 		lines.push(
 			renderTableRow(
-				wrapped.map(lines => ({
-					text: lines[lineIndex] ?? "",
-				})),
-				columns,
+				kept.map(column => ({ text: column.cells[row] || column.placeholder || "" })),
+				tableColumns,
 				width,
-				{ ...options, fit: false },
+				options,
 			),
 		);
 	}
 	return lines;
 }
 
-function renderLabelValues(entries: readonly LabelValue[], width: number): string[] {
-	if (entries.length === 0) return [];
-	const safeWidth = Math.max(1, width);
-	const nativeLabelWidth = 30;
-	let labelWidth = 0;
+/** One line per distinct warning, naming every entry that shares it. */
+function groupedWarnings(entries: ReadonlyArray<{ name: string; warning?: string }>, width: number): string[] {
+	const grouped = new Map<string, string[]>();
 	for (const entry of entries) {
-		const entryWidth = visibleWidth(entry.label);
-		if (entryWidth <= nativeLabelWidth) labelWidth = Math.max(labelWidth, entryWidth);
+		const warning = cleanLine(entry.warning);
+		if (!warning) continue;
+		const names = grouped.get(warning) ?? [];
+		const name = cleanLine(entry.name) || "Unnamed";
+		if (!names.includes(name)) names.push(name);
+		grouped.set(warning, names);
 	}
-	const sideBySide = labelWidth > 0 && safeWidth - 2 - labelWidth - 2 >= 12;
-	const prefixWidth = 2 + labelWidth + 2;
-	const valueWidth = Math.max(1, safeWidth - prefixWidth);
 	const lines: string[] = [];
-	for (const entry of entries) {
-		const plainLabel = entry.label;
-		if (!sideBySide || visibleWidth(plainLabel) > labelWidth) {
-			if (plainLabel) pushIndented(lines, theme.fg("muted", plainLabel), 2, safeWidth);
-			pushIndented(lines, entry.value, plainLabel ? 4 : 2, safeWidth);
-			continue;
-		}
-		const label = plainLabel ? theme.fg("muted", plainLabel) : "";
-		const rowPrefix = `  ${label}${padding(labelWidth - visibleWidth(plainLabel))}  `;
-		const continuation = padding(prefixWidth);
-		const valueLines = wrapTextWithAnsi(entry.value, valueWidth);
-		if (valueLines.length === 0) {
-			lines.push(rowPrefix);
-			continue;
-		}
-		lines.push(`${rowPrefix}${valueLines[0]}`);
-		for (let index = 1; index < valueLines.length; index++) lines.push(`${continuation}${valueLines[index]}`);
+	for (const [warning, names] of grouped) {
+		pushIndented(lines, theme.fg("warning", `${theme.status.warning} ${names.join(", ")}: ${warning}`), 2, width);
 	}
 	return lines;
 }
 
-interface RoleFacts {
-	role: string;
-	identity: string;
-	thinking: string;
-	intelligence: string;
-	performance: string;
-	context: string;
-	cost: string;
-	narrowMetrics: readonly string[];
+function thinkingText(level: ConfiguredThinkingLevel | undefined): string {
+	if (level === undefined) return "";
+	const glyph = thinkingLevelGlyph(level, theme);
+	const label = getConfiguredThinkingLevelMetadata(level).label;
+	return glyph ? `${glyph} ${label}` : label;
 }
 
-function shown(value: string): string {
-	return value || theme.fg("dim", "—");
+// ─── Summary ─────────────────────────────────────────────────────────────────
+
+function renderSummary(setup: ProfileDashboardSetupRef, snapshot: ProfileSnapshot, width: number): string[] {
+	const parts: string[] = [];
+	if (setup.kind === "current") {
+		parts.push(`${muted("Settings:")} all groups · current session`);
+	} else {
+		const enabled = new Set(setup.metadata?.enabledGroups ?? []);
+		const included = PROFILE_SETTINGS_GROUPS.filter(group => enabled.has(group.id)).map(group =>
+			cleanLine(group.label),
+		);
+		const inherited = PROFILE_SETTINGS_GROUPS.length - included.length;
+		parts.push(`${muted("Includes:")} ${included.length > 0 ? included.join(", ") : "models only"}`);
+		if (inherited > 0) parts.push(dim(`${inherited} group${inherited === 1 ? "" : "s"} inherited`));
+	}
+	const { backend, scope, storageLabel } = snapshot.memory;
+	parts.push(`${muted("Memory:")} ${cleanLine(backend)}${scope ? ` (${cleanLine(scope)})` : ""}`);
+	parts.push(`${muted("Storage:")} ${cleanLine(storageLabel)}`);
+	return wrapTextWithAnsi(parts.join(dim(" · ")), Math.max(1, width));
 }
+
+// ─── Models ──────────────────────────────────────────────────────────────────
 
 function roleIdentity(role: ProfileRoleRow): string {
 	const selector = cleanLine(role.selector);
@@ -155,127 +208,17 @@ function roleIdentity(role: ProfileRoleRow): string {
 	let target: string;
 	let alias = "";
 	if (model || provider) {
-		target = role.automatic
-			? theme.fg("dim", `auto → ${plainTarget}`)
-			: provider
-				? `${theme.fg("dim", `${provider}/`)}${model}`
-				: model;
+		target = role.automatic ? dim(`auto → ${plainTarget}`) : provider ? `${dim(`${provider}/`)}${model}` : model;
 		const canonicalSelector = formatModelSelectorValue(plainTarget, role.thinkingLevel);
-		if (selector && selector !== plainTarget && selector !== canonicalSelector) {
-			alias = theme.fg("dim", ` ← ${selector}`);
-		}
+		if (selector && selector !== plainTarget && selector !== canonicalSelector) alias = dim(` ← ${selector}`);
 	} else {
-		target = theme.fg("dim", "—");
+		target = dim("—");
 	}
 	const dot = theme.fg(
 		role.warning ? "warning" : role.automatic ? "dim" : "success",
 		role.automatic ? theme.status.shadowed : theme.status.enabled,
 	);
 	return `${dot} ${target}${alias}`;
-}
-
-function roleFacts(role: ProfileRoleRow): RoleFacts {
-	let thinking = "";
-	if (role.thinkingLevel !== undefined) {
-		const glyph = thinkingLevelGlyph(role.thinkingLevel, theme);
-		const label = getConfiguredThinkingLevelMetadata(role.thinkingLevel).label;
-		thinking = glyph ? `${glyph} ${label}` : label;
-	}
-	const intelligence = formatIntelligence(role);
-	const performance = formatModelPerformance(role, role.perf);
-	const context = formatContext(role);
-	const cost = role.cost ? formatCostPair(role) : "";
-	return {
-		role: cleanLine(role.role),
-		identity: roleIdentity(role),
-		thinking: shown(thinking),
-		intelligence: shown(intelligence),
-		performance: shown(performance),
-		context: shown(context),
-		cost: shown(cost),
-		narrowMetrics: [
-			...(thinking ? [`Think ${thinking}`] : []),
-			...(intelligence ? [`Int ${intelligence}`] : []),
-			...(performance ? [`TTFT · t/s ${performance}`] : []),
-			...(context ? [`Ctx ${context}`] : []),
-			...(cost ? [`$ in/out ${cost}`] : []),
-		],
-	};
-}
-
-function maxCellWidth(values: readonly string[], minimum: number, maximum: number): number {
-	let natural = minimum;
-	for (const value of values) natural = Math.max(natural, visibleWidth(value));
-	return Math.min(maximum, natural);
-}
-
-function renderWideRoles(facts: readonly RoleFacts[], width: number): string[] | undefined {
-	const gap = "  ";
-	const indent = "  ";
-	const roleWidth = maxCellWidth(["Role", ...facts.map(fact => fact.role)], 8, 16);
-	const thinkingWidth = maxCellWidth(["Think", ...facts.map(fact => fact.thinking)], 7, 16);
-	const intelligenceWidth = maxCellWidth(["Int", ...facts.map(fact => fact.intelligence)], 3, 6);
-	const performanceWidth = maxCellWidth(["TTFT · t/s", ...facts.map(fact => fact.performance)], 10, 14);
-	const contextWidth = maxCellWidth(["Ctx", ...facts.map(fact => fact.context)], 3, 10);
-	const costWidth = maxCellWidth(["$ in/out", ...facts.map(fact => fact.cost)], 8, 18);
-	const fixedWidth = roleWidth + thinkingWidth + intelligenceWidth + performanceWidth + contextWidth + costWidth;
-	const identityWidth = width - visibleWidth(indent) - visibleWidth(gap) * 6 - fixedWidth;
-	if (identityWidth < 32) return undefined;
-	const widths = [
-		roleWidth,
-		identityWidth,
-		thinkingWidth,
-		intelligenceWidth,
-		performanceWidth,
-		contextWidth,
-		costWidth,
-	];
-	const lines = renderWrappedTableRow(
-		[
-			{ text: theme.fg("muted", "Role") },
-			{ text: theme.fg("muted", "Model") },
-			{ text: theme.fg("muted", "Think") },
-			{ text: theme.fg("muted", "Int"), align: "right" },
-			{ text: theme.fg("muted", "TTFT · t/s"), align: "right" },
-			{ text: theme.fg("muted", "Ctx"), align: "right" },
-			{ text: theme.fg("muted", "$ in/out"), align: "right" },
-		],
-		widths,
-		width,
-		{ indent, gap },
-	);
-	for (const fact of facts) {
-		lines.push(
-			...renderWrappedTableRow(
-				[
-					{ text: theme.fg("muted", fact.role) },
-					{ text: fact.identity },
-					{ text: fact.thinking },
-					{ text: fact.intelligence, align: "right" },
-					{ text: fact.performance, align: "right" },
-					{ text: fact.context, align: "right" },
-					{ text: fact.cost, align: "right" },
-				],
-				widths,
-				width,
-				{ indent, gap },
-			),
-		);
-	}
-	return lines;
-}
-
-function renderNarrowRoles(facts: readonly RoleFacts[], width: number): string[] {
-	const lines: string[] = [];
-	for (const [index, fact] of facts.entries()) {
-		if (index > 0) lines.push("");
-		pushIndented(lines, theme.bold(fact.role), 2, width);
-		pushIndented(lines, fact.identity, 4, width);
-		if (fact.narrowMetrics.length > 0) {
-			pushIndented(lines, fact.narrowMetrics.join(theme.fg("dim", "  ·  ")), 4, width);
-		}
-	}
-	return lines;
 }
 
 function isEmptyRole(role: ProfileRoleRow): boolean {
@@ -293,187 +236,261 @@ function isEmptyRole(role: ProfileRoleRow): boolean {
 	);
 }
 
-function renderRoleWarnings(roles: readonly ProfileRoleRow[], width: number): string[] {
-	const grouped = new Map<string, string[]>();
-	for (const role of roles) {
-		const warning = cleanLine(role.warning);
-		if (!warning) continue;
-		const names = grouped.get(warning) ?? [];
-		const name = cleanLine(role.role) || "Unnamed role";
-		if (!names.includes(name)) names.push(name);
-		grouped.set(warning, names);
+function renderModels(snapshot: ProfileSnapshot, width: number): string[] {
+	const roles = snapshot.roles.filter(role => !isEmptyRole(role));
+	const unassigned = snapshot.roles.filter(isEmptyRole).map(role => cleanLine(role.role) || "Unnamed role");
+	const lines = [
+		sectionHeading(`Models (${roles.length})`, roles.some(role => role.cost) ? "$ per 1M tokens" : undefined),
+	];
+	for (const warning of new Set(snapshot.warnings.map(cleanLine).filter(Boolean))) {
+		pushIndented(lines, theme.fg("warning", `${theme.status.warning} ${warning}`), 2, width);
 	}
-	const lines: string[] = [];
-	for (const [warning, names] of grouped) {
-		pushIndented(lines, theme.fg("warning", `${theme.status.warning} ${names.join(", ")}: ${warning}`), 2, width);
+	if (roles.length > 0) {
+		const none = dim("—");
+		lines.push(
+			...renderCompactTable(
+				[
+					{ header: "Role", cells: roles.map(role => cleanLine(role.role)), max: 16 },
+					{ header: "Model", cells: roles.map(roleIdentity), flexMin: 24 },
+					{
+						header: "Think",
+						cells: roles.map(role => thinkingText(role.thinkingLevel)),
+						placeholder: none,
+						max: 12,
+						drop: 5,
+					},
+					{
+						header: "Int",
+						cells: roles.map(role => formatIntelligence(role)),
+						align: "right",
+						placeholder: none,
+						drop: 4,
+					},
+					{
+						header: "TTFT · t/s",
+						cells: roles.map(role => formatModelPerformance(role, role.perf)),
+						align: "right",
+						placeholder: none,
+						max: 14,
+						drop: 3,
+					},
+					{
+						header: "Ctx",
+						cells: roles.map(role => formatContext(role)),
+						align: "right",
+						placeholder: none,
+						drop: 2,
+					},
+					{
+						header: "$ in/out",
+						cells: roles.map(role => (role.cost ? formatCostPair(role) : "")),
+						align: "right",
+						placeholder: none,
+						max: 14,
+						drop: 1,
+					},
+				],
+				width,
+			),
+		);
+	} else if (unassigned.length === 0) {
+		lines.push(`${TABLE_INDENT}${dim("No roles assigned")}`);
 	}
+	if (unassigned.length > 0) pushIndented(lines, dim(`Unassigned: ${unassigned.join(", ")}`), 2, width);
+	lines.push(
+		...groupedWarnings(
+			roles.map(role => ({ name: role.role, warning: role.warning })),
+			width,
+		),
+	);
 	return lines;
 }
 
-function renderRoles(roles: readonly ProfileRoleRow[], warnings: readonly string[], width: number): string[] {
-	const lines: string[] = [];
-	const snapshotWarnings = [...new Set(warnings.map(cleanLine).filter(Boolean))];
-	for (const warning of snapshotWarnings) {
-		pushIndented(lines, theme.fg("warning", `${theme.status.warning} ${warning}`), 2, width);
-	}
-	if (roles.length === 0) {
-		if (snapshotWarnings.length > 0) lines.push("");
-		lines.push(theme.fg("dim", "No roles assigned"));
-		return lines;
-	}
+// ─── Agents ──────────────────────────────────────────────────────────────────
 
-	const visibleRoles = roles.filter(role => !isEmptyRole(role));
-	const emptyRoleNames = roles.filter(isEmptyRole).map(role => cleanLine(role.role) || "Unnamed role");
-	if (snapshotWarnings.length > 0 && (visibleRoles.length > 0 || emptyRoleNames.length > 0)) lines.push("");
-	if (visibleRoles.length > 0) {
-		const facts = visibleRoles.map(roleFacts);
-		lines.push(...(renderWideRoles(facts, width) ?? renderNarrowRoles(facts, width)));
-	}
-	if (emptyRoleNames.length > 0) {
-		if (visibleRoles.length > 0) lines.push("");
-		pushIndented(lines, theme.fg("dim", `No model assigned: ${emptyRoleNames.join(", ")}`), 2, width);
-	}
-	const roleWarnings = renderRoleWarnings(roles, width);
-	if (roleWarnings.length > 0) {
-		if (visibleRoles.length > 0 || emptyRoleNames.length > 0) lines.push("");
-		lines.push(...roleWarnings);
-	}
-	if (visibleRoles.some(role => role.cost)) lines.push(theme.fg("dim", "$ input/output per 1M tokens"));
-	return wrapLines(lines, width);
-}
-
-function agentAssignment(agent: ProfileAgentRow): string {
-	const selector = cleanLine(agent.selector);
+function agentTarget(agent: ProfileAgentRow): string {
 	const provider = cleanLine(agent.provider);
 	const model = cleanLine(agent.modelId);
-	let target = "";
-	let targetPlain = "";
-	if (provider && model) {
-		targetPlain = `${provider}/${model}`;
-		target = `${theme.fg("dim", `${provider}/`)}${model}`;
-	} else if (model || provider) {
-		targetPlain = model || provider;
-		target = targetPlain;
-	}
-	const canonicalSelector = targetPlain ? formatModelSelectorValue(targetPlain, agent.thinkingLevel) : "";
-	if (selector && selector !== targetPlain && selector !== canonicalSelector) {
-		target = target ? `${target}${theme.fg("dim", ` ← ${selector}`)}` : selector;
-	}
-	return target || theme.fg("dim", "Fallback: default role");
+	return provider && model ? `${provider}/${model}` : model || provider;
+}
+
+function agentModel(agent: ProfileAgentRow): string {
+	const provider = cleanLine(agent.provider);
+	const model = cleanLine(agent.modelId);
+	if (provider && model) return `${dim(`${provider}/`)}${model}`;
+	return agentTarget(agent) || cleanLine(agent.selector) || dim("Fallback: default role");
+}
+
+/** The configured selector when it names the model indirectly (an alias or a pattern). */
+function agentVia(agent: ProfileAgentRow): string {
+	const selector = cleanLine(agent.selector);
+	const target = agentTarget(agent);
+	if (!selector || !target || selector === target) return "";
+	return selector === formatModelSelectorValue(target, agent.thinkingLevel) ? "" : selector;
 }
 
 function renderAgents(snapshot: ProfileSnapshot, width: number): string[] {
-	if (snapshot.agents.length === 0) return [theme.fg("dim", "No agent assignments")];
-	const entries: LabelValue[] = [];
-	for (const agent of snapshot.agents) {
-		const statusLabel = agent.enabled ? "enabled" : "disabled";
-		const statusColor = agent.warning ? "warning" : agent.enabled ? "success" : "dim";
-		let thinking = "—";
-		if (agent.thinkingLevel !== undefined) {
-			const glyph = thinkingLevelGlyph(agent.thinkingLevel, theme);
-			const label = getConfiguredThinkingLevelMetadata(agent.thinkingLevel).label;
-			thinking = glyph ? `${glyph} ${label}` : label;
-		}
-		const assignment = agentAssignment(agent);
-		const state = theme.fg(statusColor, statusLabel);
-		const sourceAndThinking = theme.fg("dim", `${cleanLine(agent.source) || "unknown"} · ${thinking}`);
-		entries.push({
-			label: cleanLine(agent.name),
-			value: `${assignment} · ${state} · ${sourceAndThinking}`,
-		});
-		if (agent.warning) {
-			entries.push({
-				label: "",
-				value: theme.fg("warning", `${theme.status.warning} ${cleanLine(agent.warning)}`),
-			});
-		}
+	const agents = snapshot.agents;
+	const enabled = agents.filter(agent => agent.enabled).length;
+	const sources = new Set(agents.map(agent => cleanLine(agent.source) || "unknown"));
+	const details: string[] = [];
+	if (agents.length > 0) {
+		details.push(
+			enabled === agents.length ? "all enabled" : `${enabled} enabled · ${agents.length - enabled} disabled`,
+		);
+		if (sources.size === 1) details.push([...sources][0]!);
 	}
-	return renderLabelValues(entries, width);
-}
-
-function renderSettingsMemory(setup: ProfileDashboardSetupRef, snapshot: ProfileSnapshot, width: number): string[] {
-	const entries: LabelValue[] = [];
-	if (setup.kind === "current") {
-		entries.push({
-			label: "Settings",
-			value: theme.fg("muted", `${theme.status.info} All settings groups · current session`),
-		});
-	} else {
-		const included = new Set(setup.metadata?.enabledGroups ?? []);
-		const includedLabels = PROFILE_SETTINGS_GROUPS.filter(group => included.has(group.id)).map(group =>
-			cleanLine(group.label),
-		);
-		const inheritedLabels = PROFILE_SETTINGS_GROUPS.filter(group => !included.has(group.id)).map(group =>
-			cleanLine(group.label),
-		);
-		entries.push(
-			{
-				label: "Included",
-				value:
-					includedLabels.length > 0
-						? theme.fg("success", `${theme.status.enabled} ${includedLabels.join(", ")}`)
-						: theme.fg("dim", "None"),
-			},
-			{
-				label: "Inherited",
-				value:
-					inheritedLabels.length > 0
-						? theme.fg("dim", `${theme.status.shadowed} ${inheritedLabels.join(", ")}`)
-						: theme.fg("dim", "None"),
-			},
-		);
+	const lines = [sectionHeading(`Agents (${agents.length})`, details.join(" · ") || undefined)];
+	if (agents.length === 0) {
+		lines.push(`${TABLE_INDENT}${dim("No agent assignments")}`);
+		return lines;
 	}
-	entries.push(
-		{ label: "Memory", value: cleanLine(snapshot.memory.backend) },
-		...(snapshot.memory.scope ? [{ label: "Scope", value: cleanLine(snapshot.memory.scope) }] : []),
-		{ label: "Storage", value: cleanLine(snapshot.memory.storageLabel) },
+	lines.push(
+		...renderCompactTable(
+			[
+				{ header: "Agent", cells: agents.map(agent => cleanLine(agent.name)), max: 22 },
+				{ header: "Model", cells: agents.map(agentModel), flexMin: 20 },
+				{ header: "Via", cells: agents.map(agentVia), max: 20, drop: 2 },
+				{
+					header: "Think",
+					cells: agents.map(agent => thinkingText(agent.thinkingLevel)),
+					placeholder: dim("—"),
+					max: 12,
+					drop: 3,
+				},
+				// Uniform sources are already named in the heading.
+				{
+					header: "Source",
+					cells: sources.size > 1 ? agents.map(agent => dim(cleanLine(agent.source) || "unknown")) : [],
+					max: 12,
+					drop: 1,
+				},
+				{
+					header: "Status",
+					cells: agents.map(agent =>
+						theme.fg(
+							agent.warning ? "warning" : agent.enabled ? "success" : "dim",
+							agent.enabled ? `${theme.status.enabled} enabled` : `${theme.status.shadowed} disabled`,
+						),
+					),
+				},
+			],
+			width,
+		),
 	);
-	return renderLabelValues(entries, width);
-}
-
-function renderSplitBlocks(left: readonly string[], right: readonly string[], leftWidth: number): string[] {
-	const separator = theme.fg("dim", " │ ");
-	const lines: string[] = [];
-	const rowCount = Math.max(left.length, right.length);
-	for (let rowIndex = 0; rowIndex < rowCount; rowIndex++) {
-		const leftLine = left[rowIndex] ?? "";
-		const rightLine = right[rowIndex] ?? "";
-		lines.push(`${leftLine}${padding(Math.max(0, leftWidth - visibleWidth(leftLine)))}${separator}${rightLine}`);
-	}
+	lines.push(
+		...groupedWarnings(
+			agents.map(agent => ({ name: agent.name, warning: agent.warning })),
+			width,
+		),
+	);
 	return lines;
 }
-function sectionHeading(label: string): string {
-	return theme.bold(theme.fg("accent", cleanLine(label)));
+
+// ─── Usage ───────────────────────────────────────────────────────────────────
+
+/** This session's quota per provider bucket, aggregated as the `/usage` dashboard does. */
+function renderUsage(reports: readonly UsageReport[], snapshot: ProfileSnapshot, width: number): string[] {
+	const now = Date.now();
+	const cards = buildProviderCards([...reports], now);
+	const latest = Math.max(0, ...reports.map(report => report.fetchedAt ?? 0));
+	const lines = [
+		sectionHeading("Usage & limits", latest > 0 ? `updated ${formatDuration(now - latest)} ago` : undefined),
+	];
+	const providers: string[] = [];
+	const limits: string[] = [];
+	const bars: string[] = [];
+	const free: string[] = [];
+	const resets: string[] = [];
+	const push = (provider: string, limit: string, bar = "", left = "", reset = ""): void => {
+		providers.push(provider);
+		limits.push(limit);
+		bars.push(bar);
+		free.push(left);
+		resets.push(reset);
+	};
+	for (const card of cards.filter(card => !card.idle)) {
+		const name =
+			card.accounts > 1 ? `${cleanLine(card.name)} ${dim(`${card.accounts} accts`)}` : cleanLine(card.name);
+		if (card.unlimited) {
+			push(name, dim("no limits"));
+			continue;
+		}
+		for (const [index, window] of card.windows.slice(0, CARD_MAX_WINDOWS).entries()) {
+			const label = `${muted(cleanLine(window.label))}${window.windowTag ? dim(` ${cleanLine(window.windowTag)}`) : ""}`;
+			const reset = window.resetMs !== undefined ? dim(formatDuration(window.resetMs)) : "";
+			if (window.fraction === undefined) {
+				push(index === 0 ? name : "", label, "", dim(cleanLine(window.usedText ?? "no data")), reset);
+				continue;
+			}
+			push(
+				index === 0 ? name : "",
+				label,
+				renderUsageBar(window.fraction, window.status, USAGE_BAR_WIDTH),
+				theme.fg(usageStatusColor(window.status), `${Math.max(0, Math.round((1 - window.fraction) * 100))}%`),
+				reset,
+			);
+		}
+		const hidden = card.windows.length - CARD_MAX_WINDOWS;
+		if (hidden > 0) push("", dim(`+${hidden} more`));
+	}
+	if (providers.length > 0) {
+		lines.push(
+			...renderCompactTable(
+				[
+					{ header: "Provider", cells: providers, max: 24 },
+					{ header: "Limit", cells: limits, flexMin: 12 },
+					{ header: "Used", cells: bars, drop: 2 },
+					{ header: "Free", cells: free, align: "right", max: 16 },
+					{ header: "Resets in", cells: resets, align: "right", drop: 1 },
+				],
+				width,
+			),
+		);
+	}
+	const idle = cards.filter(card => card.idle).map(card => cleanLine(card.name));
+	if (idle.length > 0) {
+		pushIndented(
+			lines,
+			`${theme.fg("success", theme.status.success)} ${dim(`untouched: ${idle.join(" · ")}`)}`,
+			2,
+			width,
+		);
+	}
+	const reported = new Set(reports.map(report => report.provider));
+	const unreported = [
+		...new Set(
+			[...snapshot.roles, ...snapshot.agents]
+				.map(row => row.provider)
+				.filter((provider): provider is string => !!provider && !reported.has(provider)),
+		),
+	].map(provider => cleanLine(formatProviderName(provider)));
+	if (unreported.length > 0) pushIndented(lines, dim(`Not reported: ${unreported.join(" · ")}`), 2, width);
+	return lines;
 }
 
+/**
+ * The read-only profile overview: one summary line, then Models, Agents, and
+ * (for the current profile) Usage, each as a one-line-per-row table so the
+ * whole profile reads at a glance. The draft editor holds the full detail.
+ */
 export function buildProfilePreviewOverview(options: {
 	setup: ProfileDashboardSetupRef;
 	snapshot: ProfileSnapshot;
 	width: number;
-	/** This session's account usage report, rendered for a width; shown last. */
-	usage?: (width: number) => string;
+	/** This session's account usage reports; shown last, for the current profile only. */
+	usage?: readonly UsageReport[];
 }): string[] {
 	const { setup, snapshot } = options;
 	const width = Math.max(1, options.width);
-	const lines: string[] = [sectionHeading("Models"), ...renderRoles(snapshot.roles, snapshot.warnings, width), ""];
-
-	if (width >= 83) {
-		const availableWidth = width - 3;
-		const settingsWidth = Math.max(40, Math.floor(availableWidth / 3));
-		const agentsWidth = availableWidth - settingsWidth;
-		const agents = [sectionHeading("Agents"), ...renderAgents(snapshot, agentsWidth)];
-		const settings = [sectionHeading("Settings & memory"), ...renderSettingsMemory(setup, snapshot, settingsWidth)];
-		lines.push(...renderSplitBlocks(agents, settings, agentsWidth));
-	} else {
-		lines.push(
-			sectionHeading("Agents"),
-			...renderAgents(snapshot, width),
-			"",
-			sectionHeading("Settings & memory"),
-			...renderSettingsMemory(setup, snapshot, width),
-		);
-	}
-	if (options.usage) lines.push("", ...options.usage(width).split("\n"));
-
+	const rule = dim(theme.boxSharp.horizontal.repeat(width));
+	const lines = [
+		...renderSummary(setup, snapshot, width),
+		rule,
+		...renderModels(snapshot, width),
+		rule,
+		...renderAgents(snapshot, width),
+	];
+	if (options.usage && options.usage.length > 0) lines.push(rule, ...renderUsage(options.usage, snapshot, width));
 	return wrapLines(lines, width);
 }

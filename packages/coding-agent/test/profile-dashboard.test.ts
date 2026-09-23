@@ -1,5 +1,6 @@
 import { beforeAll, describe, expect, test } from "bun:test";
 import { stripVTControlCharacters } from "node:util";
+import type { UsageReport } from "@oh-my-pi/pi-ai";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import {
 	ProfileDashboard,
@@ -211,7 +212,7 @@ describe("profile dashboard interaction boundaries", () => {
 
 		const width = 96;
 		const height = 18;
-		const overview = pageOverviewUntil(dashboard, width, height, "Profile-local default storage", lines => {
+		const overview = pageOverviewUntil(dashboard, width, height, "zz-last-agent", lines => {
 			expect(lines).toHaveLength(height);
 			for (const line of lines) expect(Bun.stringWidth(line)).toBeLessThanOrEqual(width);
 			const rightPane = lines
@@ -224,7 +225,7 @@ describe("profile dashboard interaction boundaries", () => {
 			expect(rightPane).toContain("Saved profile");
 			expect(dashboard.selectedSetup).toEqual(savedSetup("beta"));
 		});
-		for (const section of ["Models", "Agents", "Settings & memory"]) {
+		for (const section of ["Includes:", "Models", "Agents"]) {
 			expect(overview).toContain(section);
 		}
 		expect(overview).toContain("fixture-model");
@@ -356,7 +357,7 @@ describe("profile dashboard interaction boundaries", () => {
 		clickSetup(compactLast);
 	});
 
-	test("aligns unequal model rows at wide widths and preserves every metric when narrow", () => {
+	test("aligns unequal model rows at wide widths and keeps each role on one row when narrow", () => {
 		const profile = snapshot();
 		Object.assign(profile.roles[0]!, {
 			int: 45.2,
@@ -392,28 +393,60 @@ describe("profile dashboard interaction boundaries", () => {
 		expect(primary.indexOf("$3/15") + "$3/15".length).toBe(secondary.indexOf("$2/8") + "$2/8".length);
 		expect(wideLines.join("\n")).toContain("Model catalog warning");
 
+		// A narrow pane drops low-priority columns instead of wrapping: each role stays one row.
 		const narrow = setup(48, []);
 		narrow.dashboard.setSetupState(CURRENT_SETUP, { snapshot: profile, loading: false });
-		narrow.dashboard.handleInput("\t");
-		const narrowSummary = pageOverviewUntil(narrow.dashboard, 80, 48, "Profile-local default storage", lines => {
-			expect(lines).toHaveLength(48);
-			for (const line of lines) expect(Bun.stringWidth(line)).toBeLessThanOrEqual(80);
+		const narrowLines = narrow.dashboard.render(80, 48).map(stripVTControlCharacters);
+		for (const line of narrowLines) expect(Bun.stringWidth(line)).toBeLessThanOrEqual(80);
+		const header = narrowLines.findIndex(line => line.includes("Role") && line.includes("Model"));
+		expect(header).toBeGreaterThan(0);
+		expect(narrowLines[header + 1]).toContain("fixture-model");
+		expect(narrowLines[header + 1]).toContain("45");
+		expect(narrowLines[header + 2]).toContain("secondary-model");
+		expect(narrowLines[header + 2]).toContain("74");
+		expect(narrowLines.join("\n")).toContain("Model catalog warning");
+	});
+
+	test("summarizes this session's usage per quota bucket, collapsing idle and naming unreported providers", () => {
+		const hour = 3_600_000;
+		const report = (provider: string, used: number): UsageReport => ({
+			provider,
+			fetchedAt: NOW,
+			limits: [
+				{
+					id: "weekly",
+					label: "Weekly",
+					scope: { provider, windowId: "7d", shared: true },
+					window: { id: "7d", label: "7d", durationMs: 168 * hour, resetsAt: NOW + 2 * hour },
+					amount: { unit: "percent", usedFraction: used },
+				},
+			],
 		});
-		for (const value of [
-			"fixture-model",
-			"secondary-model",
-			"45",
-			"74",
-			"0.9s",
-			"1.7s",
-			"128k",
-			"64k",
-			"$3/15",
-			"$2/8",
-			"Model catalog warning",
-		]) {
-			expect(narrowSummary).toContain(value);
-		}
+		const profile = snapshot();
+		profile.roles.push({
+			role: "web",
+			selector: "web/perplexity",
+			provider: "web",
+			modelId: "perplexity",
+			automatic: false,
+		});
+		const { dashboard } = setup(48, []);
+		dashboard.setSetupState(CURRENT_SETUP, {
+			snapshot: profile,
+			loading: false,
+			usage: [report("anthropic", 0.25), report("kimi-code", 0)],
+		});
+		const lines = dashboard.render(160, 48).map(stripVTControlCharacters);
+
+		const anthropic = lines.filter(line => line.includes("Anthropic"));
+		expect(anthropic).toHaveLength(1);
+		expect(anthropic[0]).toContain("Weekly");
+		expect(anthropic[0]).toContain("75%");
+		const kimi = lines.filter(line => line.includes("Kimi Code"));
+		expect(kimi).toHaveLength(1);
+		expect(kimi[0]).toContain("untouched");
+		expect(lines.find(line => line.includes("Not reported"))).toContain("Web");
+		expect(lines.find(line => line.includes("Not reported"))).not.toContain("Anthropic");
 	});
 
 	test("consolidates empty roles and identical warnings without losing affected role names", () => {
@@ -438,7 +471,7 @@ describe("profile dashboard interaction boundaries", () => {
 		expect(warningLines).toHaveLength(1);
 		expect(warningLines[0]).toContain("default");
 		expect(warningLines[0]).toContain("review");
-		const emptyLine = lines.find(line => line.includes("No model assigned"));
+		const emptyLine = lines.find(line => line.includes("Unassigned"));
 		if (!emptyLine) throw new Error("Expected empty model roles to be summarized");
 		expect(emptyLine).toContain("apply");
 		expect(emptyLine).toContain("compact");
@@ -450,7 +483,7 @@ describe("profile dashboard interaction boundaries", () => {
 		profile.agents.push({ name: "inherited-agent", enabled: true, source: "bundled" });
 		dashboard.setSetupState(CURRENT_SETUP, { snapshot: profile, loading: false });
 		dashboard.handleInput("\t");
-		const text = pageOverviewUntil(dashboard, 120, 48, "Settings & memory", lines => {
+		const text = pageOverviewUntil(dashboard, 120, 48, "inherited-agent", lines => {
 			expect(lines).toHaveLength(48);
 			for (const line of lines) expect(Bun.stringWidth(line)).toBeLessThanOrEqual(120);
 		});
@@ -474,7 +507,7 @@ describe("profile dashboard interaction boundaries", () => {
 	test("summarizes current and saved ownership without leaking the full scalar editor", () => {
 		const current = setup(48, []);
 		const currentText = current.dashboard.render(180, 48).map(stripVTControlCharacters).join("\n");
-		expect(currentText).toMatch(/All settings groups[^\n]*current session/);
+		expect(currentText).toMatch(/Settings:[^\n]*current session/);
 		expect(currentText).not.toContain("Model options");
 
 		const { dashboard, actions } = setup(48, ["beta"]);
@@ -538,9 +571,9 @@ describe("profile dashboard interaction boundaries", () => {
 		expect(actions).toEqual(setupSelection);
 		dashboard.handleInput("\t");
 
-		const summary = pageOverviewUntil(dashboard, 120, 48, "Provider settings").replace(/\s+/g, " ");
-		expect(summary).toMatch(/Included.*Context.*Agents & tasks/);
-		expect(summary).toMatch(/Inherited.*Model options.*Appearance.*Provider settings/);
+		const summary = pageOverviewUntil(dashboard, 120, 48, "Includes:").replace(/\s+/g, " ");
+		expect(summary).toMatch(/Includes: Context, Agents & tasks/);
+		expect(summary).toContain("8 groups inherited");
 		for (const editorField of [
 			"Auto-Compact",
 			"Temperature",
@@ -596,13 +629,10 @@ describe("profile dashboard interaction boundaries", () => {
 		if (!wideModel) throw new Error("Expected the overview model row");
 		const firstDivider = wideModel.indexOf("│");
 		expect(wideModel.slice(firstDivider + 1, wideModel.indexOf("fixture-model"))).not.toContain("│");
-		const agentsWideRow = wide.findIndex(line => line.includes("Agents"));
-		const settingsWideRow = wide.findIndex(line => line.includes("Settings & memory"));
-		expect(agentsWideRow).toBeGreaterThan(0);
-		expect(settingsWideRow).toBe(agentsWideRow);
+		expect(wide.join("\n")).toContain("sqlite (workspace)");
 
 		dashboard.handleInput("\t");
-		const narrowOverview = pageOverviewUntil(dashboard, 80, 24, "Profile-local default storage", lines => {
+		const narrowOverview = pageOverviewUntil(dashboard, 80, 24, "sonic", lines => {
 			expect(lines).toHaveLength(24);
 			for (const line of lines) expect(Bun.stringWidth(line)).toBeLessThanOrEqual(80);
 			expect(lines.join("\n")).toContain("Current profile");
@@ -611,20 +641,18 @@ describe("profile dashboard interaction boundaries", () => {
 			"Models",
 			"fixture-model",
 			"Agents",
-			"Settings & memory",
 			"sqlite",
 			"workspace",
 			"Profile-local default storage",
 		]) {
 			expect(narrowOverview).toContain(value);
 		}
-		expect(narrowOverview.indexOf("Settings & memory")).toBeGreaterThan(narrowOverview.indexOf("Agents"));
 
 		const resizedWide = dashboard.render(220, 40);
 		expect(resizedWide).toHaveLength(40);
 		for (const line of resizedWide) expect(Bun.stringWidth(line)).toBeLessThanOrEqual(220);
 		moveOverviewToStart(dashboard, 220, 40);
-		const reachableAgain = pageOverviewUntil(dashboard, 220, 40, "Profile-local default storage");
+		const reachableAgain = pageOverviewUntil(dashboard, 220, 40, "sonic");
 		expect(reachableAgain).toContain("fixture-model");
 		expect(reachableAgain).toContain("security-reviewer");
 		expect(actions).toEqual([]);

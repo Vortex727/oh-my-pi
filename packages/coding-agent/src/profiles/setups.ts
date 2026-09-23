@@ -397,7 +397,7 @@ export function setDraftGroup(
 
 // ─── Storage ─────────────────────────────────────────────────────────────────
 
-async function readSetupFile(filePath: string, name: string): Promise<ProfileDraft & { warnings: string[] }> {
+async function readSetupDocument(filePath: string, name: string): Promise<unknown> {
 	const file = Bun.file(filePath);
 	let content: string;
 	try {
@@ -408,13 +408,27 @@ async function readSetupFile(filePath: string, name: string): Promise<ProfileDra
 		if (isEnoent(error)) throw new SetupError("not-found", `Profile "${name}" was not found`, { cause: error });
 		throw error;
 	}
-	let document: unknown;
 	try {
-		document = YAML.parse(content);
+		return YAML.parse(content);
 	} catch (error) {
 		throw new SetupError("invalid", `Profile "${name}" is not valid YAML`, { cause: error });
 	}
-	return parseSetupDocument(document);
+}
+
+async function readSetupFile(filePath: string, name: string): Promise<ProfileDraft & { warnings: string[] }> {
+	return parseSetupDocument(await readSetupDocument(filePath, name));
+}
+
+/** Atomically replace `filePath` with `content`. */
+async function replaceSetupFile(filePath: string, content: string): Promise<void> {
+	const tempPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+	await Bun.write(tempPath, content);
+	try {
+		await replaceFileAtomically(tempPath, filePath);
+	} catch (error) {
+		await fs.rm(tempPath, { force: true });
+		throw error;
+	}
 }
 
 /** List saved setups by name, including unreadable ones with their error. */
@@ -482,14 +496,7 @@ export async function saveSetup(
 	}
 	await fs.mkdir(setupsDirectory(agentDir), { recursive: true });
 	if (options.overwrite) {
-		const tempPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
-		await Bun.write(tempPath, content);
-		try {
-			await replaceFileAtomically(tempPath, filePath);
-		} catch (error) {
-			await fs.rm(tempPath, { force: true });
-			throw error;
-		}
+		await replaceSetupFile(filePath, content);
 	} else {
 		try {
 			await fs.writeFile(filePath, content, { flag: "wx" });
@@ -501,6 +508,35 @@ export async function saveSetup(
 		}
 	}
 	return { name: normalized, updatedAt: Date.now(), metadata: draft.metadata };
+}
+
+/**
+ * Set or clear one saved setup's emoji. Every other entry stays as written,
+ * including entries this version of omp skipped on load, so an emoji change
+ * never drops settings a newer omp understands.
+ */
+export async function setSavedSetupEmoji(
+	name: string,
+	emoji: ProfileEmoji | undefined,
+	agentDir: string = getAgentDir(),
+): Promise<SavedSetupDescriptor> {
+	const normalized = normalizeSetupName(name);
+	const filePath = setupFilePath(normalized, agentDir);
+	const document = await readSetupDocument(filePath, normalized);
+	// Parsing validates the format version before anything is written.
+	const { metadata } = parseSetupDocument(document);
+	const { [SETUP_METADATA_KEY]: rawMetadata, ...entries } = document as Record<string, unknown>;
+	const nextMetadata: Record<string, unknown> = isPlainRecord(rawMetadata)
+		? { ...rawMetadata }
+		: { version: SETUP_FORMAT_VERSION, enabledGroups: metadata.enabledGroups };
+	if (emoji === undefined) delete nextMetadata.emoji;
+	else nextMetadata.emoji = emoji;
+	const content = stringifyYamlConfig({ [SETUP_METADATA_KEY]: nextMetadata, ...entries });
+	if (Buffer.byteLength(content) > MAX_SETUP_BYTES) {
+		throw new SetupError("too-large", `Profile "${normalized}" is larger than 1 MiB`);
+	}
+	await replaceSetupFile(filePath, content);
+	return { name: normalized, updatedAt: Date.now(), metadata: { ...metadata, emoji } };
 }
 
 /** Rename a saved setup without replacing another one. Case-only renames are allowed. */

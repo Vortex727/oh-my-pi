@@ -55,6 +55,8 @@ export interface ProfileEmojiPickerOptions {
 	value?: ProfileEmoji;
 	name?: string;
 	terminalHeight?: number;
+	/** The choice is committed to the saved profile as soon as it is made. */
+	saveImmediately?: boolean;
 	onSelect(value: ProfileEmoji | undefined): void;
 	onCancel(): void;
 	requestRender(): void;
@@ -108,13 +110,17 @@ export class ProfileEmojiPicker implements Component {
 		const preview = `${previewEmoji}${padding(Math.max(0, EMOJI_SLOT_WIDTH - visibleWidth(previewEmoji)))}  ${
 			previewName || "Profile"
 		} · ${selected?.label ?? "No emoji"}`;
-		const notice = "Curated labels only";
+		const notice = this.#options.saveImmediately
+			? "Choosing saves this profile emoji immediately"
+			: "Curated labels only";
 		const lines = [topBorder(width, "Profile emoji"), row(theme.fg("dim", notice), width)];
 		if (this.#error) lines.push(row(theme.fg("error", `${theme.status.error} ${this.#error}`), width));
 		this.#contentStart = lines.length;
 		for (let index = 0; index < contentRows; index++) lines.push(row(listLines[index] ?? "", width));
 		lines.push(divider(width));
-		const action = "Enter to choose · Esc to cancel";
+		const action = this.#options.saveImmediately
+			? "Enter to save · Esc to cancel"
+			: "Enter to choose · Esc to cancel";
 		lines.push(row(`Preview  ${preview}  ${theme.fg("dim", action)}`, width));
 		lines.push(bottomBorder(width));
 		return lines;
@@ -136,6 +142,12 @@ export interface ProfileEditorCallbacks {
 	onSave(draft: ProfileDraft, saveAsNew: boolean): void | Promise<void>;
 	onEditAgent(agent: string, draft: ProfileDraft): Promise<ProfileDraft | undefined>;
 	onCancel(): void;
+	/**
+	 * Commit only the emoji of an existing saved profile. Resolves true once
+	 * written, false when the editor closed first. Omitted for drafts, whose
+	 * emoji saves with the rest of the draft.
+	 */
+	onSaveEmoji?(value: ProfileEmoji | undefined): Promise<boolean>;
 }
 
 export interface ProfileEditorOptions {
@@ -243,7 +255,9 @@ export class ProfileEditorComponent implements Component {
 			composerPreviewStatus: options.settingsContext?.composerPreviewStatus,
 			requestRender: this.#callbacks.requestRender,
 		};
-		const draftNotice = "Draft only; changes do not affect the active session.";
+		const draftNotice = this.#callbacks.onSaveEmoji
+			? "Emoji choices save immediately; other changes remain draft-only."
+			: "Draft only; changes do not affect the active session.";
 		this.#selector = new SettingsSelectorComponent(
 			runtime,
 			{
@@ -316,7 +330,9 @@ export class ProfileEditorComponent implements Component {
 						id: "emoji",
 						label: "Emoji",
 						currentValue: emoji ? `${emoji} ${emojiLabel}` : emojiLabel,
-						description: "Choose a curated emoji for this profile draft.",
+						description: this.#callbacks.onSaveEmoji
+							? "Choose a curated emoji. This profile metadata change saves immediately."
+							: "Choose a curated emoji for this profile draft.",
 						onActivate: () => this.#openEmojiPicker(),
 					},
 				],
@@ -497,8 +513,13 @@ export class ProfileEditorComponent implements Component {
 			name: this.#name,
 			value: this.#draft.metadata.emoji,
 			terminalHeight: this.#terminalHeight,
+			saveImmediately: this.#callbacks.onSaveEmoji !== undefined,
 			requestRender: this.#callbacks.requestRender,
 			onSelect: value => {
+				if (this.#callbacks.onSaveEmoji) {
+					void this.#saveEmoji(this.#callbacks.onSaveEmoji, value, picker);
+					return;
+				}
 				this.#setEmoji(value);
 				this.#showMain();
 			},
@@ -514,6 +535,27 @@ export class ProfileEditorComponent implements Component {
 			metadata: { ...this.#draft.metadata, emoji: value },
 		};
 		this.#error = undefined;
+	}
+
+	/** Commit the emoji alone; a failed write stays in the picker so the choice can be retried. */
+	async #saveEmoji(
+		saveEmoji: (value: ProfileEmoji | undefined) => Promise<boolean>,
+		value: ProfileEmoji | undefined,
+		picker: ProfileEmojiPicker,
+	): Promise<void> {
+		if (this.#busy) return;
+		this.#busy = true;
+		try {
+			if (!(await saveEmoji(value))) return;
+			this.#setEmoji(value);
+			this.#showMain();
+		} catch (error) {
+			picker.setError(cleanImportedLine(error instanceof Error ? error.message : error) || "Unable to save emoji");
+			this.#callbacks.requestRender();
+		} finally {
+			this.#busy = false;
+			if (!this.#nested) this.#refresh();
+		}
 	}
 
 	async #editRole(role: string): Promise<void> {

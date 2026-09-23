@@ -244,6 +244,60 @@ describe("profile draft editor isolation", () => {
 		expect(saved.map(entry => entry.draft.metadata.emoji)).toEqual(["🪙"]);
 	});
 
+	test("serializes immediate emoji saves and preserves the draft when a write fails", async () => {
+		const draft = modelsOnlyDraft();
+		draft.metadata.emoji = "⚡";
+		const firstSave = Promise.withResolvers<boolean>();
+		const secondSave = Promise.withResolvers<boolean>();
+		const cancelled = vi.fn();
+		let attempt = 0;
+		const onSaveEmoji = vi.fn((_value: ProfileEmoji | undefined) => {
+			attempt++;
+			return attempt === 1 ? firstSave.promise : secondSave.promise;
+		});
+		const { editor } = createEditor({
+			draft,
+			callbacks: {
+				requestRender: () => {},
+				onEditRole: async (_role, current) => current,
+				onEditAgent: async (_agent, current) => current,
+				onSave: () => {},
+				onSaveEmoji,
+				onCancel: cancelled,
+			},
+		});
+
+		editor.handleInput("\r");
+		editor.handleInput("\x1b[B");
+		editor.handleInput("\r");
+		expect(onSaveEmoji).toHaveBeenCalledTimes(1);
+		expect(onSaveEmoji).toHaveBeenLastCalledWith("🪙");
+		expect(editor.draft.metadata.emoji).toBe("⚡");
+
+		editor.handleInput("\x1b[B");
+		editor.handleInput("\r");
+		editor.handleInput("\x1b");
+		expect(onSaveEmoji).toHaveBeenCalledTimes(1);
+		expect(cancelled).not.toHaveBeenCalled();
+
+		firstSave.reject(new Error("\x1b[31mwrite\tfailed\nunsafe\x1b[0m"));
+		await firstSave.promise.catch(() => undefined);
+		await Promise.resolve();
+		expect(editor.draft.metadata.emoji).toBe("⚡");
+		expect(editor.render(80).map(stripVTControlCharacters).join("\n")).toContain("write failed unsafe");
+
+		editor.handleInput("\r");
+		expect(onSaveEmoji).toHaveBeenCalledTimes(2);
+		expect(onSaveEmoji).toHaveBeenLastCalledWith("🪙");
+		secondSave.resolve(true);
+		await secondSave.promise;
+		await Promise.resolve();
+		expect(editor.draft.metadata.emoji).toBe("🪙");
+
+		editor.handleInput("\x1b");
+		expect(cancelled).toHaveBeenCalledTimes(1);
+	});
+
 	test("keeps a rejected save visible and accepts a later retry", async () => {
 		const saved: ProfileDraft[] = [];
 		let attempts = 0;

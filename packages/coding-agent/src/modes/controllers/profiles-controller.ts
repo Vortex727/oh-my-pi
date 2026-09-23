@@ -25,10 +25,11 @@ import {
 	type SavedSetupDescriptor,
 	SetupError,
 	saveSetup,
+	setSavedSetupEmoji,
 	setupOverrides,
 } from "../../profiles/setups";
 import { buildProfileSnapshot } from "../../profiles/snapshot";
-import type { ProfileDraft, ProfileSnapshot } from "../../profiles/types";
+import type { ProfileDraft, ProfileEmoji, ProfileSnapshot } from "../../profiles/types";
 import {
 	ProfileDashboard,
 	type ProfileDashboardActiveControl,
@@ -296,26 +297,39 @@ export class ProfilesController {
 
 	#editSetup(setup: ProfileDashboardSetupRef): Promise<void> {
 		return this.#interaction(async () => {
-			const draft =
-				setup.kind === "saved" ? await loadSavedSetup(setup.name, this.#agentDir()) : this.#currentDraft();
-			const saved = await this.#openEditor(setup, { metadata: draft.metadata, config: draft.config });
+			const loaded = setup.kind === "saved" ? await loadSavedSetup(setup.name, this.#agentDir()) : undefined;
+			const draft = loaded ?? this.#currentDraft();
+			const saved = await this.#openEditor(
+				setup,
+				{ metadata: draft.metadata, config: draft.config },
+				loaded?.warnings,
+			);
 			if (saved === undefined) return undefined;
 			await this.#refresh({ kind: "saved", name: saved });
 			return { message: `Saved profile ${cleanText(saved)}. Load it to use it.`, tone: "success" };
 		});
 	}
 
-	/** Save an edited draft, prompting for a name when it is new. Resolves the saved name, or undefined when cancelled. */
+	/**
+	 * Save an edited draft, prompting for a name when it is new. Resolves the
+	 * saved name, or undefined when cancelled. `skipped` lists entries the
+	 * existing file holds that this version could not load; overwriting drops them.
+	 */
 	async #saveDraft(
 		setup: ProfileDashboardSetupRef,
 		draft: ProfileDraft,
 		saveAsNew: boolean,
+		skipped: readonly string[],
 	): Promise<string | undefined> {
 		const signal = this.#dialogs.signal;
 		if (setup.kind === "saved" && !saveAsNew) {
+			const drops =
+				skipped.length > 0
+					? `\nSaving also drops ${skipped.length} entr${skipped.length === 1 ? "y" : "ies"} this version of omp cannot load: ${cleanText(skipped[0])}`
+					: "";
 			const confirmed = await this.ctx.showHookConfirm(
 				`Save changes to ${cleanText(setup.name)}?`,
-				"This replaces the saved profile only. The current session does not change.",
+				`This replaces the saved profile only. The current session does not change.${drops}`,
 				{ signal },
 			);
 			if (!confirmed) return undefined;
@@ -336,8 +350,21 @@ export class ProfilesController {
 		}
 	}
 
-	/** Open the isolated draft editor. Resolves the saved setup name, or undefined when the edit was cancelled. */
-	async #openEditor(setup: ProfileDashboardSetupRef, draft: ProfileDraft): Promise<string | undefined> {
+	/** Commit one saved profile's emoji now; the rest of the open draft stays unsaved. */
+	async #saveEmoji(name: string, emoji: ProfileEmoji | undefined, isClosed: () => boolean): Promise<boolean> {
+		if (isClosed() || this.#dialogs.signal.aborted) return false;
+		const saved = await setSavedSetupEmoji(name, emoji, this.#agentDir());
+		this.#descriptors = this.#descriptors.map(item => (item.name === saved.name ? saved : item));
+		this.#dashboard?.setSetups(this.#setupRefs(), { kind: "saved", name: saved.name });
+		return !isClosed();
+	}
+
+	/** Open the isolated draft editor. Resolves the saved profile name, or undefined when the edit was cancelled. */
+	async #openEditor(
+		setup: ProfileDashboardSetupRef,
+		draft: ProfileDraft,
+		skipped: readonly string[] = [],
+	): Promise<string | undefined> {
 		const effective = this.#draftSettings(draft, "default", "PROFILE DRAFT");
 		const inherited = setup.kind === "saved" ? await this.#previewSettings(undefined) : this.ctx.settings;
 		const availableThemes = await getAvailableThemes();
@@ -404,13 +431,15 @@ export class ProfilesController {
 				onSave: async (value, saveAsNew) => {
 					handle.setHidden(true);
 					try {
-						const name = await this.#saveDraft(setup, value, saveAsNew || setup.kind === "current");
+						const name = await this.#saveDraft(setup, value, saveAsNew || setup.kind === "current", skipped);
 						if (name !== undefined) finish(name);
 					} finally {
 						reveal();
 					}
 				},
 				onCancel: cancel,
+				onSaveEmoji:
+					setup.kind === "saved" ? emoji => this.#saveEmoji(setup.name, emoji, () => finished) : undefined,
 			},
 		});
 		const handle = this.host.showFullscreenMenu(editor);

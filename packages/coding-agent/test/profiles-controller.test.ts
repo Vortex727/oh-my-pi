@@ -11,14 +11,29 @@ import type { ProfileEditorComponent } from "@oh-my-pi/pi-coding-agent/modes/com
 import { ProfilesController, type ProfilesHost } from "@oh-my-pi/pi-coding-agent/modes/controllers/profiles-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { saveSetup } from "@oh-my-pi/pi-coding-agent/profiles/setups";
+import { PROFILE_EMOJIS } from "@oh-my-pi/pi-coding-agent/profiles/types";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import type { Component, OverlayHandle } from "@oh-my-pi/pi-tui";
 import type { SettingsSelectorComponent } from "@oh-my-pi/pi-tui/overlays/settings-selector";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { setAgentDir, setProjectDir, TempDir } from "@oh-my-pi/pi-utils";
+import { YAML } from "bun";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
 
 const NEW_SESSION = "Start a new session";
+/** A saved profile holding an entry a newer omp wrote and this version skips on load. */
+const FOCUS_WITH_FUTURE_ENTRY = [
+	"$setup:",
+	"  version: 1",
+	"  enabledGroups: [context]",
+	"modelRoles:",
+	"  smol: anthropic/claude-haiku-4-5",
+	"compaction:",
+	"  enabled: true",
+	"futureSection:",
+	"  flag: true",
+	"",
+].join("\n");
 
 interface DialogOptions {
 	signal?: AbortSignal;
@@ -27,6 +42,7 @@ interface DialogOptions {
 interface ShownDialog<T> {
 	promise: Promise<T>;
 	signal: AbortSignal | undefined;
+	message: string;
 }
 
 /** Like the real dialogs: resolve with `answer`, or with `aborted` once the signal fires. */
@@ -103,6 +119,7 @@ describe("ProfilesController", () => {
 		const prompts: string[] = [];
 		const editors = signalQueue<ProfileEditorComponent>();
 		const settingsShown = signalQueue<void>();
+		const rendered = signalQueue<void>();
 		const startNewSession = vi.fn(async (_label: string) => true);
 		const ctx = {
 			settings,
@@ -116,15 +133,15 @@ describe("ProfilesController", () => {
 				setModelTemporary: async () => {},
 			},
 			sessionManager: { getCwd: () => projectDir },
-			ui: { requestRender: () => {}, setFocus: () => {}, terminal: { rows: 40 } },
+			ui: { requestRender: () => rendered.fire(), setFocus: () => {}, terminal: { rows: 40 } },
 			statusLine: {},
 			showWarning: () => {},
 			startNewSession,
 			showHookSelector: (_title: string, _items: unknown, options?: DialogOptions) =>
 				dialog(choice.promise, undefined, options?.signal),
-			showHookConfirm: (_title: string, _message: string, options?: DialogOptions) => {
+			showHookConfirm: (_title: string, message: string, options?: DialogOptions) => {
 				const promise = dialog(confirm.promise, false, options?.signal);
-				confirmShown.resolve({ promise, signal: options?.signal });
+				confirmShown.resolve({ promise, signal: options?.signal, message });
 				return promise;
 			},
 			showHookInput: async (title: string, _placeholder?: string, options?: DialogOptions) => {
@@ -175,6 +192,14 @@ describe("ProfilesController", () => {
 			mount,
 			dashboard: () => dashboard!,
 			screen: () => stripVTControlCharacters(dashboard!.render(160, 40).join("\n")),
+			/**
+			 * Wait on real render requests until `predicate` holds. The predicate
+			 * must not render: a render that requests another render would spin
+			 * this loop on microtasks and starve the test timeout.
+			 */
+			renderedUntil: async (predicate: () => boolean) => {
+				while (!predicate()) await rendered.next();
+			},
 			/** Select the saved `focus` profile, press `l`, and choose a new session. */
 			loadFocus: () => {
 				dashboard!.handleInput("\x1b[B");
@@ -259,6 +284,52 @@ describe("ProfilesController", () => {
 		expect(await Bun.file(focusPath).bytes()).toEqual(focusBytes);
 		expect(fs.readdirSync(path.join(agentDir, "setups")).sort()).toEqual(["focus.yml", "fresh.yml"]);
 		expect(h.screen()).toContain("fresh");
+	});
+
+	it("writes a saved profile's emoji at once and alone, keeping entries this version skipped", async () => {
+		const focusPath = path.join(agentDir, "setups", "focus.yml");
+		await Bun.write(focusPath, FOCUS_WITH_FUTURE_ENTRY);
+		const readFocus = () => YAML.parse(fs.readFileSync(focusPath, "utf8")) as Record<string, Record<string, unknown>>;
+		const emoji = PROFILE_EMOJIS[0]!.emoji;
+		const h = await harness();
+		const editorShown = h.nextEditor();
+		h.dashboard().handleInput("\x1b[B");
+		h.dashboard().handleInput("\r");
+		const editor = await editorShown;
+
+		editor.handleInput("\r");
+		editor.handleInput("\x1b[B");
+		editor.handleInput("\r");
+		await h.renderedUntil(() => readFocus().$setup?.emoji === emoji);
+		expect(h.screen()).toContain(`${emoji} focus`);
+
+		expect(readFocus()).toEqual({
+			$setup: { version: 1, enabledGroups: ["context"], emoji },
+			modelRoles: { smol: "anthropic/claude-haiku-4-5" },
+			compaction: { enabled: true },
+			futureSection: { flag: true },
+		});
+		const closed = h.nextSettingsShown();
+		editor.handleInput("\x1b");
+		await closed;
+		expect(readFocus().$setup?.emoji).toBe(emoji);
+	});
+
+	it("names the skipped entries an overwrite would drop before saving", async () => {
+		const focusPath = path.join(agentDir, "setups", "focus.yml");
+		await Bun.write(focusPath, FOCUS_WITH_FUTURE_ENTRY);
+		const before = await Bun.file(focusPath).bytes();
+		const h = await harness();
+		const editorShown = h.nextEditor();
+		h.dashboard().handleInput("\x1b[B");
+		h.dashboard().handleInput("\r");
+		(await editorShown).handleInput("\x13");
+
+		const shown = await h.confirmShown;
+		expect(shown.message).toContain("futureSection");
+		h.confirm.resolve(false);
+		expect(await shown.promise).toBe(false);
+		expect(await Bun.file(focusPath).bytes()).toEqual(before);
 	});
 
 	it("returning to Profiles rediscovers added setups and drops missing ones", async () => {

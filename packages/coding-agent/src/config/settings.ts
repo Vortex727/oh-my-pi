@@ -542,6 +542,8 @@ export class Settings {
 	#quarantinedYamlTargets = new Map<string, string>();
 	/** Extra config.yml-style overlays passed by CLI */
 	#configOverlay: RawSettings = {};
+	/** Saved setup applied to this session; never persisted. Sits above `#configOverlay`. */
+	#setupLayer: RawSettings = {};
 	/** Project settings file that most recently supplied shellPath. */
 	#projectShellPathSource: string | undefined;
 	/** Capability warnings already surfaced for the current project scope; reloads stay quiet. */
@@ -731,6 +733,7 @@ export class Settings {
 		const segments = path.split(".");
 		this.#captureGlobalMutation(path, this.#modifiedPathMutations, getByPath(this.#global, segments));
 		setByPath(this.#global, segments, value);
+		this.#releaseSetupPath(segments);
 		this.#persistedMutationGeneration++;
 		this.#modified.add(path);
 		this.#rebuildMerged();
@@ -781,6 +784,38 @@ export class Settings {
 		const next = this.get(path);
 		SETTING_HOOKS[path]?.(next, prev);
 		this.#fireEffectiveSettingChanged(path, next, prev);
+	}
+
+	/**
+	 * Replace the saved-setup layer for this session. The layer sits above
+	 * explicit `--config` overlays and below runtime overrides, and is never
+	 * persisted. Editing a setting it owns drops that path from the layer so the
+	 * edit takes effect and persists as usual. `undefined` clears the layer.
+	 */
+	applySetupLayer(config: RawSettings | undefined): void {
+		const paths = Object.keys(SETTINGS_SCHEMA) as SettingPath[];
+		const previous = paths.map(path => this.get(path));
+		const previousCodeModeValues = this.#codeModeSignalSnapshot();
+		this.#setupLayer = config === undefined ? {} : this.#migrateRawSettings(structuredClone(config), false);
+		this.#rebuildMerged();
+		this.#fireCodeModeChangeIfNeeded(previousCodeModeValues);
+		for (const [index, path] of paths.entries()) {
+			const prev = previous[index];
+			const next = this.get(path);
+			if (Bun.deepEquals(next, prev)) continue;
+			SETTING_HOOKS[path]?.(next, prev);
+			this.#fireEffectiveSettingChanged(path, next, prev);
+		}
+	}
+
+	/** Drop a setup-owned path so an explicit edit of that setting takes effect. */
+	#releaseSetupPath(segments: readonly string[]): void {
+		let parent: unknown = this.#setupLayer;
+		for (const segment of segments.slice(0, -1)) {
+			if (!isRecord(parent)) return;
+			parent = parent[segment];
+		}
+		if (isRecord(parent)) delete parent[segments[segments.length - 1]];
 	}
 
 	/** Effective values of every setting that repartitions the Code Mode surface. */
@@ -879,6 +914,7 @@ export class Settings {
 		if (!this.#persist) cloned.#projectShellPathSource = this.#projectShellPathSource;
 		cloned.#configFiles = [...this.#configFiles];
 		cloned.#configOverlay = structuredClone(this.#configOverlay);
+		cloned.#setupLayer = structuredClone(this.#setupLayer);
 		cloned.#overlayShellPathSource = this.#overlayShellPathSource;
 		cloned.#overrides = this.#buildOriginalOverrides();
 		cloned.#rebuildMerged();
@@ -1263,6 +1299,7 @@ export class Settings {
 		const projectRoles = getByPath(this.#project, ["modelRoles"]);
 		const current: Record<string, unknown> = isRecord(projectRoles) ? { ...projectRoles } : {};
 		current[role] = modelId;
+		this.#releaseSetupPath(["modelRoles", role]);
 		setByPath(this.#project, ["modelRoles"], current);
 		this.#modifiedProjectModelRoles.add(role);
 		this.#persistedMutationGeneration++;
@@ -1289,6 +1326,7 @@ export class Settings {
 		const prev = this.get("modelRoles");
 		const current = this.#modelRolesFromLayer(this.#global);
 		this.#captureGlobalMutation(role, this.#modifiedGlobalModelRoleMutations, current[role]);
+		this.#releaseSetupPath(["modelRoles", role]);
 		if (modelId === undefined) {
 			delete current[role];
 		} else {
@@ -1366,8 +1404,10 @@ export class Settings {
 
 	/**
 	 * Report which layer actually supplies the effective model role across
-	 * full merge precedence (runtime override → config overlay → project →
-	 * global → default). Unlike {@link getModelRoleSource}, this accounts
+	 * full merge precedence (runtime override → saved setup / config overlay →
+	 * project → global → default). A saved-setup role reports as `"overlay"`:
+	 * both are explicit non-persisted layers above project config. Unlike
+	 * {@link getModelRoleSource}, this accounts
 	 * for runtime and config-overlay layers and detects ownership by key
 	 * presence rather than normalized value, so a `null` tombstone in the
 	 * overlay or runtime layer correctly blocks lower layers. The project
@@ -1377,6 +1417,7 @@ export class Settings {
 	 */
 	getModelRoleProvenance(role: ModelRole | string): "runtime" | "overlay" | "project" | "global" | "default" {
 		if (this.#modelRoleLayerOwns(this.#overrides, role)) return "runtime";
+		if (this.#modelRoleLayerOwns(this.#setupLayer, role)) return "overlay";
 		if (this.#modelRoleLayerOwns(this.#configOverlay, role)) return "overlay";
 		if (this.#modelRoleLayerOwns(this.#projectSettingsForMerge(), role)) return "project";
 		if (this.#modelRoleLayerOwns(this.#global, role)) return "global";
@@ -3319,6 +3360,7 @@ export class Settings {
 		this.#revision++;
 		this.#merged = this.#deepMerge(this.#deepMerge({}, this.#global), this.#projectSettingsForMerge());
 		this.#merged = this.#deepMerge(this.#merged, this.#configOverlay);
+		this.#merged = this.#deepMerge(this.#merged, this.#setupLayer);
 		this.#merged = this.#deepMerge(this.#merged, this.#overrides);
 		this.#resolvedCache.clear();
 		this.#groupCache.clear();

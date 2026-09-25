@@ -1,13 +1,14 @@
 /**
  * Contracts of the fullscreen /agents hub: frame geometry, scope sidebar
- * filtering, type-to-filter search, the Space enable/disable toggle, and the
+ * filtering, type-to-filter search, the Space enable/disable toggle, the
  * strip-driven configuration flows (property strips, pattern input, and the
- * model-browser pick) persisting one agent's entry at a time.
+ * model-browser pick) persisting one agent's entry at a time, and the host
+ * options (title, initial agent, no creation without creation deps).
  */
 import { beforeAll, describe, expect, test } from "bun:test";
 import { Effort } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import { AgentsHubComponent, type HubAgent } from "../src/overlays/agents-hub";
+import { AgentsHubComponent, type AgentsHubOptions, type HubAgent } from "../src/overlays/agents-hub";
 import { initTheme } from "../src/theme";
 import type { TUI } from "../src/index";
 
@@ -56,7 +57,10 @@ const sonnet = buildModel({
 	maxTokens: 8192,
 });
 
-async function createHub(settings: TestSettings): Promise<{
+async function createHub(
+	settings: TestSettings,
+	options: { creation?: boolean; hub?: AgentsHubOptions } = {},
+): Promise<{
 	hub: AgentsHubComponent;
 	strip: () => string;
 	type: (text: string) => void;
@@ -110,14 +114,19 @@ async function createHub(settings: TestSettings): Promise<{
 			effectiveAdvisorPattern: agent => (agent.advisorOverride === "on" ? "@advisor" : undefined),
 			setAgentDisabled: (name, disabled) => settings.setMember("task.disabledAgents", name, disabled),
 			setAgentOverride: (property, name, value) => settings.setEntry(OVERRIDE_KEYS[property], name, value),
-			generateAgent: async () => {
-				throw new Error("Agent generation is not used by configuration tests");
-			},
-			saveAgent: async () => {
-				throw new Error("Agent creation is not used by configuration tests");
-			},
+			...(options.creation === false
+				? {}
+				: {
+						generateAgent: async () => {
+							throw new Error("Agent generation is not used by configuration tests");
+						},
+						saveAgent: async () => {
+							throw new Error("Agent creation is not used by configuration tests");
+						},
+					}),
 		},
 		{ onCancel: () => (cancelled = true) },
+		options.hub,
 	);
 	return {
 		hub,
@@ -171,6 +180,26 @@ describe("AgentsHub layout", () => {
 		expect(rendered).toContain("dev");
 		hub.handleInput("\x1b");
 		expect(cancelled()).toBe(true);
+	});
+
+	test("the host title and initial agent apply on open", async () => {
+		const { strip } = await createHub(new TestSettings(), {
+			hub: { title: "Agents · profile draft", initialAgent: "task" },
+		});
+		const rendered = strip();
+		expect(rendered).toContain("Agents · profile draft");
+		// The detail block describes the selected agent.
+		expect(rendered).toContain("Generic task agent");
+		expect(rendered).not.toContain("Development agent");
+	});
+
+	test("offers no agent creation without generation and save deps", async () => {
+		const { hub, strip } = await createHub(new TestSettings(), { creation: false });
+		expect(strip()).not.toContain("New agent");
+		hub.handleInput("\x1b[A"); // up from the first row stays on an agent
+		for (let i = 0; i < 5; i++) hub.handleInput("\x1b[B"); // down past the last agent
+		hub.handleInput("\r");
+		expect(strip()).toContain("task →");
 	});
 });
 

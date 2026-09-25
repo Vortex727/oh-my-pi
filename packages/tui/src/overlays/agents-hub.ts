@@ -112,12 +112,20 @@ export interface AgentsHubDeps {
 	setAgentDisabled: (name: string, disabled: boolean) => void;
 	/** Persist one agent's override for `property`; `undefined` clears it. Other agents are untouched. */
 	setAgentOverride: (property: PropertyKind, name: string, value: string | undefined) => void;
-	generateAgent: (description: string, onText: (text: string) => void) => Promise<string>;
-	saveAgent: (scope: "project" | "user", spec: GeneratedAgentSpec) => Promise<string>;
+	/** Without both `generateAgent` and `saveAgent`, the hub offers no agent creation. */
+	generateAgent?: (description: string, onText: (text: string) => void) => Promise<string>;
+	saveAgent?: (scope: "project" | "user", spec: GeneratedAgentSpec) => Promise<string>;
 }
 
 export interface AgentsHubCallbacks {
 	onCancel: () => void;
+}
+
+export interface AgentsHubOptions {
+	/** Header label; defaults to "Agents". */
+	title?: string;
+	/** Agent whose row is selected on open. */
+	initialAgent?: string;
 }
 
 const IDENTIFIER_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+){1,5}$/;
@@ -175,6 +183,8 @@ export class AgentsHubComponent implements Component {
 	#tui: TUI;
 	#deps: AgentsHubDeps;
 	#callbacks: AgentsHubCallbacks;
+	/** Agent creation, present only when the host supplies both generation and saving. */
+	readonly #creation: Required<Pick<AgentsHubDeps, "generateAgent" | "saveAgent">> | undefined;
 
 	#allAgents: HubAgent[] = [];
 	#entries: SidebarEntry[] = [];
@@ -218,26 +228,29 @@ export class AgentsHubComponent implements Component {
 		while (lines.length < rows) lines.push("");
 		return lines.slice(0, rows);
 	};
-	readonly #frame: HubFrame = new HubFrame(
-		"Agents",
-		{ min: 16, max: 24 },
-		(width, rows) =>
-			this.#frame.renderSidebar(
-				this.#entries,
-				width,
-				rows,
-				{ id: this.#activeEntryId, focused: this.#focus === "scope", follow: true, clamp: false },
-				this.#sidebarStyle,
-			),
-		this.#renderBodyPane,
-	);
+	readonly #frame: HubFrame;
 	/** First agent-list row's offset in body-line coordinates (after the status row). */
 	#listRowStart = 2;
 
-	private constructor(tui: TUI, deps: AgentsHubDeps, callbacks: AgentsHubCallbacks) {
+	private constructor(tui: TUI, deps: AgentsHubDeps, callbacks: AgentsHubCallbacks, title: string) {
 		this.#tui = tui;
 		this.#deps = deps;
 		this.#callbacks = callbacks;
+		const { generateAgent, saveAgent } = deps;
+		this.#creation = generateAgent && saveAgent ? { generateAgent, saveAgent } : undefined;
+		this.#frame = new HubFrame(
+			title,
+			{ min: 16, max: 24 },
+			(width, rows) =>
+				this.#frame.renderSidebar(
+					this.#entries,
+					width,
+					rows,
+					{ id: this.#activeEntryId, focused: this.#focus === "scope", follow: true, clamp: false },
+					this.#sidebarStyle,
+				),
+			this.#renderBodyPane,
+		);
 		this.#browser = new ModelBrowser(deps.browserSource, {
 			emptyText: () => "  No models available — configure a provider in /models first.",
 		});
@@ -250,9 +263,10 @@ export class AgentsHubComponent implements Component {
 		tui: TUI,
 		deps: AgentsHubDeps,
 		callbacks: AgentsHubCallbacks = { onCancel: () => {} },
+		options: AgentsHubOptions = {},
 	): Promise<AgentsHubComponent> {
-		const hub = new AgentsHubComponent(tui, deps, callbacks);
-		await hub.#reload();
+		const hub = new AgentsHubComponent(tui, deps, callbacks, options.title ?? "Agents");
+		await hub.#reload(options.initialAgent);
 		return hub;
 	}
 
@@ -265,10 +279,10 @@ export class AgentsHubComponent implements Component {
 	// Data pipeline
 	// ═══════════════════════════════════════════════════════════════════════
 
-	async #reload(): Promise<void> {
+	/** Reload agents, keeping `selectedName` (default: the selected agent) selected when it still exists. */
+	async #reload(selectedName = this.#selectedAgent()?.name): Promise<void> {
 		this.#loadError = null;
 		try {
-			const selectedName = this.#selectedAgent()?.name;
 			this.#allAgents = (await this.#deps.loadAgents()).sort((a, b) => {
 				const sourceCmp = SOURCE_ORDER[a.source] - SOURCE_ORDER[b.source];
 				return sourceCmp !== 0 ? sourceCmp : a.name.localeCompare(b.name);
@@ -308,8 +322,10 @@ export class AgentsHubComponent implements Component {
 				});
 			}
 		}
-		entries.push({ id: "sep:actions", kind: "separator", label: "" });
-		entries.push({ id: "new", kind: "new", label: "New agent" });
+		if (this.#creation) {
+			entries.push({ id: "sep:actions", kind: "separator", label: "" });
+			entries.push({ id: "new", kind: "new", label: "New agent" });
+		}
 		this.#entries = entries;
 		if (!entries.some(entry => entry.id === this.#activeEntryId)) this.#activeEntryId = "all";
 	}
@@ -323,7 +339,8 @@ export class AgentsHubComponent implements Component {
 		const scoped =
 			entry.kind === "source" ? this.#allAgents.filter(agent => agent.source === entry.source) : this.#allAgents;
 		const filtered = this.#searchQuery ? scoped.filter(agent => matchAgent(agent, this.#searchQuery)) : scoped;
-		this.#rows = [...filtered.map(agent => ({ kind: "agent", agent }) as ListRow), { kind: "new" }];
+		this.#rows = filtered.map(agent => ({ kind: "agent", agent }) as ListRow);
+		if (this.#creation) this.#rows.push({ kind: "new" });
 	}
 
 	#clampRowIndex(): void {
@@ -577,7 +594,7 @@ export class AgentsHubComponent implements Component {
 	}
 
 	#beginCreateFlow(): void {
-		if (this.#createGenerating) return;
+		if (!this.#creation || this.#createGenerating) return;
 		this.#createError = null;
 		this.#createSpec = null;
 		this.#createDescription = "";
@@ -628,7 +645,8 @@ export class AgentsHubComponent implements Component {
 	}
 
 	async #runAgentCreationArchitect(description: string): Promise<GeneratedAgentSpec> {
-		const raw = await this.#deps.generateAgent(description, text => {
+		if (!this.#creation) throw new Error("Agent creation is unavailable here.");
+		const raw = await this.#creation.generateAgent(description, text => {
 			this.#createStreamingText += text;
 			this.#tui.requestRender();
 		});
@@ -637,8 +655,8 @@ export class AgentsHubComponent implements Component {
 
 	async #saveGeneratedAgent(): Promise<void> {
 		const spec = this.#createSpec;
-		if (!spec) return;
-		const filePath = await this.#deps.saveAgent(this.#createScope, spec);
+		if (!spec || !this.#creation) return;
+		const filePath = await this.#creation.saveAgent(this.#createScope, spec);
 		this.#clearCreateFlow();
 		this.#notice = `Created agent ${spec.identifier} at ${shortenPath(filePath)}`;
 		await this.#reload();

@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added **Profiles** to Settings (also `/profiles`): save models, agents, and chosen settings groups as named profiles, preview and edit them as drafts, and load one into this conversation (models only) or a new session (everything, applied live) without rewriting your configuration; `u` unloads it ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727))
+- Added profile export and import through a file or the clipboard; imports can be reviewed before saving, and safety settings such as the tool approval mode are never exported or imported ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727))
+- Added quota to every profile's overview in the Profiles tab: the remaining quota on each provider that profile's models use, and which roles use it, so profiles can be compared before switching ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727))
+
 ### Fixed
 
 - Fixed the Windows bash tool exporting `TEMP`, `TMP`, and `TMPDIR` with 8.3 short names such as `ADMINI~1`, so they now match the long-form `pwd`/`$PWD` after `cd "$TEMP"` ([#13265](https://github.com/can1357/oh-my-pi/pull/13265) by [@CoderTCY](https://github.com/CoderTCY))

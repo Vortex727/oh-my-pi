@@ -94,6 +94,18 @@ interface DefinitionBase {
 	 */
 	credential?: true;
 	/**
+	 * Marks a setting bound to this machine or account (local servers, provider endpoints, billing
+	 * tiers, saved reset credits): saved profiles never capture or share it ({@link Setting.isMachineLocal}).
+	 */
+	machineLocal?: true;
+	/**
+	 * Marks a setting whose permissive value loosens tool approvals or secret redaction, hands over
+	 * the user's real browser or desktop, or automatically runs or installs project or third-party
+	 * code and services: profile imports and exports withhold it; the user's own saved profiles keep
+	 * it ({@link Setting.isSafetySensitive}).
+	 */
+	safetySensitive?: true;
+	/**
 	 * Array entries may be objects scoping values to working-directory prefixes
 	 * (`{ path(s)/pathPrefix(es), values | items | <valuesKey> }`, see `config/settings.ts`);
 	 * `valuesKey` names the domain-specific alias for the values list (e.g. `models`).
@@ -509,6 +521,16 @@ export class Setting<T, Id extends string = string> extends Derived<T> {
 	/** Whether the value is a credential (explicit marker or legacy `ui.secret`). */
 	get isCredential(): boolean {
 		return this.definition.credential === true || this.ui?.secret === true;
+	}
+
+	/** Whether the value is tied to this machine or account, so saved profiles never capture it. */
+	get isMachineLocal(): boolean {
+		return this.definition.machineLocal === true;
+	}
+
+	/** Whether profile imports and exports must withhold the value. */
+	get isSafetySensitive(): boolean {
+		return this.definition.safetySensitive === true;
 	}
 
 	/** Value supplied by the environment variable, or `undefined` when unset or unparseable. */

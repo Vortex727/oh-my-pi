@@ -3,6 +3,7 @@ import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { stripVTControlCharacters } from "node:util";
+import { Agent, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { AuthStorage, SqliteAuthCredentialStore, type UsageReport } from "@oh-my-pi/pi-ai";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -12,20 +13,25 @@ import { ProfilesController, type ProfilesHost } from "@oh-my-pi/pi-coding-agent
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { parseProfileText, saveSetup } from "@oh-my-pi/pi-coding-agent/profiles/setups";
 import { PROFILE_EMOJIS } from "@oh-my-pi/pi-coding-agent/profiles/types";
+import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { cfgCompactionEnabled } from "@oh-my-pi/pi-coding-agent/session/context-settings";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { cfgTaskAgentModelOverrides, cfgTaskDisabledAgents } from "@oh-my-pi/pi-coding-agent/task/settings";
 import * as clipboard from "@oh-my-pi/pi-coding-agent/utils/clipboard";
 import type { Component, OverlayHandle, TUI } from "@oh-my-pi/pi-tui";
 import { AgentsHubComponent } from "@oh-my-pi/pi-tui/overlays/agents-hub";
 import type { SettingsSelectorComponent } from "@oh-my-pi/pi-tui/overlays/settings-selector";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
+import { AUTO_THINKING } from "@oh-my-pi/pi-tui/thinking";
 import { setAgentDir, setProjectDir, TempDir } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
 
 const NEW_SESSION = "Start a new session";
 const HOUR = 3_600_000;
+const SONNET_45 = "anthropic/claude-sonnet-4-5";
+const SONNET_46 = "anthropic/claude-sonnet-4-6";
 
 function quotaReport(now: number, provider = "anthropic"): UsageReport {
 	return {
@@ -113,6 +119,7 @@ describe("ProfilesController", () => {
 	let projectDir: string;
 	let configPath: string;
 	let authStorage: AuthStorage;
+	let liveSession: AgentSession | undefined;
 
 	beforeEach(async () => {
 		state = beginSettingsTest();
@@ -137,6 +144,8 @@ describe("ProfilesController", () => {
 	});
 
 	afterEach(async () => {
+		await liveSession?.dispose();
+		liveSession = undefined;
 		authStorage.close();
 		AgentStorage.close();
 		// AgentStorage's one-off schema statements are finalized only by GC, and
@@ -149,9 +158,51 @@ describe("ProfilesController", () => {
 		await tempDir.remove();
 	});
 
-	async function harness(options: { fetchUsageReports?: () => Promise<UsageReport[] | null> } = {}) {
+	/**
+	 * Saved profile `focus` holding `lines` plus an entry this version skips.
+	 * Warning about that entry is the last step of a new-session load.
+	 */
+	async function saveFocus(lines: string[]): Promise<void> {
+		const document = ["$setup:", "  version: 1", ...lines, "futureSection:", "  flag: true", ""];
+		await Bun.write(path.join(agentDir, "setups", "focus.yml"), document.join("\n"));
+	}
+
+	/** A real session starting on Sonnet 4.5 at `thinkingLevel`, with usage kept offline. */
+	function startLiveSession(settings: Settings, modelRegistry: ModelRegistry, thinkingLevel: ThinkingLevel) {
+		const model = modelRegistry.find("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected the bundled claude-sonnet-4-5 model");
+		const session = new AgentSession({
+			agent: new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.inMemory(projectDir),
+			settings,
+			modelRegistry,
+			thinkingLevel,
+		});
+		liveSession = session;
+		vi.spyOn(session, "fetchUsageReports").mockResolvedValue(null);
+		return session;
+	}
+
+	/** The live session's model and configured thinking selector, e.g. `["anthropic/claude-sonnet-4-5", "auto"]`. */
+	function liveSelection(session: AgentSession): Array<string | undefined> {
+		return [session.model && `${session.model.provider}/${session.model.id}`, session.configuredThinkingLevel()];
+	}
+
+	async function harness(
+		options: {
+			fetchUsageReports?: () => Promise<UsageReport[] | null>;
+			/** Drive a real AgentSession on Sonnet 4.5 at this thinking level instead of the session stub. */
+			liveThinking?: ThinkingLevel;
+		} = {},
+	) {
 		const settings = await Settings.loadIsolated({ cwd: projectDir, agentDir });
+		// The live session's models are available only with an Anthropic credential.
+		if (options.liveThinking !== undefined) authStorage.keys.setRuntime("anthropic", "fixture-key");
 		const modelRegistry = new ModelRegistry(authStorage, path.join(agentDir, "models.yml"), { settings });
+		const live =
+			options.liveThinking === undefined
+				? undefined
+				: startLiveSession(settings, modelRegistry, options.liveThinking);
 		const choice = Promise.withResolvers<string | undefined>();
 		/** Queued selector answers, used before the pending `choice`. */
 		const choices: Array<string | undefined> = [];
@@ -167,10 +218,11 @@ describe("ProfilesController", () => {
 		const rendered = signalQueue<void>();
 		const hubs = signalQueue<{ hub: AgentsHubComponent; initialAgent: string | undefined }>();
 		const startNewSession = vi.fn(async (_label: string) => true);
-		const showWarning = vi.fn((_message: string) => {});
+		const warnings = signalQueue<string>();
+		const showWarning = vi.fn((message: string) => warnings.fire(message));
 		const ctx = {
 			settings,
-			session: {
+			session: live ?? {
 				model: undefined,
 				modelRegistry,
 				isStreaming: false,
@@ -178,6 +230,7 @@ describe("ProfilesController", () => {
 				getAvailableModels: () => [],
 				refreshBaseSystemPrompt: async () => refreshed.resolve(),
 				setModelTemporary: async () => {},
+				setThinkingLevel: () => {},
 				sessionId: "profiles-test",
 				fetchUsageReports: options.fetchUsageReports ?? (async () => null),
 				getUsageReportingModelSelectors: () => [],
@@ -238,6 +291,12 @@ describe("ProfilesController", () => {
 		} as unknown as OverlayHandle;
 		const closeSettings = vi.fn(() => controller.close());
 		const mount = () => controller.mount(selector, overlay, closeSettings);
+		/** Select the saved `focus` profile, press `l`, and choose a new session. */
+		const loadFocus = () => {
+			dashboard!.handleInput("\x1b[B");
+			dashboard!.handleInput("l");
+			choice.resolve(NEW_SESSION);
+		};
 		await mount();
 		return {
 			settings,
@@ -255,6 +314,7 @@ describe("ProfilesController", () => {
 			nextSettingsShown: settingsShown.next,
 			startNewSession,
 			showWarning,
+			live,
 			nextHub: hubs.next,
 			closeSettings,
 			mount,
@@ -268,11 +328,20 @@ describe("ProfilesController", () => {
 			renderedUntil: async (predicate: () => boolean) => {
 				while (!predicate()) await rendered.next();
 			},
-			/** Select the saved `focus` profile, press `l`, and choose a new session. */
-			loadFocus: () => {
-				dashboard!.handleInput("\x1b[B");
-				dashboard!.handleInput("l");
-				choice.resolve(NEW_SESSION);
+			loadFocus,
+			/** Confirm loading a {@link saveFocus} profile in a new session; resolves with its skipped-entry warning once done. */
+			loadFocusInNewSession: () => {
+				const warned = warnings.next();
+				loadFocus();
+				confirm.resolve(true);
+				return warned;
+			},
+			/** Reopen Settings after a load, unload the profile, and wait until Settings shows again. */
+			unload: async () => {
+				await mount();
+				const shown = settingsShown.next();
+				dashboard!.handleInput("u");
+				await shown;
 			},
 		};
 	}
@@ -362,6 +431,59 @@ describe("ProfilesController", () => {
 		expect(compactionChanges).toEqual([false]);
 		expect(h.screen()).not.toContain("u to unload profile");
 		expect(await Bun.file(configPath).bytes()).toEqual(configBytes);
+	});
+
+	it("moves a live session to a profile's Thinking Level on the same model, and back to the user's on unload", async () => {
+		await Bun.write(configPath, "compaction:\n  enabled: false\ndefaultThinkingLevel: medium\n");
+		await saveFocus(["defaultThinkingLevel: auto"]);
+		const h = await harness({ liveThinking: ThinkingLevel.Low });
+		const session = h.live!;
+
+		expect(await h.loadFocusInNewSession()).toContain("skipped");
+		// The default role is Automatic, so the model stays and only the Thinking Level applies.
+		expect(liveSelection(session)).toEqual([SONNET_45, AUTO_THINKING]);
+		expect(session.isAutoThinking).toBe(true);
+
+		await h.unload();
+		expect(liveSelection(session)).toEqual([SONNET_45, ThinkingLevel.Medium]);
+		expect(session.isAutoThinking).toBe(false);
+	});
+
+	it("unloading a profile that re-pointed the default's alias target restores the user's model and thinking", async () => {
+		await Bun.write(
+			configPath,
+			[
+				"compaction:",
+				"  enabled: false",
+				"defaultThinkingLevel: medium",
+				"modelRoles:",
+				"  default: '@slow'",
+				`  slow: ${SONNET_45}`,
+				"",
+			].join("\n"),
+		);
+		await saveFocus(["modelRoles:", `  slow: ${SONNET_46}:low`]);
+		const h = await harness({ liveThinking: ThinkingLevel.Medium });
+		const session = h.live!;
+
+		expect(await h.loadFocusInNewSession()).toContain("skipped");
+		expect(liveSelection(session)).toEqual([SONNET_46, ThinkingLevel.Low]);
+
+		// The default is still the user's own `@slow`; only what it resolves to changes.
+		await h.unload();
+		expect(liveSelection(session)).toEqual([SONNET_45, ThinkingLevel.Medium]);
+	});
+
+	it("keeps a session-only model on unload when the profile's default selects what the user's does", async () => {
+		await Bun.write(configPath, `compaction:\n  enabled: false\nmodelRoles:\n  default: ${SONNET_45}\n`);
+		await saveFocus(["modelRoles:", `  default: ${SONNET_45}`]);
+		const h = await harness({ liveThinking: ThinkingLevel.High });
+		const session = h.live!;
+		expect(await h.loadFocusInNewSession()).toContain("skipped");
+		await session.setModelTemporary(session.modelRegistry.find("anthropic", "claude-sonnet-4-6")!);
+
+		await h.unload();
+		expect(liveSelection(session)).toEqual([SONNET_46, ThinkingLevel.High]);
 	});
 
 	it("closing Settings while a load dialog is pending aborts it without starting a session", async () => {

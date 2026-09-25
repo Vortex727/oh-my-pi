@@ -102,7 +102,9 @@ export class ProfileEmojiPicker implements Component {
 	render(width: number): readonly string[] {
 		const height = Math.max(14, this.#options.terminalHeight ?? process.stdout.rows ?? 24);
 		const innerWidth = Math.max(1, width - 4);
-		const contentRows = Math.max(1, height - 6 - (this.#error ? 1 : 0));
+		// Chrome: top border, notice, [error], divider, preview, bottom border. The
+		// frame fills the terminal so bottom-anchored pointer rows line up.
+		const contentRows = Math.max(1, height - 5 - (this.#error ? 1 : 0));
 		this.#list.setMaxVisible(contentRows);
 		const listLines = this.#list.render(innerWidth);
 		const selected = PROFILE_EMOJIS.find(item => item.emoji === this.#selectedValue);
@@ -346,12 +348,14 @@ export class ProfileEditorComponent implements Component {
 			if (group.id === "model") {
 				const warnings = this.#callbacks.roleWarnings?.(this.#draft);
 				for (const [role, selector] of Object.entries(draftModelRoles(this.#draft))) {
+					const warning = warnings?.get(role);
 					items.push({
 						id: `role:${role}`,
 						label: `Model role · ${cleanImportedLine(role)}`,
 						currentValue: selector === null ? "Automatic" : cleanImportedLine(selector),
 						description: "Edit this model role in the isolated profile draft.",
-						warning: warnings?.get(role),
+						// Resolver warnings quote the imported selector verbatim.
+						warning: warning === undefined ? undefined : cleanImportedLine(warning),
 						onActivate: () => {
 							void this.#editRole(role);
 						},

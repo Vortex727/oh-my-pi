@@ -1034,10 +1034,12 @@ export class ModelHubComponent implements Component {
 	}
 
 	#unassignRole(role: string, selectedScope?: ModelRoleSelectionScope): void {
-		const assignment = this.#roles[role];
-		// A role-strip chip identifies a concrete persisted scope even when an
-		// overlay tombstone makes the effective assignment look automatic.
-		if (selectedScope === undefined && (!assignment || assignment.autoSelected)) return;
+		// Clearing targets the configured selector, not its resolution: a role set
+		// to a model that no longer resolves still has a value to clear, while an
+		// automatic role has none. A role-strip chip identifies a concrete
+		// persisted scope even when an overlay tombstone makes the effective
+		// assignment look automatic.
+		if (selectedScope === undefined && !this.#settings.getModelRole(role)) return;
 		let result: void | boolean | Promise<void | boolean>;
 		if (this.#settings.modelRoleStorage === "project") {
 			const source = selectedScope ?? this.#settings.getModelRoleSource(role);

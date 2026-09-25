@@ -199,6 +199,17 @@ describe("setup drafts", () => {
 
 		expect(setup.config.modelRoles).toEqual({ default: "openai/gpt-5.4:auto", smol: "openai/gpt-5.4-mini" });
 	});
+
+	it("keeps a role a higher layer masks Automatic when the captured draft is loaded again", () => {
+		const settings = Settings.isolated({});
+		settings.setModelRole("smol", "fixture/model");
+		settings.applySetupLayer({ modelRoles: { smol: null } });
+
+		const captured = parseProfileText(serializeSetup(createSetupDraft(settings)));
+
+		expect(captured.config.modelRoles).toEqual({ smol: null });
+		expect(settings.previewSetup(captured.config).getModelRole("smol")).toBeUndefined();
+	});
 });
 
 describe("profile sharing", () => {
@@ -279,10 +290,38 @@ describe("profile sharing", () => {
 		expect(imported.warnings.some(warning => warning.includes("providers.fireworksTier"))).toBe(true);
 	});
 
+	it("names skipped metadata entries in bounded diagnostics without expanding YAML aliases", () => {
+		// Each anchor lists the previous one twice: serialized, `n20` holds 2^21 leaves.
+		const ladder = ["    - &n0 [leaf, leaf]"];
+		for (let level = 1; level <= 20; level++) ladder.push(`    - &n${level} [*n${level - 1}, *n${level - 1}]`);
+		const groups = ["$setup:", "  enabledGroups:", "    - context", `    - "${"x".repeat(10_000)}"`, ...ladder];
+
+		const imported = parseProfileText([...groups, ""].join("\n"));
+		expect(imported.metadata.enabledGroups).toEqual(["context"]);
+		expect(imported.warnings).toHaveLength(22);
+		for (const warning of imported.warnings) expect(warning.length).toBeLessThan(200);
+
+		let error: unknown;
+		try {
+			parseProfileText([...groups, "  version: *n20", ""].join("\n"));
+		} catch (caught) {
+			error = caught;
+		}
+		expect(error).toBeInstanceOf(SetupError);
+		expect((error as SetupError).kind).toBe("unsupported-version");
+		expect((error as SetupError).message.length).toBeLessThan(200);
+	});
+
 	it("rejects model roles whose aliases fan out past the safety budget, but keeps ordinary alias chains", () => {
 		const roles = Array.from({ length: 12 }, (_, index) => `r${index}`);
 		const crafted = roles.map(role => `  ${role}: "${roles.map(other => `@${other}`).join(",")}"`);
 		expect(() => parseProfileText(["modelRoles:", ...crafted, ""].join("\n"))).toThrow(SetupError);
+		// Role names may contain colons; only a real thinking level after the last one is a suffix.
+		const colonRoles = roles.map(role => `${role}:custom`);
+		const colonCrafted = colonRoles.map(
+			role => `  "${role}": "${colonRoles.map((other, index) => `@${other}${index % 2 ? ":high" : ""}`).join(",")}"`,
+		);
+		expect(() => parseProfileText(["modelRoles:", ...colonCrafted, ""].join("\n"))).toThrow(SetupError);
 
 		const chain = parseProfileText(
 			'modelRoles:\n  default: anthropic/claude-sonnet-4-5\n  task: "@default"\n  scout: "@task,*"\n',

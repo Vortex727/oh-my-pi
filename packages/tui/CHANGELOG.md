@@ -12,6 +12,9 @@
 - Exported the model browser's context, cost, intelligence, and measured-performance formatters, and the usage dashboard's quota bar and status-color helpers, for reuse ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727))
 - Added `SettingsSelectorComponent.clearSearch()` so embedded editors can reveal errors hidden by a search filter ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727))
 
+### Changed
+
+- `AgentsHubDeps.generateAgent`/`saveAgent` are optional and the hub offers no agent creation without them; `AgentsHubComponent.create` accepts `{ title, initialAgent }` ([#12993](https://github.com/can1357/oh-my-pi/pull/12993) by [@Vortex727](https://github.com/Vortex727))
 ## [18.3.1] - 2026-09-25
 
 ### Breaking Changes

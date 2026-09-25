@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
-import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
+import { Agent, type AgentMessage, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Api, Model } from "@oh-my-pi/pi-ai";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { resolvePlanModelTransition } from "@oh-my-pi/pi-coding-agent/plan-mode/model-transition";
 import { applySetupModelRoles } from "@oh-my-pi/pi-coding-agent/profiles/apply-model-roles";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { cfgCompactionEnabled } from "@oh-my-pi/pi-coding-agent/session/context-settings";
@@ -89,6 +90,11 @@ describe("applySetupModelRoles", () => {
 		authStorage.close();
 		tempDir.removeSync();
 	});
+
+	function expectActiveModelIsEffectiveDefault(expected: Model<Api>): void {
+		expect(modelValue(session.model!)).toBe(modelValue(expected));
+		expect(modelValue(session.resolveRoleModelWithThinking("default").model!)).toBe(modelValue(expected));
+	}
 
 	it("applies alias changes in place while preserving nulls, omissions, history, and files", async () => {
 		const sessionId = session.sessionId;
@@ -206,18 +212,69 @@ describe("applySetupModelRoles", () => {
 		expect(session.sessionManager.getEntries()).toEqual(entries);
 		expect(settings.getModelRoles()).toEqual(roles);
 	});
-	it("keeps Automatic aliases valid when a referenced default is explicitly null", async () => {
+
+	it("resolves supplied aliases against the roles the replacement setup leaves effective", async () => {
+		// The outgoing setup's slow role goes with it, so @slow falls back to the global slow model.
+		settings.applySetupLayer({ modelRoles: { slow: modelValue(targetModel) } });
+		await session.setModelTemporary(targetModel);
+
 		await applySetupModelRoles({
 			session,
 			settings,
-			roles: { default: null, task: "@default" },
+			roles: { default: "@slow" },
+			getBlockReason: () => undefined,
+		});
+
+		expectActiveModelIsEffectiveDefault(initialModel);
+	});
+
+	it("switches to the default that becomes effective when the outgoing setup supplied it", async () => {
+		settings.applySetupLayer({ modelRoles: { default: modelValue(targetModel) } });
+		await session.setModelTemporary(targetModel);
+
+		await applySetupModelRoles({
+			session,
+			settings,
+			roles: { smol: modelValue(initialModel) },
+			getBlockReason: () => undefined,
+		});
+
+		expectActiveModelIsEffectiveDefault(initialModel);
+		expect(session.configuredThinkingLevel()).toBe(AUTO_THINKING);
+	});
+
+	it("keeps a runtime default override over a supplied default", async () => {
+		settings.overrideModelRoles({ default: modelValue(initialModel) });
+
+		await applySetupModelRoles({
+			session,
+			settings,
+			roles: { default: modelValue(targetModel) },
+			getBlockReason: () => undefined,
+		});
+
+		expectActiveModelIsEffectiveDefault(initialModel);
+	});
+
+	it("resolves an explicit Automatic default alias to the active model at runtime", async () => {
+		await applySetupModelRoles({
+			session,
+			settings,
+			roles: { default: null, smol: null, plan: "@default:high", task: "@smol" },
 			getBlockReason: () => undefined,
 		});
 
 		expect(session.model).toBe(initialModel);
-		expect(settings.getModelRole("default")).toBeUndefined();
-		expect(settings.getModelRoleProvenance("default")).toBe("setup");
-		expect(settings.getModelRole("task")).toBe("@default");
+		const plan = session.resolveRoleModelWithThinking("plan");
+		expect(modelValue(plan.model!)).toBe(modelValue(initialModel));
+		expect(resolvePlanModelTransition(session.model, plan, false)).toEqual({
+			kind: "thinking",
+			thinkingLevel: ThinkingLevel.High,
+		});
+		// Roles that merely inherit the default keep their own fallback instead of the active model.
+		const task = session.resolveRoleModelWithThinking("task").model;
+		expect(task).toBeDefined();
+		expect(modelValue(task!)).not.toBe(modelValue(initialModel));
 	});
 
 	it("keeps the settings of a fully loaded profile while replacing its model roles", async () => {

@@ -648,6 +648,38 @@ describe("ModelHub", () => {
 			expect(onCancel).toHaveBeenCalledTimes(1);
 		});
 
+		test("clears a role whose configured model no longer resolves, in the scope that stores it", () => {
+			const available = makeModel("test", "available-model");
+			const globalStorage = Settings.isolated({ modelRoles: { smol: "test/missing-model" } });
+			const projectStorage = Settings.isolated({ modelRoleStorage: "project" });
+			projectStorage.setModelRole("smol", "test/missing-global");
+			projectStorage.setProjectModelRole("smol", "test/missing-project");
+			const openFocused = (settings: Settings) => {
+				const onCancel = vi.fn();
+				// Emulate the controller: clearing deletes the persisted role from its scope.
+				const onUnassign: ModelHubCallbacks["onUnassign"] = (role, scope) => {
+					if (scope === "project") settings.clearProjectModelRole(role);
+					else settings.setModelRole(role, undefined);
+				};
+				const { hub } = createHub({
+					models: [available],
+					scoped: true,
+					settings,
+					hub: { initialAssignRole: "smol" },
+					callbacks: { onUnassign, onCancel },
+				});
+				hub.handleInput("\x1b[3~");
+				return onCancel;
+			};
+
+			expect(openFocused(globalStorage)).toHaveBeenCalledTimes(1);
+			expect(globalStorage.getModelRole("smol")).toBeUndefined();
+
+			expect(openFocused(projectStorage)).toHaveBeenCalledTimes(1);
+			expect(projectStorage.getProjectModelRole("smol")).toBeUndefined();
+			expect(projectStorage.getGlobalModelRole("smol")).toBe("test/missing-global");
+		});
+
 		test("returns to the host when a focused assignment fails", () => {
 			const model = makeModel("test", "failed-model");
 			const onAssign = vi.fn(() => false);

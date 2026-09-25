@@ -10,14 +10,11 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { formatModelSelectorValue } from "@oh-my-pi/pi-tui/overlays/model-selector";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
-import { getAgentDir, isEexist, isEnoent, logger, stringifyYamlConfig } from "@oh-my-pi/pi-utils";
+import { getAgentDir, isEexist, isEnoent, logger, stringifyYamlConfig, truncate } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
 import { orderedSettings } from "../config/all-settings";
-import {
-	DEFAULT_MODEL_ROLE_ALIAS,
-	LEGACY_MODEL_ROLE_ALIAS_PREFIX,
-	MODEL_ROLE_ALIAS_PREFIX,
-} from "../config/model-roles";
+import { modelRoleAliasTarget, normalizeModelPatternList } from "../config/model-resolver";
+import { cfgModelRoles } from "../config/model-settings";
 import type { AnySetting } from "../config/registry";
 import type { RawSettings, Settings } from "../config/settings";
 import { cfgRetryFallbackChains } from "../session/settings";
@@ -44,6 +41,8 @@ const SETUP_METADATA_KEY = "$setup";
 const SETUP_FORMAT_VERSION = 1;
 const MAX_SETUP_BYTES = 1024 * 1024;
 const MAX_SETUP_NAME_LENGTH = 64;
+/** Longest excerpt of an untrusted string a diagnostic quotes. */
+const MAX_DIAGNOSTIC_TEXT_LENGTH = 64;
 /** Alias expansions one profile's model roles may need; bounds preview work for crafted files. */
 const MAX_ROLE_REFERENCE_WORK = 10_000;
 const WINDOWS_INVALID_FILENAME_RE = /[\p{Cc}\p{Cf}<>:"/\\|?*]/u;
@@ -101,6 +100,18 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
 	const prototype = Object.getPrototypeOf(value);
 	return prototype === Object.prototype || prototype === null;
+}
+
+/**
+ * A bounded description of an untrusted document value for a diagnostic: a quoted
+ * excerpt of a string, a scalar as written, and only the kind of a list or mapping,
+ * whose YAML aliases could otherwise expand exponentially when serialized.
+ */
+function describeValue(value: unknown): string {
+	if (typeof value === "string") return JSON.stringify(truncate(value, MAX_DIAGNOSTIC_TEXT_LENGTH));
+	if (Array.isArray(value)) return "a list";
+	if (typeof value === "object" && value !== null) return "a mapping";
+	return String(value);
 }
 
 /** Validate a user-facing setup name; the result is also the file basename. */
@@ -286,7 +297,7 @@ function parseMetadata(value: unknown, warnings: string[]): SetupMetadata {
 	if (value.version !== undefined && value.version !== SETUP_FORMAT_VERSION) {
 		throw new SetupError(
 			"unsupported-version",
-			`This profile uses format version ${String(value.version)}; update omp to load it`,
+			`This profile uses format version ${describeValue(value.version)}; update omp to load it`,
 		);
 	}
 	if (typeof value.emoji === "string" && PROFILE_EMOJI_SET.has(value.emoji)) {
@@ -297,8 +308,13 @@ function parseMetadata(value: unknown, warnings: string[]): SetupMetadata {
 	if (Array.isArray(value.enabledGroups)) {
 		const groups: ProfileSettingsGroup[] = [];
 		for (const group of value.enabledGroups) {
-			if (typeof group === "string" && GROUP_ORDER.has(group)) groups.push(group as ProfileSettingsGroup);
-			else warnings.push(`Ignored settings group ${JSON.stringify(group)}: unknown group`);
+			if (typeof group !== "string") {
+				warnings.push(`Ignored settings group entry: expected a group name, got ${describeValue(group)}`);
+			} else if (GROUP_ORDER.has(group)) {
+				groups.push(group as ProfileSettingsGroup);
+			} else {
+				warnings.push(`Ignored settings group ${describeValue(group)}: unknown group`);
+			}
 		}
 		metadata.enabledGroups = sortGroups(groups);
 	} else if (value.enabledGroups !== undefined) {
@@ -322,16 +338,6 @@ function parseModelRoles(value: unknown, warnings: string[]): ModelRoleAssignmen
 	return roles;
 }
 
-/** The role a selector pattern aliases (`@role`, `pi/role`, `*`), ignoring any `:level` suffix. */
-function aliasedRole(pattern: string): string | undefined {
-	const base = pattern.trim().split(":", 1)[0]!;
-	if (base === DEFAULT_MODEL_ROLE_ALIAS) return "default";
-	for (const prefix of [MODEL_ROLE_ALIAS_PREFIX, LEGACY_MODEL_ROLE_ALIAS_PREFIX]) {
-		if (base.startsWith(prefix)) return base.slice(prefix.length);
-	}
-	return undefined;
-}
-
 /**
  * Whether expanding `roles`' aliases stays within budget. Role resolution walks
  * every alias path with its own visited set, so roles that all list each other
@@ -343,8 +349,8 @@ function roleReferencesWithinBudget(roles: ModelRoleAssignments): boolean {
 	const visit = (role: string, visited: ReadonlySet<string>): boolean => {
 		const selector = roles[role];
 		if (typeof selector !== "string") return true;
-		for (const pattern of selector.split(",")) {
-			const alias = aliasedRole(pattern);
+		for (const pattern of normalizeModelPatternList(selector)) {
+			const alias = modelRoleAliasTarget(pattern);
 			if (alias === undefined) continue;
 			const target = Object.hasOwn(roles, alias) ? alias : Object.hasOwn(roles, "default") ? "default" : undefined;
 			if (target === undefined || visited.has(target)) continue;
@@ -419,17 +425,24 @@ export function modelsOnlyDraft(draft: ProfileDraft): ProfileDraft {
 }
 
 /**
- * Start a models-only draft from the effective configuration. When the live
- * session's model is supplied, it becomes the saved default together with its
- * configured thinking level (including `auto`).
+ * Start a models-only draft from the effective configuration. A role a higher
+ * layer masks with `null` stays masked, so the draft never brings back the
+ * lower layer's model. When the live session's model is supplied, it becomes
+ * the saved default together with its configured thinking level (including `auto`).
  */
 export function createSetupDraft(
 	settings: Settings,
 	current?: { provider: string; id: string; thinkingLevel?: ConfiguredThinkingLevel },
 ): ProfileDraft {
 	const modelRoles: ModelRoleAssignments = {};
-	for (const [role, selector] of Object.entries(settings.getModelRoles())) {
-		if (selector !== undefined) modelRoles[role] = selector;
+	// `getModelRoles()` drops `null` masks; the raw effective record keeps them.
+	const effective: unknown = cfgModelRoles.get(settings);
+	if (isPlainRecord(effective)) {
+		for (const [role, value] of Object.entries(effective)) {
+			if (PROTOTYPE_KEYS.has(role)) continue;
+			const selector = value === null ? null : settings.getModelRole(role);
+			if (selector !== undefined) modelRoles[role] = selector;
+		}
 	}
 	if (current) {
 		modelRoles.default = formatModelSelectorValue(`${current.provider}/${current.id}`, current.thinkingLevel);

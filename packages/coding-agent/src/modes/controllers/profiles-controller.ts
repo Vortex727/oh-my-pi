@@ -10,11 +10,12 @@ import type { SettingsSelectorComponent } from "@oh-my-pi/pi-tui/overlays/settin
 import { replaceTabs, TRUNCATE_LENGTHS } from "@oh-my-pi/pi-tui/render/render-utils";
 import { getAvailableThemes, theme } from "@oh-my-pi/pi-tui/theme";
 import { oneLineLabel } from "@oh-my-pi/pi-tui/tools/task";
-import type { UsageReport } from "@oh-my-pi/pi-ai";
+import { type ConfiguredThinkingLevel, parseConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
+import type { Model, UsageReport } from "@oh-my-pi/pi-ai";
 import { getProjectDir, isRecord, logger, sanitizeText } from "@oh-my-pi/pi-utils";
 import { orderedSettings } from "../../config/all-settings";
 import { cfgModelRoles, cfgModelRoleStorage } from "../../config/model-settings";
-import { getModelMatchPreferences, resolveModelRoleValue } from "../../config/model-resolver";
+import { resolveModelRoleValue } from "../../config/model-resolver";
 import type { AnySetting } from "../../config/registry";
 import { type RawSettings, Settings } from "../../config/settings";
 import { applySetupModelRoles } from "../../profiles/apply-model-roles";
@@ -50,6 +51,8 @@ import {
 } from "../components/profile-dashboard";
 import { ProfileEditorComponent } from "../components/profile-editor";
 import { createAgentsHubDeps } from "../agents-hub-deps";
+import { resolveRoleModelFull } from "../../session/role-models";
+import { cfgDefaultThinkingLevel } from "../../session/settings";
 import { cfgTaskDisabledAgents } from "../../task/settings";
 import { createModelBrowserSource } from "../model-browser-source";
 import { resolveToCwd } from "../../tools/path-utils";
@@ -120,6 +123,22 @@ function safetySettingsText(settings: readonly AnySetting[], config?: RawSetting
 /** Whether a setup layer node still sets anything, counting a `null` role that masks a configured one. */
 function setsAnything(value: unknown): boolean {
 	return isRecord(value) ? Object.values(value).some(setsAnything) : value !== undefined;
+}
+
+/** The model and thinking a session takes from the default role under some settings. */
+interface DefaultSelection {
+	/** The configured default role; `undefined` is Automatic, which keeps the session's model. */
+	selector: string | undefined;
+	/** `undefined` when the role selects no model this session can use. */
+	model: Model | undefined;
+	thinkingLevel: ConfiguredThinkingLevel | undefined;
+}
+
+/** Whether two selections put the session on the same model and thinking; unusable ones compare by selector. */
+function selectionsEqual(left: DefaultSelection, right: DefaultSelection): boolean {
+	const sameModel =
+		left.model || right.model ? modelsAreEqual(left.model, right.model) : left.selector === right.selector;
+	return sameModel && left.thinkingLevel === right.thinkingLevel;
 }
 
 /** "profile focus", or "profiles focus and fast" when settings and models came from different profiles. */
@@ -992,7 +1011,7 @@ export class ProfilesController {
 		}
 		this.#loaded = { settings: loaded.name, models: loaded.name };
 		await this.ctx.session.refreshBaseSystemPrompt();
-		await this.#useDefaultModel(`Profile ${name}`);
+		await this.#useDefault(this.#defaultSelection(this.ctx.settings), `Profile ${name}`);
 		if (loaded.warnings.length > 0) {
 			this.ctx.showWarning(
 				`Profile ${name} skipped ${loaded.warnings.length} entr${loaded.warnings.length === 1 ? "y" : "ies"}: ${cleanText(loaded.warnings[0])}`,
@@ -1003,8 +1022,9 @@ export class ProfilesController {
 
 	/**
 	 * Drop the session's setup layer so the user's own settings and models apply
-	 * again. When the profile owned the default role, the session moves to the
-	 * default that applies now.
+	 * again. When that changes the model or thinking the default role selects,
+	 * even through an alias such as `@slow`, the session moves to the default
+	 * that applies now.
 	 */
 	#unloadProfile(): Promise<void> {
 		return this.#interaction(async () => {
@@ -1018,16 +1038,20 @@ export class ProfilesController {
 			);
 			if (!confirmed) return undefined;
 			const { session, settings } = this.ctx;
-			const ownsDefault = settings.getModelRoleProvenance("default") === "setup";
-			if (ownsDefault && session.isStreaming) {
-				return { message: "Wait for the current response to finish before unloading the profile", tone: "error" };
-			}
 			const release = await this.host.acquireDefaultRoleMutation();
 			try {
+				const baseline = this.#defaultSelection(settings.previewSetup(undefined));
+				const defaultChanges = !selectionsEqual(this.#defaultSelection(settings), baseline);
+				if (defaultChanges && session.isStreaming) {
+					return {
+						message: "Wait for the current response to finish before unloading the profile",
+						tone: "error",
+					};
+				}
 				settings.applySetupLayer(undefined);
 				this.#loaded = {};
 				await session.refreshBaseSystemPrompt();
-				if (ownsDefault) await this.#useDefaultModel(`Unloaded ${label}`);
+				if (defaultChanges) await this.#useDefault(baseline, `Unloaded ${label}`);
 			} finally {
 				release();
 			}
@@ -1037,27 +1061,48 @@ export class ProfilesController {
 	}
 
 	/**
-	 * Switch the session to the effective default role without persisting a model
-	 * choice. When that model is unavailable, warn (led by `subject`) and keep the current one.
+	 * What the default role selects under `settings` (live or a preview), with
+	 * startup's thinking precedence: the role's explicit thinking suffix, else the
+	 * model's own default level, else the Thinking Level setting.
 	 */
-	async #useDefaultModel(subject: string): Promise<void> {
-		const { session, settings } = this.ctx;
+	#defaultSelection(settings: Settings): DefaultSelection {
+		const { session } = this.ctx;
 		const selector = settings.getModelRole("default");
-		if (!selector) return;
-		const resolved = resolveModelRoleValue(selector, session.getAvailableModels(), {
-			settings,
-			matchPreferences: getModelMatchPreferences(settings),
-		});
-		if (!resolved.model || !session.modelRegistry.hasConfiguredAuth(resolved.model)) {
+		const resolved = resolveRoleModelFull(settings, "default", session.getAvailableModels(), session.model);
+		const model =
+			selector === undefined
+				? session.model
+				: resolved.model && session.modelRegistry.hasConfiguredAuth(resolved.model)
+					? resolved.model
+					: undefined;
+		const thinkingLevel =
+			model && resolved.explicitThinkingLevel
+				? resolved.thinkingLevel
+				: (model?.thinking?.defaultLevel ?? parseConfiguredThinkingLevel(cfgDefaultThinkingLevel.get(settings)));
+		return { selector, model, thinkingLevel };
+	}
+
+	/**
+	 * Put the session on `selection` without persisting a model or thinking choice.
+	 * When its model is unavailable, warn (led by `subject`) and keep the current
+	 * model; the selection's thinking still applies.
+	 */
+	async #useDefault(selection: DefaultSelection, subject: string): Promise<void> {
+		const { session } = this.ctx;
+		const { selector, model, thinkingLevel } = selection;
+		if (model && !modelsAreEqual(session.model, model)) {
+			await session.setModelTemporary(model, thinkingLevel);
+			return;
+		}
+		if (!model && selector !== undefined) {
 			const current = session.model ? `${session.model.provider}/${session.model.id}` : "no model";
 			this.ctx.showWarning(
 				`${subject}: default model ${cleanText(selector)} is not available; keeping ${cleanText(current)}`,
 			);
-			return;
 		}
-		const thinkingLevel = resolved.explicitThinkingLevel ? resolved.thinkingLevel : undefined;
-		if (modelsAreEqual(session.model, resolved.model) && thinkingLevel === undefined) return;
-		await session.setModelTemporary(resolved.model, thinkingLevel);
+		if (thinkingLevel !== undefined && session.configuredThinkingLevel() !== thinkingLevel) {
+			session.setThinkingLevel(thinkingLevel);
+		}
 	}
 
 	#openActiveControl(control: ProfileDashboardActiveControl): void {

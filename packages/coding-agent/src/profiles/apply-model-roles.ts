@@ -2,11 +2,12 @@ import type { Model } from "@oh-my-pi/pi-ai";
 import { resolveBudgetReserveTokens } from "@oh-my-pi/pi-agent-core/compaction";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
-import { getModelMatchPreferences, pickDefaultAvailableModel, resolveModelRoleValue } from "../config/model-resolver";
+import { getModelMatchPreferences, resolveModelRoleValue, type SessionModelRoleLookup } from "../config/model-resolver";
 import { getRoleInfo, roleCandidatePool } from "../config/model-roles";
 import type { Settings } from "../config/settings";
 import type { AgentSession } from "../session/agent-session";
 import { cfgCompaction } from "../session/context-settings";
+import { sessionModelRoleLookup } from "../session/role-models";
 import type { ModelRoleAssignments } from "./types";
 
 export interface ApplySetupModelRolesOptions {
@@ -55,24 +56,19 @@ function selectionsEqual(left: DefaultSelection, right: DefaultSelection): boole
 	);
 }
 
+/** The effective default of `settings`; an Automatic default keeps the active model. */
 function resolveDefaultSelection(
-	options: ApplySetupModelRolesOptions,
+	activeModel: Model,
 	availableModels: Model[],
-	selector: string | undefined,
-	roleLookup: { getModelRole(role: string): string | undefined },
+	settings: Settings,
+	roleLookup: SessionModelRoleLookup,
 ): DefaultSelection | undefined {
-	if (!selector) {
-		const model =
-			options.session.model ??
-			pickDefaultAvailableModel(availableModels, provider =>
-				options.session.modelRegistry.hasConcreteAuth(provider),
-			);
-		return model ? { model, explicitThinkingLevel: false } : undefined;
-	}
+	const selector = settings.getModelRole("default");
+	if (!selector) return { model: activeModel, explicitThinkingLevel: false };
 	const resolved = resolveModelRoleValue(selector, availableModels, {
-		settings: options.settings,
+		settings,
 		roleLookup,
-		matchPreferences: getModelMatchPreferences(options.settings),
+		matchPreferences: getModelMatchPreferences(settings),
 	});
 	return resolved.model
 		? {
@@ -127,42 +123,35 @@ export async function applySetupModelRoles(options: ApplySetupModelRolesOptions)
 	if (!previousModel) {
 		throw new Error("The current session has no active model. Load the profile in a new session.");
 	}
+	for (const role of Object.keys(options.roles)) assertRoleName(role);
 	const previousThinkingLevel = options.session.configuredThinkingLevel();
 	const availableModels = options.session.getAvailableModels();
 	let availableModelsOfAllKinds: Model[] | undefined;
-	const currentLookup = { getModelRole: (role: string) => options.settings.getModelRole(role) };
-	const proposedLookup = {
-		getModelRole: (role: string): string | undefined => {
-			if (!Object.hasOwn(options.roles, role)) return options.settings.getModelRole(role);
-			const selector = options.roles[role];
-			if (selector !== null) return selector;
-			// Runtime role resolution treats an Automatic default as the active
-			// model, including when another supplied role aliases @default.
-			return role === "default" ? `${previousModel.provider}/${previousModel.id}` : undefined;
-		},
-	};
+	// Validate against, select from, and commit the same setup, so runtime overrides and roles the
+	// outgoing setup supplied rank exactly as they will once it applies.
+	const config = { ...options.settings.getSetupLayer(), modelRoles: options.roles };
+	const proposed = options.settings.previewSetup(config);
+	const proposedLookup = sessionModelRoleLookup(proposed, previousModel);
+	const matchPreferences = getModelMatchPreferences(proposed);
 	for (const [role, selector] of Object.entries(options.roles)) {
-		assertRoleName(role);
 		if (selector === null) continue;
 		if (!selector.trim()) throw invalidRoleError(role);
 		const roleModels =
-			role === "default"
-				? availableModels
-				: roleCandidatePool(role, options.settings, options.session.modelRegistry);
+			role === "default" ? availableModels : roleCandidatePool(role, proposed, options.session.modelRegistry);
 		const resolved = resolveModelRoleValue(selector, roleModels, {
-			settings: options.settings,
+			settings: proposed,
 			roleLookup: proposedLookup,
-			matchPreferences: getModelMatchPreferences(options.settings),
+			matchPreferences,
 		});
 		if (resolved.warning) throw invalidRoleError(role);
 		if (!resolved.model) {
 			availableModelsOfAllKinds ??= options.session.modelRegistry.getAvailable("all");
 			const unrestricted = resolveModelRoleValue(selector, availableModelsOfAllKinds, {
-				settings: options.settings,
+				settings: proposed,
 				roleLookup: proposedLookup,
-				matchPreferences: getModelMatchPreferences(options.settings),
+				matchPreferences,
 			});
-			if (unrestricted.model && !getRoleInfo(role, options.settings).accepts(unrestricted.model)) {
+			if (unrestricted.model && !getRoleInfo(role, proposed).accepts(unrestricted.model)) {
 				throw invalidRoleError(role);
 			}
 			throw unresolvedRoleError(role);
@@ -171,16 +160,12 @@ export async function applySetupModelRoles(options: ApplySetupModelRolesOptions)
 	}
 
 	const currentDefault = resolveDefaultSelection(
-		options,
+		previousModel,
 		availableModels,
-		options.settings.getModelRole("default"),
-		currentLookup,
+		options.settings,
+		sessionModelRoleLookup(options.settings, previousModel),
 	);
-	const proposedDefaultSelector =
-		Object.hasOwn(options.roles, "default") && options.roles.default === null
-			? undefined
-			: proposedLookup.getModelRole("default");
-	let proposedDefault = resolveDefaultSelection(options, availableModels, proposedDefaultSelector, proposedLookup);
+	let proposedDefault = resolveDefaultSelection(previousModel, availableModels, proposed, proposedLookup);
 	const defaultExplicitlyReplaced = Object.hasOwn(options.roles, "default");
 	const defaultChanged =
 		defaultExplicitlyReplaced ||
@@ -215,7 +200,7 @@ export async function applySetupModelRoles(options: ApplySetupModelRolesOptions)
 			options.session.setThinkingLevel(proposedDefault.thinkingLevel);
 		}
 		assertReady(options);
-		options.settings.applySetupLayer({ ...options.settings.getSetupLayer(), modelRoles: options.roles });
+		options.settings.applySetupLayer(config);
 	} catch (error) {
 		const stateChanged =
 			sessionMutated ||

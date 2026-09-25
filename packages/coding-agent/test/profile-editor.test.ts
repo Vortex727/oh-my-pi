@@ -1,13 +1,17 @@
 import { beforeAll, describe, expect, test, vi } from "bun:test";
 import { stripVTControlCharacters } from "node:util";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { cfgMemoryBackend } from "@oh-my-pi/pi-coding-agent/memory-backend/settings";
 import { ProfileEditorComponent, ProfileEmojiPicker } from "@oh-my-pi/pi-coding-agent/modes/components/profile-editor";
-import { getSetupGroupSettings } from "@oh-my-pi/pi-coding-agent/profiles/setups";
+import { draftModelRoles, getSetupGroupSettings } from "@oh-my-pi/pi-coding-agent/profiles/setups";
+import { projectProfileRoles } from "@oh-my-pi/pi-coding-agent/profiles/snapshot";
 import { PROFILE_EMOJIS, type ProfileDraft, type ProfileEmoji } from "@oh-my-pi/pi-coding-agent/profiles/types";
 import { cfgCompactionEnabled } from "@oh-my-pi/pi-coding-agent/session/context-settings";
 import { cfgRetryFallbackChains } from "@oh-my-pi/pi-coding-agent/session/settings";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
+import { TempDir } from "@oh-my-pi/pi-utils";
+import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
 beforeAll(async () => {
 	await initTheme(false);
@@ -255,6 +259,46 @@ describe("profile draft editor isolation", () => {
 		expect(editor.draft.config.modelRoles).toEqual({ default: "anthropic/fixture-model" });
 	});
 
+	test("strips terminal controls from a resolver warning that quotes an imported selector", () => {
+		using tempDir = TempDir.createSync("@omp-profile-editor-warning-");
+		const authStorage = createInMemoryAuthStorage();
+		try {
+			authStorage.keys.setRuntime("anthropic", "test-key");
+			const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+			const draft = modelsOnlyDraft();
+			draft.config.modelRoles = { default: "anthropic/claude-sonnet-4-5:\x1b[2J" };
+			const { editor } = createEditor({
+				draft,
+				callbacks: {
+					requestRender: () => {},
+					onEditRole: async (_role, current) => current,
+					onEditAgents: async current => current,
+					onSave: () => {},
+					onCancel: () => {},
+					roleWarnings: current => {
+						const warnings = new Map<string, string>();
+						const rows = projectProfileRoles({
+							cwd: tempDir.path(),
+							settings: Settings.isolated({ modelRoles: draftModelRoles(current) }),
+							modelRegistry,
+						});
+						for (const row of rows) {
+							if (row.warning) warnings.set(row.role, row.warning);
+						}
+						return warnings;
+					},
+				},
+			});
+
+			editor.handleInput("\x1b[B"); // Emoji → the imported default role, whose warning shows below the list.
+			const frame = editor.render(160).join("\n");
+			expect(frame).not.toContain("\x1b[2J");
+			expect(stripVTControlCharacters(frame)).toContain("Invalid thinking level");
+		} finally {
+			authStorage.close();
+		}
+	});
+
 	test("an emoji pick is staged in the draft and saved only with the draft", () => {
 		const draft = modelsOnlyDraft();
 		draft.metadata.emoji = "⚡";
@@ -391,5 +435,45 @@ describe("profile emoji picker", () => {
 		for (let index = 0; index <= local; index++) picker.handleInput("\x1b[A");
 		picker.handleInput("\r");
 		expect(selections).toEqual([PROFILE_EMOJIS[local]!.emoji, undefined]);
+	});
+
+	test("a click chooses the row drawn under the pointer, with or without an error line", async () => {
+		const draft = modelsOnlyDraft();
+		draft.metadata.emoji = "⚡";
+		const saves: Array<ProfileEmoji | undefined> = [];
+		let lastSave: Promise<boolean> = Promise.resolve(false);
+		const { editor } = createEditor({
+			draft,
+			callbacks: {
+				requestRender: () => {},
+				onEditRole: async (_role, current) => current,
+				onEditAgents: async current => current,
+				onSave: () => {},
+				onCancel: () => {},
+				onSaveEmoji: value => {
+					saves.push(value);
+					lastSave = saves.length === 1 ? Promise.reject(new Error("disk full")) : Promise.resolve(true);
+					return lastSave;
+				},
+			},
+		});
+		// The fullscreen overlay anchors the frame to the bottom of createEditor's 24-row terminal.
+		const clickNone = async () => {
+			const frame = editor.render(80).map(stripVTControlCharacters);
+			const screenRow = 24 - frame.length + frame.findIndex(line => line.includes("None"));
+			editor.handleInput(`\x1b[<0;5;${screenRow + 1}M`);
+			await lastSave.catch(() => false);
+			await Promise.resolve();
+		};
+
+		editor.handleInput("\r");
+		await clickNone();
+		expect(saves).toEqual([undefined]);
+		expect(editor.draft.metadata.emoji).toBe("⚡");
+
+		// The failed write adds an error line above the list.
+		await clickNone();
+		expect(saves).toEqual([undefined, undefined]);
+		expect(editor.draft.metadata.emoji).toBeUndefined();
 	});
 });

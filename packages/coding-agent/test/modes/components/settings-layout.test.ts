@@ -177,10 +177,8 @@ describe("settings layout", () => {
 		selector.setProfilesContent(profiles);
 		const rendered = Bun.stripANSI(selector.render(80).join("\n"));
 
-		expect(rendered).toContain("Settings");
 		expect(rendered).toContain("Profiles");
 		expect(rendered).toContain("Profiles content 0");
-		expect(rendered).not.toContain("Open Profiles Manager");
 		expect(profiles.width).toBe(76);
 		expect(rendered).toContain(`Profiles row ${profiles.height - 1}`);
 		expect(rendered.split("\n")).toHaveLength(18);

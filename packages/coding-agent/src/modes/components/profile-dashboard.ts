@@ -176,6 +176,7 @@ export class ProfileDashboard implements Component {
 	#actionNotice: { text: string; tone: "error" | "success" | "info" } | undefined;
 	#activeProfile: ProfileDashboardActiveProfile | undefined;
 	#focus: DashboardFocus = "profiles";
+	/** Last selected setup; remembered while a filter hides it so clearing the filter restores it. */
 	#selectedKey = "current";
 	#filter = "";
 	#searching = false;
@@ -205,8 +206,9 @@ export class ProfileDashboard implements Component {
 		this.#terminalHeight = options.terminalHeight ?? process.stdout.rows ?? 24;
 	}
 
+	/** The selected setup while the current filter shows it; a filtered-out selection is inert. */
 	get selectedSetup(): ProfileDashboardSetupRef | undefined {
-		return this.#setups.find(setup => setupKey(setup) === this.#selectedKey);
+		return this.#filteredSetups.find(setup => setupKey(setup) === this.#selectedKey);
 	}
 
 	setSetupState(setup: ProfileDashboardSetupRef, state: ProfileDashboardProfileState): void {

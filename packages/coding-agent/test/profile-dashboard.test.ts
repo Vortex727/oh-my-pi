@@ -727,7 +727,6 @@ describe("profile dashboard interaction boundaries", () => {
 		searchable.dashboard.handleInput("n");
 		searchable.dashboard.handleInput("i");
 		searchable.dashboard.handleInput("x");
-		expect(searchable.dashboard.selectedSetup).toEqual(savedSetup("gamma"));
 		expect(searchable.actions.some(action => /^(load:|save$|delete:|rename:|import$|export:)/.test(action))).toBe(
 			false,
 		);
@@ -762,5 +761,25 @@ describe("profile dashboard interaction boundaries", () => {
 		expect(refreshed).toContain("fixture-model");
 		expect(refreshed).toContain("Refresh failed without losing preview");
 		expect(refreshed).toContain("showing cached data");
+	});
+
+	test("a filter with no matches leaves the remembered selection inert until it is cleared", () => {
+		const { dashboard, actions } = setup(24, ["beta"]);
+		dashboard.handleInput("\x1b[B");
+		dashboard.handleInput("/");
+		dashboard.handleInput("does-not-exist");
+		const before = actions.length;
+
+		dashboard.handleInput("\r");
+		// Tab would leave search on the hidden setup's preview, where these keys act on it.
+		dashboard.handleInput("\t");
+		for (const key of ["d", "n", "x", "e", "l"]) dashboard.handleInput(key);
+		expect(dashboard.selectedSetup).toBeUndefined();
+		expect(plain(dashboard, 120)).not.toContain("beta");
+		expect(actions.slice(before)).toEqual([]);
+
+		dashboard.handleInput("\x1b");
+		dashboard.handleInput("\r");
+		expect(actions.slice(before)).toEqual(["edit-profile:saved:beta"]);
 	});
 });

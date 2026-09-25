@@ -31,8 +31,6 @@ describe("Settings entry-level writes", () => {
 		restoreSettingsTestState(state);
 		state = undefined;
 		AgentStorage.close();
-		// SQLite keeps agent.db open until GC finalizes its statements; Windows cannot delete an open file.
-		Bun.gc(true);
 		tempDir.removeSync();
 	});
 

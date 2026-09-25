@@ -43,8 +43,6 @@ describe("SelectorController model hub writes", () => {
 		session = undefined;
 		authStorage.close();
 		AgentStorage.close();
-		// SQLite keeps agent.db open until GC finalizes its statements; Windows cannot delete an open file.
-		Bun.gc(true);
 		tempDir.removeSync();
 	});
 
